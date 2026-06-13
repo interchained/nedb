@@ -101,11 +101,14 @@ jobs:
           targets: ${{ matrix.target }}
       - run: npm install
       - name: Build native addon
-        run: npx @napi-rs/cli build --release --platform --target ${{ matrix.target }} --manifest-path rust/crates/nedb-node/Cargo.toml
+        run: npx @napi-rs/cli build --platform --release --target ${{ matrix.target }} --cargo-cwd rust/crates/nedb-node
       - uses: actions/upload-artifact@v4
         with:
           name: node-${{ matrix.target }}
-          path: "*.node"
+          path: |
+            *.node
+            index.js
+            index.d.ts
 
   publish-npm:
     needs: node-binaries
@@ -117,15 +120,14 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
-      - run: npm install
       - uses: actions/download-artifact@v4
         with:
           pattern: node-*
           merge-multiple: true
           path: .
-      - name: Assemble platform packages and publish
+      - name: List downloaded artifacts
+        run: ls -la *.node index.js index.d.ts
+      - name: Publish to npm (all platform binaries bundled in one package)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          npx @napi-rs/cli prepublish -t npm --manifest-path rust/crates/nedb-node/Cargo.toml || true
-          npm publish --access public
+        run: npm publish --access public

@@ -29,4 +29,4 @@ except ImportError:  # pure-Python install (sdist / unsupported platform)
 
 __all__ = ["NEDB", "OpLog", "Op", "ReplayError", "Query", "parse_nql",
            "_native", "__has_native__"]
-__version__ = "0.1.1"
+__version__ = "0.1.2"

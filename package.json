@@ -1,9 +1,10 @@
 {
   "name": "nedb-engine",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "NEDB — a versioned, self-compressing, time-traveling embedded database (replay-protected, idempotent, relational, searchable). Native core via napi-rs.",
   "main": "index.js",
   "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "*.node", "README.md", "LICENSE"],
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
@@ -26,8 +27,8 @@
     }
   },
   "scripts": {
-    "build": "napi build --release --platform --manifest-path rust/crates/nedb-node/Cargo.toml",
-    "build:debug": "napi build --platform --manifest-path rust/crates/nedb-node/Cargo.toml",
+    "build": "napi build --release --platform --cargo-cwd rust/crates/nedb-node",
+    "build:debug": "napi build --platform --cargo-cwd rust/crates/nedb-node",
     "test": "node test/smoke.mjs"
   },
   "devDependencies": {
