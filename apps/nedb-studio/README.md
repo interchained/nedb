@@ -52,7 +52,8 @@ AIASSIST_DEFAULT_MODEL=claude-sonnet-4-6
 - The key is read **only** by the server (`server.ts` / `src/server`). It is never sent to the browser.
 - Provider/model lists come from `GET /v1/providers` (bearer auth, server-side) and populate the selectors + the marquee.
 - `X-AiAssist-Provider` is sent on **every** request; the selected model is sent in the body.
-- Pipeline: prompt → **runner** (fast generation) → **sentinel** (validate/repair) → **Zod** (`validateScaffold`) → render. Anything that fails twice falls back to a mock template — generation never hard-fails.
+- Pipeline: prompt → **runner** (fast generation) → **sentinel** (validate/repair) → **Zod** (`validateScaffold`) → render. Model output is extracted with KeyStone-Lite **sentinel blocks** (`<<<SCAFFOLD>>>` / `<<<NQL>>>`, content taken verbatim) so code/quotes/newlines never break parsing.
+- **Mock templates are the no-credentials demo only.** In live mode there is no silent fallback — if generation fails, the studio surfaces the real error instead of quietly serving a mock.
 
 ## Mock mode
 

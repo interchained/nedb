@@ -52,7 +52,15 @@ api.get("/providers", async (_req, res) => {
     const result = await listProviders();
     res.json({ ...result, mode: "live" });
   } catch (err) {
-    res.json({ ...MOCK_PROVIDERS, mode: "mock", error: String(err) });
+    // Credentials exist, so stay LIVE — degrade to the configured default
+    // provider/model so the selectors still work. Never relabel as "mock".
+    const d = defaults();
+    res.json({
+      defaultProvider: d.provider,
+      providers: [{ id: d.provider, label: d.provider, isDefault: true, models: [{ id: d.model, name: d.model }] }],
+      mode: "live",
+      error: String(err),
+    });
   }
 });
 
@@ -66,12 +74,13 @@ api.post("/generate", async (req, res) => {
     return;
   }
 
-  // Mock mode — no credentials configured.
+  // Demo mode — ONLY when there are no AiAssist credentials. With credentials,
+  // generation is always live and failures are surfaced (never a silent mock).
   if (!hasCredentials()) {
     res.json({
       scaffold: matchTemplate(prompt),
       mode: "mock",
-      notes: ["No AiAssist credentials configured — served a deterministic mock template."],
+      notes: ["Demo mode (no AiAssist credentials) — deterministic template. Add a key for live AI generation."],
     });
     return;
   }
@@ -106,12 +115,12 @@ api.post("/generate", async (req, res) => {
       result = validateScaffold(candidate);
     }
 
-    // ── Guard: still invalid → deterministic mock fallback ──────────────────
+    // Live mode never silently falls back to a mock. If it still won't validate
+    // after the sentinel repair pass, surface the real error.
     if (!result.ok || !result.scaffold) {
-      res.json({
-        scaffold: matchTemplate(prompt),
-        mode: "mock",
-        notes: [...notes, "Live generation failed validation twice; served a mock template.", ...(result.errors ?? []).slice(0, 5)],
+      res.status(422).json({
+        error: "Generation didn't produce a valid schema",
+        details: [...notes, ...(result.errors ?? []).slice(0, 8)],
       });
       return;
     }
@@ -120,11 +129,7 @@ api.post("/generate", async (req, res) => {
     const scaffold = finalizeScaffold(result.scaffold);
     res.json({ scaffold, mode: "live", provider, model, notes });
   } catch (err) {
-    res.json({
-      scaffold: matchTemplate(prompt),
-      mode: "mock",
-      notes: ["Live generation error; served a mock template.", String(err)],
-    });
+    res.status(502).json({ error: "AiAssist generation error", details: [String(err)] });
   }
 });
 
@@ -137,6 +142,7 @@ api.post("/nql", async (req, res) => {
     res.status(400).json({ error: "prompt and schema are required" });
     return;
   }
+  // Demo mode only when no credentials: heuristic NL→NQL compiler.
   if (!hasCredentials()) {
     res.json({ nql: heuristicNlToNql(prompt, schema), mode: "mock" });
     return;
@@ -147,9 +153,13 @@ api.post("/nql", async (req, res) => {
       temperature: 0,
       maxTokens: 160,
     });
-    const nql = extractNql(raw) || heuristicNlToNql(prompt, schema);
+    const nql = extractNql(raw);
+    if (!/^from\s/i.test(nql)) {
+      res.status(422).json({ error: "Model did not return a valid NQL query", details: [nql.slice(0, 200)] });
+      return;
+    }
     res.json({ nql, mode: "live" });
   } catch (err) {
-    res.json({ nql: heuristicNlToNql(prompt, schema), mode: "mock", error: String(err) });
+    res.status(502).json({ error: "AiAssist NQL compile error", details: [String(err)] });
   }
 });

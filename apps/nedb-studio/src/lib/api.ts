@@ -5,6 +5,16 @@ import type { GenerateResponse, ProvidersPayload, StudioStatus } from "./types";
  * (proxied to the Express server in dev). It never sees the AiAssist key.
  */
 
+async function errorMessage(res: Response, fallback: string): Promise<string> {
+  try {
+    const data = await res.json();
+    if (data?.error) return data.details?.length ? `${data.error}: ${data.details.join("; ")}` : data.error;
+  } catch {
+    /* response wasn't JSON */
+  }
+  return `${fallback} (${res.status})`;
+}
+
 export async function getStatus(): Promise<StudioStatus> {
   const res = await fetch("/api/status");
   if (!res.ok) throw new Error(`/api/status -> ${res.status}`);
@@ -28,8 +38,7 @@ export async function generate(
     body: JSON.stringify({ prompt, provider, model }),
   });
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`/api/generate -> ${res.status}: ${text}`);
+    throw new Error(await errorMessage(res, "Generation failed"));
   }
   return (await res.json()) as GenerateResponse;
 }
@@ -48,8 +57,7 @@ export async function compileNql(prompt: string, schema: unknown): Promise<Compi
     body: JSON.stringify({ prompt, schema }),
   });
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`/api/nql -> ${res.status}: ${text}`);
+    throw new Error(await errorMessage(res, "Query compile failed"));
   }
   return (await res.json()) as CompileNqlResult;
 }
