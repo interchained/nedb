@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+.venv/
+
+# Rust
+/rust/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node / napi
+node_modules/
+*.node
+npm/
+
+# misc
+.DS_Store

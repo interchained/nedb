@@ -1,0 +1,19 @@
+[package]
+name = "nedb-node"
+description = "napi-rs bindings for nedb-core → the @interchained/nedb npm package."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nedb-core = { path = "../nedb-core" }
+serde_json = "1"
+napi = { version = "2", default-features = false, features = ["napi8"] }
+napi-derive = "2"
+
+[build-dependencies]
+napi-build = "2"

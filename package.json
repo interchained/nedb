@@ -1,0 +1,36 @@
+{
+  "name": "@interchained/nedb",
+  "version": "0.1.0",
+  "description": "NEDB — a versioned, self-compressing, time-traveling embedded database (replay-protected, idempotent, relational, searchable). Native core via napi-rs.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/interchained/nedb.git"
+  },
+  "keywords": [
+    "database", "embedded", "mvcc", "time-travel", "versioning",
+    "compression", "dedup", "graph", "search", "redis", "git", "napi-rs"
+  ],
+  "engines": { "node": ">= 16" },
+  "napi": {
+    "name": "nedb",
+    "triples": {
+      "defaults": true,
+      "additional": [
+        "aarch64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc"
+      ]
+    }
+  },
+  "scripts": {
+    "build": "napi build --release --platform --manifest-path rust/crates/nedb-node/Cargo.toml",
+    "build:debug": "napi build --platform --manifest-path rust/crates/nedb-node/Cargo.toml",
+    "test": "node test/smoke.mjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  }
+}
