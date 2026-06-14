@@ -245,6 +245,49 @@ def bench_nedbd(n: int = SMALL, base: str = "http://127.0.0.1:7070") -> Optional
     return rows
 
 
+def bench_resp2(n: int = SMALL, port: int = 6379) -> Optional[List[Dict]]:
+    """NEDB embedded GET vs nedbd RESP2 (raw socket, no redis-py required)."""
+    import socket as _sock
+    def _send(s, *args):
+        cmd = f"*{len(args)}\r\n" + "".join(f"${len(a)}\r\n{a}\r\n" for a in args)
+        s.sendall(cmd.encode())
+        return s.recv(4096)
+
+    try:
+        s = _sock.create_connection(("127.0.0.1", port), timeout=2)
+        _send(s, "PING")
+        _send(s, "SELECT", "_bench")
+    except Exception:
+        s = None
+
+    if not s:
+        return None
+
+    rows: List[Dict] = []
+    db = NEDB()
+    for i in range(n):
+        db.put("k", str(i), {"v": i})
+
+    # Seed nedbd via RESP2
+    for i in range(min(n, SMALL)):
+        _send(s, "SET", f"bench:{i}", str(i))
+
+    r = bench(lambda: [db.get("k", str(i)) for i in range(n)], n, warmup=1)
+    rows.append({"operation": "NEDB GET (embedded, in-process)", **r})
+
+    r = bench(lambda: [_send(s, "GET", f"bench:{i}") for i in range(min(n, SMALL))], min(n, SMALL), warmup=1)
+    rows.append({"operation": f"nedbd GET (RESP2 TCP, port {port})", **r})
+
+    r = bench(lambda: [db.put("k", str(i), {"v": i + 1}) for i in range(n)], n, warmup=1)
+    rows.append({"operation": "NEDB PUT (embedded)", **r})
+
+    r = bench(lambda: [_send(s, "SET", f"bench:{i}", str(i + 1)) for i in range(min(n, SMALL))], min(n, SMALL), warmup=1)
+    rows.append({"operation": f"nedbd SET (RESP2 TCP, port {port})", **r})
+
+    s.close()
+    return rows
+
+
 def bench_redis_cmp(n: int = SMALL) -> Optional[List[Dict]]:
     """NEDB embedded GET vs Redis GET over TCP."""
     try:
@@ -318,6 +361,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="NEDB benchmark suite")
     ap.add_argument("--nedbd",  action="store_true", help="Compare with nedbd over HTTP")
     ap.add_argument("--redis",  action="store_true", help="Compare with Redis over TCP")
+    ap.add_argument("--resp2",  action="store_true", help="Compare with nedbd RESP2 wire protocol")
+    ap.add_argument("--resp2-port", type=int, default=6379, dest="resp2_port", help="nedbd RESP2 port (default 6379)")
     ap.add_argument("--save",   action="store_true", help=f"Write results to {RESULTS_MD}")
     ap.add_argument("--small",  action="store_true", help="Use SMALL N (faster, less accurate)")
     ap.add_argument("--base",   default="http://127.0.0.1:7070", help="nedbd base URL")
@@ -362,6 +407,16 @@ def main() -> None:
             print(f"  {row['operation']:<45} {'—':>10}  {row['_reload_ms']:.1f} ms total")
         else:
             print(f"  {row['operation']:<45} {fmt_rate(row['ops_per_s']):>10}  {fmt_lat(row['latency_us']):>12}")
+
+    if a.resp2:
+        print(f"\n── NEDB embedded vs nedbd RESP2 ─────────────────────────────────")
+        r = bench_resp2(min(n, SMALL), a.resp2_port)
+        if r:
+            results["NEDB embedded vs nedbd RESP2"] = r
+            for row in r:
+                print(f"  {row['operation']:<45} {fmt_rate(row['ops_per_s']):>10}  {fmt_lat(row['latency_us']):>12}")
+        else:
+            print(f"  [nedbd RESP2 not reachable on port {a.resp2_port} — start: NEDBD_RESP2_PORT={a.resp2_port} nedbd]")
 
     if a.nedbd:
         print(f"\n── NEDB embedded vs nedbd HTTP ({a.base}) ───────────────────────")

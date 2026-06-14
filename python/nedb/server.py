@@ -30,6 +30,11 @@ HTTP API (all JSON):
   DELETE /v1/databases/<name>/rows/<coll>/<id>
   GET    /v1/databases/<name>/verify
   GET    /v1/databases/<name>/log?limit=N
+  POST   /v1/databases/<name>/files             {name, data_b64, tier?}  — store a file (Cascade-compressed)
+  GET    /v1/databases/<name>/files/<filename>?version=N&tier=warm  — retrieve a file
+  GET    /v1/databases/<name>/files/<filename>/root?version=N&tier=warm  — Merkle root (anchorable)
+  POST   /v1/databases/<name>/checkpoint        — on-demand checkpoint
+  GET    /v1/databases/<name>/batch             — batch writes (array of {op,coll,id,doc})
 """
 from __future__ import annotations
 
@@ -320,12 +325,71 @@ def make_handler(manager: Manager, token: Optional[str]):
                         ops = [o.to_dict() for o in db.log.ops[-limit:]][::-1]
                         self._send(200, {"log": ops, "seq": db.seq, "head": db.head})
                         return
+                    if method == "POST" and action == "files":
+                        b = self._body()
+                        fname = b.get("name")
+                        data_b64 = b.get("data_b64")
+                        if not fname or not data_b64:
+                            raise HttpError(400, "name and data_b64 are required")
+                        import base64 as _b64
+                        data = _b64.b64decode(data_b64)
+                        tier = str(b.get("tier", "warm"))
+                        version = db.put_file(str(fname), data, tier=tier)
+                        root = db.file_root(str(fname), version, tier=tier)
+                        self._send(201, {"name": fname, "version": version, "root": root,
+                                         "size": len(data), "tier": tier})
+                        return
 
                 # DELETE /v1/databases/<name>/rows/<coll>/<id>
                 if method == "DELETE" and len(parts) == 6 and parts[:2] == ["v1", "databases"] and parts[3] == "rows":
                     db = manager.require(parts[2])
                     db.delete(parts[4], parts[5])
                     self._send(200, {"ok": True, "seq": db.seq, "head": db.head})
+                    return
+
+                # GET  /v1/databases/<name>/files/<filename>          → file bytes as base64
+                # GET  /v1/databases/<name>/files/<filename>/root      → Merkle root hex
+                if method == "GET" and len(parts) >= 5 and parts[:2] == ["v1", "databases"] and parts[3] == "files":
+                    import base64 as _b64
+                    db = manager.require(parts[2])
+                    fname = parts[4]
+                    version = int(query.get("version", ["-1"])[0])
+                    tier = query.get("tier", ["warm"])[0]
+                    # /root sub-resource
+                    if len(parts) == 6 and parts[5] == "root":
+                        root = db.file_root(fname, version, tier=tier)
+                        self._send(200, {"name": fname, "version": version, "root": root, "tier": tier})
+                        return
+                    data = db.get_file(fname, version, tier=tier)
+                    self._send(200, {"name": fname, "version": version,
+                                     "data_b64": _b64.b64encode(data).decode(),
+                                     "size": len(data), "tier": tier})
+                    return
+
+                # POST /v1/databases/<name>/batch  — multiple ops in one request
+                # Body: {ops: [{op:"put"|"del"|"link", coll, id, doc?, frm?, rel?, to?}, ...]}
+                if method == "POST" and len(parts) == 4 and parts[:2] == ["v1", "databases"] and parts[3] == "batch":
+                    db = manager.require(parts[2])
+                    b = self._body()
+                    ops_list = b.get("ops") or []
+                    if not isinstance(ops_list, list) or not ops_list:
+                        raise HttpError(400, "ops array is required")
+                    results = []
+                    for op in ops_list:
+                        kind = str(op.get("op", "put")).lower()
+                        if kind == "put":
+                            doc = db.put(str(op["coll"]), str(op["id"]), dict(op.get("doc") or {}))
+                            results.append({"op": "put", "id": op["id"], "seq": db.seq})
+                        elif kind == "del":
+                            db.delete(str(op["coll"]), str(op["id"]))
+                            results.append({"op": "del", "id": op["id"], "seq": db.seq})
+                        elif kind == "link":
+                            db.link(str(op["frm"]), str(op["rel"]), str(op["to"]))
+                            results.append({"op": "link", "seq": db.seq})
+                        else:
+                            results.append({"op": kind, "error": "unknown op"})
+                    self._send(200, {"results": results, "count": len(results),
+                                     "seq": db.seq, "head": db.head})
                     return
 
                 raise HttpError(404, "no such route")
@@ -390,6 +454,35 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT,  _shutdown)
 
+    # Optional hour-aligned periodic checkpoint.
+    # NEDBD_CHECKPOINT_INTERVAL=60 means checkpoint every 60 minutes, on the hour mark.
+    # The system clock handles the cadence — we sleep to the next :00 boundary, checkpoint,
+    # then repeat. Default: disabled (0). Value is in minutes.
+    ckpt_interval = int(os.environ.get("NEDBD_CHECKPOINT_INTERVAL", "0"))
+    _stop_ckpt = threading.Event()
+
+    if ckpt_interval > 0:
+        def _checkpoint_loop():
+            import time
+            interval_s = ckpt_interval * 60
+            while not _stop_ckpt.is_set():
+                # Sleep until the next clock-aligned boundary
+                now = time.time()
+                secs_into_interval = now % interval_s
+                sleep_s = interval_s - secs_into_interval
+                # Wake slightly after the boundary so we always round up
+                _stop_ckpt.wait(timeout=sleep_s + 0.5)
+                if _stop_ckpt.is_set():
+                    break
+                ts = time.strftime("%Y-%m-%d %H:%M")
+                n = len(manager._open)
+                print(f"  [checkpoint:{ts}] checkpointing {n} database(s)…")
+                manager.checkpoint_all()
+
+        ckpt_thread = threading.Thread(target=_checkpoint_loop, daemon=True)
+        ckpt_thread.start()
+        print(f"  checkpoint — every {ckpt_interval}min on the clock mark (NEDBD_CHECKPOINT_INTERVAL)")
+
     # Optional RESP2 server (redis-cli / redis-benchmark compatible)
     resp2_srv = None
     if resp2_port > 0:
@@ -401,6 +494,7 @@ def main() -> None:
     try:
         httpd.serve_forever()   # blocks; unblocked by _shutdown → httpd.shutdown()
     finally:
+        _stop_ckpt.set()  # stop the checkpoint loop
         httpd.server_close()
         if resp2_srv:
             resp2_srv.shutdown()
