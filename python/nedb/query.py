@@ -35,7 +35,8 @@ _TOKEN_RE = re.compile(
 )
 
 _KEYWORDS = {"from", "as", "of", "where", "and", "search", "order", "by",
-             "asc", "desc", "traverse", "limit", "true", "false", "null"}
+             "asc", "desc", "traverse", "limit", "true", "false", "null",
+             "group", "count", "sum", "avg", "min", "max"}
 
 
 def _lex(text: str) -> List[Tuple[str, Any]]:
@@ -65,7 +66,8 @@ def _lex(text: str) -> List[Tuple[str, Any]]:
 
 def empty_plan(coll: str) -> dict:
     return {"from": coll, "as_of": None, "where": [], "search": None,
-            "order_by": None, "traverse": None, "limit": None}
+            "order_by": None, "traverse": None, "limit": None,
+            "group_by": None, "aggregate": None}
 
 
 def parse_nql(text: str) -> dict:
@@ -173,6 +175,28 @@ def parse_nql(text: str) -> dict:
             raise SyntaxError("NQL: LIMIT expects an integer")
         i += 1
         plan["limit"] = int(v)
+
+    # GROUP BY field [COUNT | SUM field | AVG field | MIN field | MAX field]
+    if peek() == ("kw", "group"):
+        i += 1
+        expect_kw("by")
+        t, field = peek()
+        if t not in ("word", "kw"):
+            raise SyntaxError("NQL: expected field after GROUP BY")
+        i += 1
+        plan["group_by"] = field
+        # optional aggregate after GROUP BY
+        t, agg = peek()
+        if t == "kw" and agg in ("count", "sum", "avg", "min", "max"):
+            i += 1
+            if agg == "count":
+                plan["aggregate"] = ("count", None)
+            else:
+                t2, agg_field = peek()
+                if t2 not in ("word", "kw"):
+                    raise SyntaxError(f"NQL: {agg.upper()} expects a field name")
+                i += 1
+                plan["aggregate"] = (agg, agg_field)
 
     if i != len(toks):
         raise SyntaxError(f"NQL: unexpected trailing tokens: {toks[i:]}")

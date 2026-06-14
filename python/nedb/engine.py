@@ -13,6 +13,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from .cascade import BlobStore
+from . import snapshot as _snap
 from .index import Indexes, tokenize
 from .log import Op, OpLog, ReplayError  # noqa: F401  (re-exported)
 from .merkle import merkle_proof, merkle_verify
@@ -80,13 +81,34 @@ class NEDB:
         self._aof = open(self._aof_path, "a", encoding="utf-8")
 
     def _load(self) -> None:
-        # 1) index configuration (the only state not captured by the op log)
+        # ── Try snapshot-assisted load first (O(delta) instead of O(total)) ─
+        snap_seq = _snap.load_snapshot(self)
+        if snap_seq >= 0:
+            # Snapshot loaded: only replay AOF ops AFTER the checkpoint op.
+            ops: List[Op] = []
+            if os.path.exists(self._aof_path):
+                with open(self._aof_path, encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if line:
+                            ops.append(Op.from_dict(json.loads(line)))
+            # Build the full log (needed for verify() and AS OF) but only
+            # apply ops that arrive after the checkpoint to avoid double-fold.
+            self.log.load(ops)
+            for op in self.log.ops:
+                if op.seq > snap_seq:
+                    apply_op(self.store, self.relations, self.indexes, op)
+            self._nonce = dict(self.log._last_nonce)
+            return
+
+        # ── No snapshot: full replay (original behaviour) ─────────────────
+        # 1) index configuration
         if os.path.exists(self._meta_path):
             with open(self._meta_path, encoding="utf-8") as fh:
                 for coll, field, kind in json.load(fh).get("indexes", []):
                     self.indexes.ensure(coll, field, kind)
-        # 2) the hash-chained op log itself
-        ops: List[Op] = []
+        # 2) the hash-chained op log
+        ops = []
         if os.path.exists(self._aof_path):
             with open(self._aof_path, encoding="utf-8") as fh:
                 for line in fh:
@@ -94,10 +116,10 @@ class NEDB:
                     if line:
                         ops.append(Op.from_dict(json.loads(line)))
         self.log.load(ops)
-        # 3) fold the log into materialized state (state = pure function of log)
+        # 3) fold
         for op in self.log.ops:
             apply_op(self.store, self.relations, self.indexes, op)
-        # 4) restore the auto-nonce counter so new local writes don't collide
+        # 4) nonce restoration
         self._nonce = dict(self.log._last_nonce)
 
     def _persist_meta(self) -> None:
@@ -136,18 +158,71 @@ class NEDB:
     def __exit__(self, *exc) -> None:
         self.close()
 
+    def checkpoint(self) -> str:
+        """
+        Capture a snapshot checkpoint and anchor it in the hash chain.
+
+        Writes ``snapshot.json`` alongside the AOF so future opens load in
+        O(delta) time instead of replaying the full log. The chain is never
+        broken — the checkpoint is a real op in the AOF whose hash chains
+        from the previous op, so ``verify()`` and ``AS OF`` remain valid.
+
+        Returns the head hash after the checkpoint op.
+
+        Example::
+
+            db = NEDB("./data")
+            # … write 100 K rows …
+            db.checkpoint()   # O(total) once; future opens are O(delta)
+            db.close()
+            db2 = NEDB("./data")  # fast: loads snapshot then replays only new ops
+            assert db2.verify()
+
+        Call periodically for long-running databases or before a planned restart.
+        """
+        return _snap.save_snapshot(self)
+
     # --- nonce helper -------------------------------------------------------
     def _next(self, client: str) -> int:
         n = self._nonce.get(client, 0) + 1
         self._nonce[client] = n
         return n
 
+    # --- TTL helpers --------------------------------------------------------
+    @staticmethod
+    def _embed_ttl(doc: dict, ttl_s: Optional[float]) -> dict:
+        if ttl_s is None:
+            return doc
+        import time
+        d = dict(doc)
+        d["_expires_at"] = time.time() + ttl_s
+        return d
+
+    def _check_ttl(self, coll: str, id: str, doc: Optional[dict]) -> Optional[dict]:
+        """Lazy expiry: if the doc has _expires_at and it has passed, delete it."""
+        if doc is None:
+            return None
+        exp = doc.get("_expires_at")
+        if exp is None:
+            return doc
+        import time
+        if time.time() > exp:
+            key = f"{coll}:{id}"
+            self._log_append("__ttl__", self._next("__ttl__"), "delete",
+                             {"key": key, "coll": coll, "id": id})
+            apply_op(self.store, self.relations, self.indexes,
+                     self.log.ops[-1])
+            return None
+        return doc
+
     # --- mutations ----------------------------------------------------------
     def put(self, coll: str, id: str, doc: dict, client: str = "local",
-            nonce: Optional[int] = None, idem: Optional[str] = None) -> dict:
+            nonce: Optional[int] = None, idem: Optional[str] = None,
+            ttl_s: Optional[float] = None) -> dict:
         key = f"{coll}:{id}"
         doc = dict(doc)
         doc.setdefault("_id", id)
+        doc = self._embed_ttl(doc, ttl_s)
         nonce = self._next(client) if nonce is None else nonce
         op, created = self._log_append(client, nonce, "put",
                                        {"key": key, "coll": coll, "id": id, "doc": doc}, idem)
@@ -165,7 +240,35 @@ class NEDB:
             apply_op(self.store, self.relations, self.indexes, op)
 
     def get(self, coll: str, id: str, as_of: Optional[int] = None) -> Optional[dict]:
-        return self.store.get(f"{coll}:{id}", as_of)
+        doc = self.store.get(f"{coll}:{id}", as_of)
+        if as_of is None:
+            return self._check_ttl(coll, id, doc)
+        return doc  # time-travel reads never trigger lazy expiry
+
+    def expire(self, coll: str, id: str, ttl_s: float) -> bool:
+        """Set or update the TTL on an existing document. Returns False if not found."""
+        doc = self.store.get(f"{coll}:{id}")
+        if doc is None:
+            return False
+        self.put(coll, id, doc, ttl_s=ttl_s)
+        return True
+
+    def sweep(self) -> int:
+        """Delete all documents whose TTL has expired. Returns the count deleted."""
+        import time
+        now = time.time()
+        deleted = 0
+        for key in list(self.store.keys()):
+            doc = self.store.get(key)
+            if doc and isinstance(doc, dict) and doc.get("_expires_at") and now > doc["_expires_at"]:
+                coll, id_ = key.split(":", 1)
+                self._log_append("__ttl__", self._next("__ttl__"), "delete",
+                                 {"key": key, "coll": coll, "id": id_})
+                apply_op(self.store, self.relations, self.indexes, self.log.ops[-1])
+                deleted += 1
+        if deleted and self.path:
+            self._persist_meta()
+        return deleted
 
     # --- relations ----------------------------------------------------------
     def link(self, frm: str, rel: str, to: str, client: str = "local",
@@ -277,7 +380,38 @@ class NEDB:
 
         if plan.get("limit") is not None:
             rows = rows[: plan["limit"]]
-        return [d for _, d in rows]
+
+        result = [d for _, d in rows]
+
+        # GROUP BY [COUNT | SUM f | AVG f | MIN f | MAX f]
+        if plan.get("group_by"):
+            gb_field = plan["group_by"]
+            agg      = plan.get("aggregate")
+            groups: dict = {}
+            for d in result:
+                gkey = d.get(gb_field)
+                groups.setdefault(gkey, []).append(d)
+            grouped = []
+            for gval, gdocs in groups.items():
+                entry: dict = {gb_field: gval, "count": len(gdocs)}
+                if agg:
+                    fn, af = agg
+                    if fn == "count":
+                        pass  # already in entry["count"]
+                    else:
+                        nums = [d[af] for d in gdocs if af in d and isinstance(d[af], (int, float))]
+                        if fn == "sum":
+                            entry[f"sum_{af}"] = sum(nums)
+                        elif fn == "avg":
+                            entry[f"avg_{af}"] = sum(nums) / len(nums) if nums else None
+                        elif fn == "min":
+                            entry[f"min_{af}"] = min(nums) if nums else None
+                        elif fn == "max":
+                            entry[f"max_{af}"] = max(nums) if nums else None
+                grouped.append(entry)
+            return grouped
+
+        return result
 
     # --- files (git-style, Cascade-compressed) ------------------------------
     def put_file(self, name: str, data: bytes, tier: str = "warm", client: str = "local",

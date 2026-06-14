@@ -19,6 +19,7 @@ from __future__ import annotations
 from .engine import NEDB
 from .log import Op, OpLog, ReplayError
 from .query import Query, parse_nql
+from .snapshot import save_snapshot, load_snapshot
 from .sql import sql_exec, sql_to_nql, SQLError, SQLUnsupportedError
 from .redis_compat import RedisCompat, RedisError, RedisUnsupportedError
 from .autoindex import AutoIndexDB
@@ -32,9 +33,10 @@ except ImportError:  # pure-Python install (sdist / unsupported platform)
 
 __all__ = [
     "NEDB", "OpLog", "Op", "ReplayError", "Query", "parse_nql",
+    "save_snapshot", "load_snapshot",
     "sql_exec", "sql_to_nql", "SQLError", "SQLUnsupportedError",
     "RedisCompat", "RedisError", "RedisUnsupportedError",
     "AutoIndexDB",
     "_native", "__has_native__",
 ]
-__version__ = "0.4.2"
+__version__ = "0.5.0"
