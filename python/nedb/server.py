@@ -366,7 +366,15 @@ def main() -> None:
     httpd = ThreadingHTTPServer((host, port), make_handler(manager, token))
     auth = "on" if token else "off"
     print(f"nedbd {__version__} — http://{host}:{port}  data={os.path.abspath(data)}  auth={auth}")
-    print(f"  {len(manager.names())} database(s): {', '.join(manager.names()) or '(none)'}")
+    # Eagerly open all known databases so backfill-encrypt (if needed) runs
+    # immediately and is visible in the boot log, not hidden on first request.
+    names = manager.names()
+    for name in names:
+        try:
+            manager.open(name)
+        except Exception as e:
+            print(f"  [{name}] failed to open: {e}")
+    print(f"  {len(names)} database(s): {', '.join(names) or '(none)'}")
 
     def _shutdown(signum, _frame):
         """SIGTERM / SIGINT — checkpoint all databases then exit cleanly.
