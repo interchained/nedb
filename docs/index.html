@@ -3,10 +3,10 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>NEDB — a versioned, time-traveling embedded database</title>
-<meta name="description" content="NEDB is a versioned, self-compressing, time-traveling embedded database: replay-protected, idempotent, relational, searchable, with durable append-only persistence and a server daemon (nedbd). pip install nedb-engine." />
+<title>NEDB — bi-temporal, causal, embedded database</title>
+<meta name="description" content="NEDB v1.0.5 — bi-temporal queries, causal write provenance, AES-256-GCM encryption, concurrent group-commit sequencer, SQL/Redis/MongoDB adapters, RESP2 wire protocol, Rust native core. pip install nedb-engine." />
 <meta property="og:title" content="NEDB" />
-<meta property="og:description" content="A versioned, time-traveling embedded database — durable persistence, a server daemon, and NQL. pip install nedb-engine." />
+<meta property="og:description" content="Bi-temporal, causal-provenance embedded database — answers 'what did the system know at seq 200 about what was true on 2024-06-15?' pip install nedb-engine." />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
@@ -52,8 +52,8 @@
   .btn-primary:hover { background: var(--accent-soft); }
   .btn-ghost { border-color: var(--line); color: var(--ink); }
   .btn-ghost:hover { border-color: var(--accent); }
-  .install { margin-top: 10px; }
-  .install code { background: var(--bg2); border: 1px solid var(--line); border-radius: 9px; padding: 9px 14px; font-size: 14px; }
+  .install { margin-top: 10px; display: flex; flex-direction: column; gap: 7px; }
+  .install code { background: var(--bg2); border: 1px solid var(--line); border-radius: 9px; padding: 9px 14px; font-size: 14px; display: inline-block; }
   .badges { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 22px; }
   .badges img { height: 20px; }
 
@@ -87,6 +87,15 @@
   .card p { margin: 0; color: var(--muted); font-size: 14px; }
   .card .ic { font-size: 18px; margin-bottom: 8px; }
 
+  /* grammar table */
+  .gram { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px 22px; margin-top: 22px; overflow-x: auto; }
+  .gram table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+  .gram th { text-align: left; color: var(--faint); font-weight: 600; font-size: 11.5px; letter-spacing: 1px; text-transform: uppercase; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+  .gram td { padding: 8px 0; border-bottom: 1px solid #1a202a; vertical-align: top; }
+  .gram td:first-child { font-family: "JetBrains Mono", monospace; color: var(--accent2); padding-right: 18px; white-space: nowrap; }
+  .gram td:last-child { color: var(--muted); }
+  .gram tr:last-child td { border-bottom: none; }
+
   footer { border-top: 1px solid var(--line); padding: 38px 0 60px; color: var(--faint); font-size: 14px; }
   footer .row { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 14px; align-items: center; }
   footer a { color: var(--muted); } footer a:hover { color: var(--ink); }
@@ -103,7 +112,7 @@
       <a class="hide" href="#server">Server</a>
       <a href="reference.html">Docs</a>
       <a href="https://github.com/Eth-Interchained/nedb/blob/master/docs/SPEC.md">Spec</a>
-      <a class="nav-cta" href="https://github.com/Eth-Interchained/nedb">GitHub →</a>
+      <a class="nav-cta" href="https://github.com/Eth-Interchained/nedb">GitHub &rarr;</a>
     </nav>
   </div>
 </header>
@@ -111,32 +120,53 @@
 <section class="hero">
   <div class="wrap grid2">
     <div>
-      <span class="relpill">● Latest <span class="v mono">v0.3.1</span> · Apache-2.0</span>
+      <span class="relpill">&#9679; Latest <span class="v mono">v1.0.5</span> &middot; GPL-3.0-or-later</span>
       <h1>NEDB</h1>
-      <p class="tag">A versioned, time-traveling embedded database. <b>Replay-protected, durable, relational, searchable</b> — with an append-only log you can prove, and a server daemon when you need one.</p>
+      <p class="tag">The embedded database that answers <b>&ldquo;what did the system know, and when?&rdquo;</b> Bi-temporal queries, causal write provenance, AES-256-GCM encryption, and a Rust core &mdash; all in one append-only hash chain.</p>
       <div class="cta">
         <a class="btn btn-primary" href="https://github.com/Eth-Interchained/nedb">View on GitHub</a>
-        <a class="btn btn-ghost" href="https://pypi.org/project/nedb-engine/">PyPI</a>
+        <a class="btn btn-ghost" href="https://studio.interchained.org">NEDB Studio &rarr;</a>
       </div>
-      <div class="install"><code class="mono"><span class="accent">$</span> pip install nedb-engine</code></div>
+      <div class="install">
+        <code class="mono"><span class="accent">$</span> pip install nedb-engine</code>
+        <code class="mono"><span class="accent">$</span> npm install nedb-engine</code>
+      </div>
       <div class="badges">
         <img alt="PyPI" src="https://img.shields.io/pypi/v/nedb-engine?color=34d399&label=pypi" />
-        <img alt="Python" src="https://img.shields.io/pypi/pyversions/nedb-engine?color=22d3ee" />
-        <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-818cf8" />
-        <img alt="tests" src="https://img.shields.io/badge/invariants-11%2F11-34d399" />
+        <img alt="npm" src="https://img.shields.io/npm/v/nedb-engine?color=22d3ee&label=npm" />
+        <img alt="License" src="https://img.shields.io/badge/license-GPL--3.0--or--later-818cf8" />
+        <img alt="invariants" src="https://img.shields.io/badge/invariants-11%2F11-34d399" />
       </div>
     </div>
     <div class="code">
-      <div class="bar"><span class="d r"></span><span class="d y"></span><span class="d g"></span><span class="fn mono">quickstart.py</span></div>
+      <div class="bar"><span class="d r"></span><span class="d y"></span><span class="d g"></span><span class="fn mono">causal_bitemporal.py</span></div>
 <pre class="mono"><span class="k">from</span> nedb <span class="k">import</span> NEDB
 
-db = <span class="f">NEDB</span>(<span class="s">"./data"</span>)            <span class="c"># durable: append-only log on disk</span>
-db.<span class="f">create_index</span>(<span class="s">"users"</span>, <span class="s">"status"</span>, <span class="s">"eq"</span>)
-db.<span class="f">put</span>(<span class="s">"users"</span>, <span class="s">"alice"</span>, {<span class="s">"name"</span>: <span class="s">"Alice"</span>, <span class="s">"status"</span>: <span class="s">"active"</span>})
+db = <span class="f">NEDB</span>(<span class="s">"./data"</span>)   <span class="c"># AES-256-GCM if NEDB_TMK set</span>
 
-db.<span class="f">query</span>(<span class="s">'FROM users WHERE status = "active" ORDER BY name'</span>)
-db.<span class="f">get</span>(<span class="s">"users"</span>, <span class="s">"alice"</span>, as_of=<span class="n">0</span>)   <span class="c"># time-travel</span>
-<span class="k">assert</span> db.<span class="f">verify</span>()                  <span class="c"># hash chain intact</span></pre>
+<span class="c"># Write with causal provenance</span>
+db.<span class="f">put</span>(<span class="s">"claims"</span>, <span class="s">"c1"</span>, {
+    <span class="s">"fact"</span>: <span class="s">"Earth orbits Sun"</span>,
+    <span class="s">"valid_from"</span>: <span class="s">"1543-01-01"</span>,
+    <span class="s">"caused_by"</span>: <span class="s">"obs:heliocentric-model"</span>,
+    <span class="s">"evidence"</span>: <span class="s">"Copernicus 1543"</span>,
+    <span class="s">"confidence"</span>: <span class="n">0.9999</span>,
+})
+
+<span class="c"># Bi-temporal: what did the system know at</span>
+<span class="c"># seq 200 about what was true on 2024-06-15?</span>
+db.<span class="f">query</span>(
+    <span class="s">'FROM claims AS OF 200'</span>
+    <span class="s">' VALID AS OF "2024-06-15"'</span>
+    <span class="s">' WHERE confidence > 0.9'</span>
+)
+
+<span class="c"># Causal trace: why does the agent believe X?</span>
+db.<span class="f">query</span>(<span class="s">'FROM claims TRACE caused_by'</span>)
+<span class="c"># Forward: what did this observation cause?</span>
+db.<span class="f">query</span>(<span class="s">'FROM claims TRACE caused_by REVERSE'</span>)
+
+<span class="k">assert</span> db.<span class="f">verify</span>()     <span class="c"># hash chain intact</span></pre>
     </div>
   </div>
 </section>
@@ -144,15 +174,41 @@ db.<span class="f">get</span>(<span class="s">"users"</span>, <span class="s">"a
 <section id="why">
   <div class="wrap">
     <div class="kick">Why NEDB</div>
-    <h2>Redis-class speed, with the things real systems need</h2>
-    <p class="lede">Redis is fast because it's in-memory and simple — but relations are hand-rolled, history is gone the moment you overwrite, and every call pays a hop. NEDB keeps the speed and builds idempotency, replay protection, MVCC, time-travel, and durability into <b>one hash-chained, append-only log</b>.</p>
+    <h2>The first embedded database that answers &ldquo;why does the agent believe X?&rdquo;</h2>
+    <p class="lede">NEDB seals <span class="mono">caused_by</span>, <span class="mono">evidence</span>, and <span class="mono">confidence</span> directly into its hash chain &mdash; so every fact carries a cryptographically-linked audit trail. Combine that with bi-temporal queries and a concurrent Rust core and you get something no other embedded database offers: <b>four-dimensional auditability at embedded-database speed.</b></p>
     <div class="cards">
-      <div class="card"><div class="ic">⛓️</div><h3>Replay-protected log</h3><p>Every write carries a monotonic per-client nonce + optional idempotency key. Retries are no-ops; tampering is detectable via <span class="mono">verify()</span>.</p></div>
-      <div class="card"><div class="ic">🕰️</div><h3>Time-travel</h3><p>Read the database exactly as it was at any past sequence — <span class="mono">AS OF seq</span>. MVCC snapshots and deterministic replay fall out of the same log.</p></div>
-      <div class="card"><div class="ic">💾</div><h3>Durable, Redis-style</h3><p>Point a database at a path and every op is appended to disk and <span class="mono">fsync</span>'d; it reloads by replaying the log. <span class="mono">verify()</span> and <span class="mono">AS OF</span> survive restarts.</p></div>
-      <div class="card"><div class="ic">🔗</div><h3>First-class relations</h3><p>Adjacency-list graph edges with O(1) traversal — and the graph time-travels too.</p></div>
-      <div class="card"><div class="ic">🔎</div><h3>Filter · sort · search</h3><p>Equality, ordered, and full-text inverted indexes, maintained incrementally. One small query language: NQL.</p></div>
-      <div class="card"><div class="ic">📦</div><h3>git-style files</h3><p>Content-defined chunking + dedup + compression tiers. Every file version gets a Merkle root you can anchor on-chain.</p></div>
+      <div class="card"><div class="ic">&#128344;</div><h3>Bi-temporal Queries</h3><p><span class="mono">VALID AS OF "date"</span> for business time + <span class="mono">AS OF seq</span> for transaction time. Ask the four-dimensional question: &ldquo;what did the system know at seq 200 about what was true on 2024-06-15?&rdquo;</p></div>
+      <div class="card"><div class="ic">&#128279;</div><h3>Causal Write Provenance</h3><p><span class="mono">caused_by</span>, <span class="mono">evidence</span>, <span class="mono">confidence</span> sealed in the hash chain. <span class="mono">TRACE caused_by</span> walks backward (why?) and <span class="mono">TRACE caused_by REVERSE</span> walks forward (what did this cause?).</p></div>
+      <div class="card"><div class="ic">&#9889;</div><h3>Concurrent Group-Commit</h3><p>nedbd handles parallel reads and batched writes safely via a lock-free sequencer. ~15&thinsp;K writes/s under load &mdash; without sacrificing durability or chain integrity.</p></div>
+      <div class="card"><div class="ic">&#128260;</div><h3>SQL + Redis + MongoDB Adapters</h3><p>All three wire protocols speak the same Rust engine. Migrate from any stack without changing your queries &mdash; and add RESP2 for <span class="mono">redis-cli</span> compatibility via <span class="mono">NEDBD_RESP2_PORT=6380</span>.</p></div>
+      <div class="card"><div class="ic">&#128274;</div><h3>AES-256-GCM Encryption</h3><p>Set <span class="mono">NEDB_TMK=&lt;32-byte-hex&gt;</span> and every record is encrypted at rest. The hash chain remains verifiable; keys never touch the log.</p></div>
+      <div class="card"><div class="ic">&#128295;</div><h3>Self-Healing Chains</h3><p>Structural gaps are detected and auto-repaired on open. Combined with the Rust native core (napi-rs for Node, PyO3 for Python), the same compiled engine powers both runtimes.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="nql">
+  <div class="wrap">
+    <div class="kick">NQL Grammar</div>
+    <h2>One query language for all four dimensions</h2>
+    <p class="lede">NQL composes cleanly &mdash; any clause is optional, order is consistent, and the same syntax works across the Python, Node, SQL, Redis, and MongoDB adapters.</p>
+    <div class="gram">
+      <table>
+        <thead><tr><th>Clause</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td>FROM &lt;coll&gt;</td><td>Target collection</td></tr>
+          <tr><td>AS OF &lt;seq&gt;</td><td>Transaction-time travel &mdash; read DB state as it existed at sequence number</td></tr>
+          <tr><td>VALID AS OF "&lt;date&gt;"</td><td>Valid-time travel &mdash; filter records whose validity window includes the given date</td></tr>
+          <tr><td>WHERE &lt;expr&gt;</td><td>Filter with equality, comparison, boolean logic, and nested field access</td></tr>
+          <tr><td>SEARCH "text"</td><td>Full-text search via incremental inverted index</td></tr>
+          <tr><td>ORDER BY &lt;field&gt;</td><td>Ordered result set (ascending/descending)</td></tr>
+          <tr><td>TRAVERSE &lt;rel&gt;</td><td>Graph traversal over adjacency-list edges (time-travels with the rest)</td></tr>
+          <tr><td>TRACE caused_by</td><td>Backward causal trace &mdash; follows the provenance chain: why does the agent believe X?</td></tr>
+          <tr><td>TRACE caused_by REVERSE</td><td>Forward causal trace &mdash; what downstream facts did this event produce?</td></tr>
+          <tr><td>LIMIT n</td><td>Cap result count</td></tr>
+          <tr><td>GROUP BY &lt;field&gt; COUNT|SUM|AVG|MIN|MAX</td><td>Aggregations, evaluated after all filters</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 </section>
@@ -160,11 +216,13 @@ db.<span class="f">get</span>(<span class="s">"users"</span>, <span class="s">"a
 <section id="whatsnew">
   <div class="wrap">
     <div class="kick">Release highlights</div>
-    <h2>The 0.3 line</h2>
+    <h2>The 1.0 line</h2>
     <div class="rel">
-      <div class="relrow"><div class="ver">v0.3.1</div><div><h3>Universal install</h3><p>Pure-Python wheel + sdist — <span class="mono">pip install nedb-engine</span> works on every platform and Python, and always ships the <span class="mono">nedbd</span> command.</p></div></div>
-      <div class="relrow"><div class="ver">v0.3.0</div><div><h3>nedbd — the server daemon</h3><p>Run NEDB as a long-lived HTTP/JSON server. Each database is durable and held open in memory; connect over a URL like Redis or Postgres.</p></div></div>
-      <div class="relrow"><div class="ver">v0.2.0</div><div><h3>Durable persistence</h3><p>Append-only log (AOF) on disk + load-by-replay. The tamper-evident chain — and time-travel — now survive a restart.</p></div></div>
+      <div class="relrow"><div class="ver">v1.0.5</div><div><h3>Bi-temporal stability &amp; Studio GA</h3><p>Production-hardened <span class="mono">VALID AS OF</span> indexing, improved self-healing on corrupt segments, and NEDB Studio goes generally available at <span class="mono">studio.interchained.org</span> &mdash; prompt-to-database GUI with live chain inspection.</p></div></div>
+      <div class="relrow"><div class="ver">v1.0.x</div><div><h3>Rust native core (napi-rs + PyO3)</h3><p>Same compiled Rust core surfaces to Node via napi-rs and to Python via maturin/PyO3. Both <span class="mono">npm install nedb-engine</span> and <span class="mono">pip install nedb-engine</span> ship native binaries with a pure fallback.</p></div></div>
+      <div class="relrow"><div class="ver">v0.9.x</div><div><h3>RESP2 wire protocol + adapters</h3><p>nedbd now speaks RESP2 &mdash; set <span class="mono">NEDBD_RESP2_PORT=6380</span> and connect any <span class="mono">redis-cli</span> client. SQL and MongoDB adapters landed alongside, all sharing the same engine.</p></div></div>
+      <div class="relrow"><div class="ver">v0.8.x</div><div><h3>Causal Write Provenance + bi-temporal</h3><p><span class="mono">caused_by</span>, <span class="mono">evidence</span>, and <span class="mono">confidence</span> are now first-class fields sealed in the hash chain. <span class="mono">TRACE caused_by [REVERSE]</span> introduced. Bi-temporal <span class="mono">VALID AS OF</span> clause added alongside existing <span class="mono">AS OF seq</span>.</p></div></div>
+      <div class="relrow"><div class="ver">v0.7.x</div><div><h3>Concurrent group-commit sequencer + AES-256-GCM</h3><p>nedbd gained a lock-free sequencer for parallel reads and batched writes (~15&thinsp;K writes/s). At-rest encryption via <span class="mono">NEDB_TMK</span> and self-healing chain repair on open also shipped in this cycle.</p></div></div>
     </div>
     <p class="lede" style="margin-top:16px">Full history on <a class="accent" href="https://github.com/Eth-Interchained/nedb/releases">GitHub Releases</a>.</p>
   </div>
@@ -175,18 +233,22 @@ db.<span class="f">get</span>(<span class="s">"users"</span>, <span class="s">"a
     <div>
       <div class="kick">Run it as a server</div>
       <h2>nedbd</h2>
-      <p class="lede"><span class="mono">pip install nedb-engine</span> ships a daemon. Run the engine as its own process and connect clients over HTTP — the way you'd run Redis or Postgres. Each named database is durable and held open in memory.</p>
+      <p class="lede"><span class="mono">pip install nedb-engine</span> or <span class="mono">npm install nedb-engine</span> ships the daemon. Run the Rust engine as its own process and connect clients over HTTP, RESP2, SQL, or MongoDB wire &mdash; whichever fits your stack. The group-commit sequencer handles concurrent access safely.</p>
     </div>
     <div class="code">
       <div class="bar"><span class="d r"></span><span class="d y"></span><span class="d g"></span><span class="fn mono">shell</span></div>
-<pre class="mono"><span class="accent">$</span> nedbd                 <span class="c"># http://127.0.0.1:7070</span>
+<pre class="mono"><span class="accent">$</span> nedbd                      <span class="c"># http://127.0.0.1:7070</span>
+<span class="accent">$</span> NEDBD_RESP2_PORT=6380 nedbd <span class="c"># also speaks redis-cli</span>
 
+<span class="c"># Create a database and write with provenance</span>
 <span class="accent">$</span> curl -X POST localhost:7070/v1/databases \
-    -d <span class="s">'{"name":"shop","init":{"seed":{"users":[{"id":"u1","name":"Ada"}]}}}'</span>
+    -d <span class="s">'{"name":"agents"}'</span>
 
-<span class="accent">$</span> curl -X POST localhost:7070/v1/databases/shop/query \
-    -d <span class="s">'{"nql":"FROM users WHERE name = \"Ada\""}'</span>
-<span class="c"># env: NEDBD_HOST · NEDBD_PORT · NEDBD_DATA · NEDBD_TOKEN</span></pre>
+<span class="accent">$</span> curl -X POST localhost:7070/v1/databases/agents/query \
+    -d <span class="s">'{"nql":"FROM beliefs AS OF 200 VALID AS OF \"2024-06-15\" WHERE confidence > 0.8 TRACE caused_by"}'</span>
+
+<span class="c"># env: NEDBD_HOST · NEDBD_PORT · NEDBD_DATA</span>
+<span class="c">#      NEDBD_TOKEN · NEDB_TMK (AES-256-GCM key)</span></pre>
     </div>
   </div>
 </section>
@@ -195,10 +257,16 @@ db.<span class="f">get</span>(<span class="s">"users"</span>, <span class="s">"a
   <div class="wrap">
     <div class="kick">Install</div>
     <h2>Two lines to a database</h2>
-    <div class="cta" style="margin-top:18px">
-      <code class="mono" style="background:var(--bg2);border:1px solid var(--line);border-radius:9px;padding:11px 16px">pip install nedb-engine</code>
+    <div class="cta" style="margin-top:18px; flex-direction: column; align-items: flex-start;">
+      <code class="mono" style="background:var(--bg2);border:1px solid var(--line);border-radius:9px;padding:11px 16px"><span class="accent">$</span> pip install nedb-engine</code>
+      <code class="mono" style="background:var(--bg2);border:1px solid var(--line);border-radius:9px;padding:11px 16px"><span class="accent">$</span> npm install nedb-engine</code>
     </div>
-    <p class="lede" style="margin-top:14px"><span class="mono">NEDB()</span> is in-memory; <span class="mono">NEDB("./path")</span> is durable. <span class="mono">nedbd</span> runs it as a server. The pure-Python reference is the always-works core; a native Rust core is additive (roadmap). Read the <a class="accent" href="https://github.com/Eth-Interchained/nedb/blob/master/docs/SPEC.md">format spec</a>.</p>
+    <p class="lede" style="margin-top:18px"><span class="mono">NEDB()</span> is in-memory; <span class="mono">NEDB("./path")</span> is durable. <span class="mono">nedbd</span> runs it as a server. The Rust core ships as a native binary with a pure fallback. Set <span class="mono">NEDB_TMK</span> for AES-256-GCM at-rest encryption. Read the <a class="accent" href="https://github.com/Eth-Interchained/nedb/blob/master/docs/SPEC.md">format spec</a> or explore your data visually in <a class="accent" href="https://studio.interchained.org">NEDB Studio</a>.</p>
+    <div class="badges" style="margin-top: 20px;">
+      <a href="https://github.com/Eth-Interchained/nedb" target="_blank" rel="noopener noreferrer"><img alt="GitHub (source)" src="https://img.shields.io/badge/github-Eth--Interchained%2Fnedb-34d399?logo=github" /></a>
+      <a href="https://github.com/aiassistsecure/nedb" target="_blank" rel="noopener noreferrer"><img alt="GitHub (mirror)" src="https://img.shields.io/badge/github-aiassistsecure%2Fnedb-22d3ee?logo=github" /></a>
+      <a href="https://studio.interchained.org" target="_blank" rel="noopener noreferrer"><img alt="NEDB Studio" src="https://img.shields.io/badge/NEDB_Studio-studio.interchained.org-818cf8" /></a>
+    </div>
   </div>
 </section>
 
@@ -206,14 +274,15 @@ db.<span class="f">get</span>(<span class="s">"users"</span>, <span class="s">"a
   <div class="wrap row">
     <div>
       <div class="brand" style="margin-bottom:7px"><span class="dot"></span> NEDB</div>
-      <div>Apache-2.0 · © <a href="https://interchained.org">INTERCHAINED, LLC</a> · built with <a href="https://aiassist.net">AiAssist</a></div>
+      <div>GPL-3.0-or-later &middot; &copy; <a href="https://interchained.org">INTERCHAINED, LLC</a> &middot; built with <a href="https://aiassist.net">AiAssist</a></div>
     </div>
     <nav class="nav-links">
       <a href="https://github.com/Eth-Interchained/nedb">GitHub</a>
       <a href="https://pypi.org/project/nedb-engine/">PyPI</a>
+      <a href="https://www.npmjs.com/package/nedb-engine">npm</a>
+      <a href="https://studio.interchained.org">Studio</a>
       <a href="https://github.com/Eth-Interchained/nedb/blob/master/docs/SPEC.md">Spec</a>
       <a href="https://interchained.org">interchained.org</a>
-      <a href="https://aiassist.net">AiAssist.net</a>
     </nav>
   </div>
 </footer>
