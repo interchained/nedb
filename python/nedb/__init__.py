@@ -28,6 +28,7 @@ from .mongo import (
 )
 from .autoindex import AutoIndexDB
 from .concurrent import Sequencer
+from .wrap_redis import wrap_redis, WrappedRedis
 
 try:  # compiled Rust core, present in platform wheels (PyO3 via maturin)
     from . import _native  # type: ignore
@@ -43,6 +44,7 @@ __all__ = [
     "RedisCompat", "RedisError", "RedisUnsupportedError",
     "MongoCompat", "MongoClient", "MongoError", "MongoUnsupportedError", "ObjectId",
     "AutoIndexDB", "Sequencer",
+    "wrap_redis", "WrappedRedis",
     "_native", "__has_native__",
 ]
-__version__ = "1.0.5"
+__version__ = "1.1.0"
