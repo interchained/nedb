@@ -245,6 +245,13 @@ pre{
       <a href="#resp2">RESP2 Wire Protocol</a>
     </div>
     <div class="sb-group">
+      <div class="sb-group-label">v1.x features</div>
+      <a href="#wrap-redis">wrap_redis() Layer-2</a>
+      <a href="#wrap-redis-backfill">Backfill</a>
+      <a href="#wrap-redis-shadow">Write Shadowing</a>
+      <a href="#wrap-redis-nedbd">nedbd Mode</a>
+    </div>
+    <div class="sb-group">
       <div class="sb-group-label">Release</div>
       <a href="#changelog">Changelog</a>
     </div>
@@ -253,7 +260,7 @@ pre{
   <div class="sb-footer">
     <a href="index.html">← Back to site</a> &nbsp;·&nbsp;
     <a href="https://github.com/Eth-Interchained/nedb">GitHub</a><br>
-    Apache-2.0 · © INTERCHAINED, LLC
+    GPL-3.0-or-later · © INTERCHAINED LLC
   </div>
 </nav>
 
@@ -1043,6 +1050,206 @@ r.execute(<span class="cs">"EXPIRE"</span>, <span class="cs">"k"</span>, <span c
   </div>
 </section>
 
+<!-- ═══════════════════ WRAP_REDIS ═══════════════════ -->
+<section class="section" id="wrap-redis">
+  <div class="section-tag">v1.x features</div>
+  <h2>wrap_redis() — Redis Layer-2</h2>
+  <p class="section-lead">Already running on Redis? Wrap your connection in <strong>one line</strong> and add NEDB's full feature set alongside your existing app — zero migration required, zero impact on your existing keys.</p>
+
+  <p>Two surfaces coexist on the same connection:</p>
+  <ul>
+    <li><strong>Surface 1</strong> — every Redis command (<code>r.set</code>, <code>r.hset</code>, <code>r.get</code>, …) passes through to Redis unchanged. Alice's app code doesn't change.</li>
+    <li><strong>Surface 2</strong> — <code>r.nedb.*</code> exposes the full NEDB API: NQL queries, time-travel, causal provenance, hash chain verification.</li>
+  </ul>
+
+  <div class="code-wrap">
+    <div class="code-label">Python — one-line wrap</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre><span class="ck">import</span> redis, json
+<span class="ck">from</span> nedb <span class="ck">import</span> wrap_redis
+
+<span class="cc"># ONE LINE — Alice's app code doesn't change</span>
+r = wrap_redis(redis.Redis(<span class="cs">"localhost"</span>, <span class="cn">6379</span>), db_name=<span class="cs">"rideshare"</span>)
+
+<span class="cc"># Surface 1 — existing Redis commands, unchanged</span>
+r.set(<span class="cs">"driver:d1"</span>, json.dumps({<span class="cs">"name"</span>: <span class="cs">"Bob"</span>, <span class="cs">"status"</span>: <span class="cs">"active"</span>}))
+r.get(<span class="cs">"driver:d1"</span>)     <span class="cc"># → b'{"name": "Bob", ...}'</span>
+r.hset(<span class="cs">"trip:t1"</span>, mapping={<span class="cs">"status"</span>: <span class="cs">"requested"</span>})
+
+<span class="cc"># Surface 2 — new NEDB features on the same connection</span>
+r.nedb.put(<span class="cs">"driver"</span>, <span class="cs">"d1"</span>, {<span class="cs">"name"</span>: <span class="cs">"Bob"</span>, <span class="cs">"status"</span>: <span class="cs">"active"</span>})
+r.nedb.query(<span class="cs">'FROM driver WHERE status = "active"'</span>)
+r.nedb.verify()    <span class="cc"># → True</span></pre>
+  </div>
+
+  <h3>Isolation guarantee</h3>
+  <p>NEDB <strong>never writes to Alice's namespace</strong>. It owns only keys prefixed <code>nedb:{db_name}:</code>:</p>
+  <table class="ptbl">
+    <tr><th>Key</th><th>Type</th><th>Purpose</th></tr>
+    <tr><td><code>nedb:{db_name}:oplog</code></td><td>Redis Stream</td><td>Append-only op log (in-process mode)</td></tr>
+    <tr><td><code>nedb:{db_name}:snapshot</code></td><td>Redis Hash</td><td>Checkpoint</td></tr>
+    <tr><td><code>nedb:{db_name}:meta</code></td><td>Redis Hash</td><td>Index configuration</td></tr>
+  </table>
+
+  <h3>wrap_redis() signature</h3>
+  <div class="code-wrap">
+    <div class="code-label">Python</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre>wrap_redis(
+    r,                         <span class="cc"># redis.Redis (or compatible) connection</span>
+    db_name: str = "default",  <span class="cc"># logical name; NEDB uses nedb:{db_name}:*</span>
+    nedbd_url: str = None,     <span class="cc"># route r.nedb.* to a nedbd server (see below)</span>
+    nedbd_token: str = None,   <span class="cc"># bearer token for nedbd auth (optional)</span>
+) → WrappedRedis</pre>
+  </div>
+
+  <div class="note">
+    <p><strong>Local testing — no Redis server needed:</strong> use <a href="https://github.com/cunla/fakeredis-py" target="_blank" rel="noopener">fakeredis</a> as a drop-in. See <code>examples/fakeredis_demo.py</code> in the repo.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ WRAP_REDIS — BACKFILL ═══════════════════ -->
+<section class="section" id="wrap-redis-backfill">
+  <div class="section-tag">v1.x features</div>
+  <h2>Backfill — import existing Redis data</h2>
+  <p class="section-lead">One-time SCAN of Alice's existing Redis keys into NEDB's hash chain. After backfill, all historical data is queryable via NQL, time-travelable, and verified.</p>
+
+  <h3>Three-step migration</h3>
+  <div class="code-wrap">
+    <div class="code-label">Python</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre><span class="cc"># Step 1 — register: map Redis key globs to NEDB collections (chainable)</span>
+(r.nedb
+ .register(<span class="cs">"driver:*"</span>, collection=<span class="cs">"driver"</span>, value_parser=json.loads)
+ .register(<span class="cs">"trip:*"</span>,   collection=<span class="cs">"trip"</span>,   value_type=<span class="cs">"hash"</span>)
+)
+
+<span class="cc"># Step 2 — backfill: import all existing Redis data once</span>
+imported = r.nedb.backfill()     <span class="cc"># → int (number of keys imported)</span>
+
+<span class="cc"># Step 3 — shadow: all future surface-1 writes auto-chain</span>
+r.nedb.shadow_writes = <span class="ck">True</span></pre>
+  </div>
+
+  <h3>register() — collection mapping</h3>
+  <table class="ptbl">
+    <tr><th>Param</th><th>Type</th><th>Description</th></tr>
+    <tr><td><code>pattern</code></td><td>str</td><td>Redis key glob, e.g. <code>"driver:*"</code></td></tr>
+    <tr><td><code>collection</code></td><td>str</td><td>NEDB collection name</td></tr>
+    <tr><td><code>id_extractor</code></td><td>callable</td><td><code>fn(key) → id</code>. Default: <code>key.rsplit(":", 1)[-1]</code></td></tr>
+    <tr><td><code>value_parser</code></td><td>callable</td><td><code>fn(raw) → dict</code>. Default: JSON decode, fallback to <code>{"_v": raw}</code></td></tr>
+    <tr><td><code>value_type</code></td><td>str</td><td><code>"string"</code> (default) · <code>"hash"</code> · <code>"json"</code></td></tr>
+  </table>
+  <p>Returns <code>self</code> for chaining.</p>
+
+  <h3>backfill() — one-pass SCAN import</h3>
+  <div class="code-wrap">
+    <div class="code-label">Python</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre><span class="cc"># Backfill all registered patterns</span>
+imported = r.nedb.backfill()
+
+<span class="cc"># Or backfill a single pattern directly (no prior register needed)</span>
+imported = r.nedb.backfill(<span class="cs">"zone:*"</span>, <span class="cs">"zone"</span>, value_parser=json.loads)</pre>
+  </div>
+  <p>Every imported record gets <code>_source: "backfill"</code> and <code>_evidence: "backfill"</code> in the hash chain entry. Returns total keys imported (int).</p>
+</section>
+
+<!-- ═══════════════════ WRAP_REDIS — WRITE SHADOWING ═══════════════════ -->
+<section class="section" id="wrap-redis-shadow">
+  <div class="section-tag">v1.x features</div>
+  <h2>Write Shadowing</h2>
+  <p class="section-lead">Set <code>r.nedb.shadow_writes = True</code> and every surface-1 write is silently mirrored into NEDB's hash chain. Alice's app writes to Redis normally; NEDB captures the full write history without any code changes.</p>
+
+  <div class="code-wrap">
+    <div class="code-label">Python</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre>r.nedb.shadow_writes = <span class="ck">True</span>
+
+<span class="cc"># Alice's code — unchanged</span>
+r.set(<span class="cs">"driver:d1"</span>, json.dumps({<span class="cs">"name"</span>: <span class="cs">"Bob"</span>, <span class="cs">"status"</span>: <span class="cs">"active"</span>}))
+r.hset(<span class="cs">"trip:t1"</span>, mapping={<span class="cs">"status"</span>: <span class="cs">"en_route"</span>, <span class="cs">"driver_id"</span>: <span class="cs">"d1"</span>})
+
+<span class="cc"># → both writes auto-chained into NEDB</span>
+r.nedb.get(<span class="cs">"driver"</span>, <span class="cs">"d1"</span>)  <span class="cc"># → {"name": "Bob", "status": "active", "_source": "shadow"}</span>
+
+<span class="cc"># HSET merges with existing NEDB doc</span>
+r.nedb.get(<span class="cs">"trip"</span>, <span class="cs">"t1"</span>)   <span class="cc"># → {"status": "en_route", "driver_id": "d1", "rider_id": "u1", ...}</span>
+
+<span class="cc"># Time-travel through shadowed writes</span>
+snap = r.nedb.seq
+r.set(<span class="cs">"driver:d1"</span>, json.dumps({<span class="cs">"name"</span>: <span class="cs">"Bob"</span>, <span class="cs">"status"</span>: <span class="cs">"offline"</span>}))
+r.nedb.get_as_of(<span class="cs">"driver"</span>, <span class="cs">"d1"</span>, snap)   <span class="cc"># → {"status": "active", ...}</span>
+
+<span class="cc"># Disable at any time</span>
+r.nedb.shadow_writes = <span class="ck">False</span></pre>
+  </div>
+
+  <h3>Shadowed commands</h3>
+  <p>The following write commands are intercepted when <code>shadow_writes=True</code>: <code>set setnx setex psetex getset mset msetnx hset hmset hsetnx hincrby hincrbyfloat hdel lpush rpush lset ltrim lpop rpop sadd srem zadd zincrby zrem del unlink rename append incr incrby decr decrby setrange</code>.</p>
+  <p>Keys that match a registered pattern get a full NEDB <code>put()</code> (NQL-queryable, time-travelable). Unmatched keys get a raw chain entry (tamper-evidence only).</p>
+  <p>Shadow failures <strong>never break</strong> the Redis surface call — any error in NEDB is silently swallowed.</p>
+</section>
+
+<!-- ═══════════════════ WRAP_REDIS — NEDBD MODE ═══════════════════ -->
+<section class="section" id="wrap-redis-nedbd">
+  <div class="section-tag">v1.x features</div>
+  <h2>wrap_redis() + nedbd Mode</h2>
+  <p class="section-lead">Pass <code>nedbd_url=</code> to route all <code>r.nedb.*</code> calls to a running <strong>nedbd</strong> server instead of the in-process engine. nedbd handles its own durable AOF persistence on disk; the Redis Stream backend is bypassed entirely.</p>
+
+  <div class="code-wrap">
+    <div class="code-label">Python</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre><span class="ck">import</span> redis
+<span class="ck">from</span> nedb <span class="ck">import</span> wrap_redis
+
+r = wrap_redis(
+    redis.Redis(<span class="cs">"localhost"</span>, <span class="cn">6379</span>),
+    db_name=<span class="cs">"rideshare"</span>,
+    nedbd_url=<span class="cs">"http://localhost:8421"</span>,   <span class="cc"># ← nedbd server</span>
+    nedbd_token=<span class="cs">"my-secret"</span>,             <span class="cc"># ← optional bearer token</span>
+)
+
+<span class="cc"># Surface 1 — Redis, unchanged</span>
+r.set(<span class="cs">"driver:d1"</span>, <span class="cs">"..."</span>)
+
+<span class="cc"># Surface 2 — forwarded to nedbd over HTTP/JSON</span>
+r.nedb.put(<span class="cs">"driver"</span>, <span class="cs">"d1"</span>, {<span class="cs">"name"</span>: <span class="cs">"Bob"</span>})
+r.nedb.query(<span class="cs">'FROM driver WHERE status = "active"'</span>)
+r.nedb.verify()   <span class="cc"># → True</span>
+
+<span class="cc"># Backfill + shadow_writes work identically in nedbd mode</span>
+r.nedb.register(<span class="cs">"driver:*"</span>, <span class="cs">"driver"</span>, value_parser=json.loads)
+r.nedb.backfill()
+r.nedb.shadow_writes = <span class="ck">True</span></pre>
+  </div>
+
+  <h3>Mode comparison</h3>
+  <table class="ptbl">
+    <tr><th>Mode</th><th>How</th><th>Persistence</th><th>Best for</th></tr>
+    <tr><td><strong>In-process</strong></td><td><code>wrap_redis(r, db_name=…)</code></td><td>Redis Stream oplog</td><td>Lightweight; single-process apps</td></tr>
+    <tr><td><strong>nedbd</strong></td><td><code>wrap_redis(r, …, nedbd_url=…)</code></td><td>Durable AOF on disk</td><td>Multi-process; production deployments</td></tr>
+  </table>
+
+  <div class="note">
+    <p><strong>NedBdProxy</strong> is the internal HTTP client that translates <code>r.nedb.*</code> calls to nedbd's <code>/v1/databases/{name}/*</code> API. The surface API is <strong>identical</strong> in both modes — switching is a one-line change to <code>wrap_redis()</code>.</p>
+  </div>
+
+  <h3>Causal provenance in nedbd mode</h3>
+  <p>As of v1.2.1 the nedbd PUT endpoint accepts <code>caused_by</code>, <code>evidence</code>, <code>confidence</code>, <code>valid_from</code>, and <code>valid_to</code> from the request body and passes them through to the engine:</p>
+  <div class="code-wrap">
+    <div class="code-label">Python</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre>r.nedb.put(<span class="cs">"trip"</span>, <span class="cs">"t1"</span>,
+    {<span class="cs">"rider"</span>: <span class="cs">"u1"</span>, <span class="cs">"driver"</span>: <span class="cs">"d1"</span>},
+    caused_by=[r.nedb.seq - <span class="cn">1</span>],
+    evidence=<span class="cs">"inference"</span>,
+    confidence=<span class="cn">0.97</span>)
+
+r.nedb.query(<span class="cs">'FROM trip WHERE _id = "t1" TRACE caused_by'</span>)  <span class="cc"># works in nedbd mode</span></pre>
+  </div>
+</section>
+
 <!-- ═══════════════════ AUTOINDEX ═══════════════════ -->
 <section class="section" id="autoindex">
   <div class="section-tag">Adapters</div>
@@ -1329,6 +1536,20 @@ redis-cli -p <span class="cn">6379</span> EVAL <span class="cs">"FROM users WHER
 <section class="section" id="changelog">
   <div class="section-tag">Release History</div>
   <h2>Changelog</h2>
+
+  <div class="cl-item"><span class="cl-ver">1.2.1</span><div class="cl-body"><h4>wrap_redis() + nedbd server mode</h4><p><code>wrap_redis()</code> now accepts <code>nedbd_url=</code> and <code>nedbd_token=</code> to route all <code>r.nedb.*</code> calls to a running nedbd HTTP server instead of the in-process engine. New <code>NedBdProxy</code> class translates put/get/query/create_index/link/delete/verify/checkpoint to nedbd's <code>/v1/databases/{name}/*</code> HTTP API. Backfill and write shadowing work identically in nedbd mode. Also: nedbd PUT endpoint now passes <code>caused_by</code>, <code>evidence</code>, <code>confidence</code>, <code>valid_from</code>, <code>valid_to</code> through to the engine (previously only <code>client</code>, <code>nonce</code>, <code>idem</code> were forwarded). 29/29 nedbd integration tests; 74/74 in-process tests.</p></div></div>
+
+  <div class="cl-item"><span class="cl-ver">1.2.0</span><div class="cl-body"><h4>wrap_redis() backfill + write shadowing</h4><p>Three-step Redis migration: <code>register()</code> maps key globs to NEDB collections, <code>backfill()</code> scans existing Redis keys via <code>SCAN</code> and imports them into the hash chain in one pass (evidence tagged <code>"backfill"</code>), <code>shadow_writes = True</code> auto-chains all future surface-1 writes. New: <code>CollectionMapping</code> with custom <code>id_extractor</code> and <code>value_parser</code>; chainable <code>register()</code>; direct <code>backfill(pattern, collection)</code> without prior register. 30 new tests; 74/74 total. Also: updated <code>fakeredis_demo.py</code> (29/29 checks) and README <em>wrap_redis</em> section.</p></div></div>
+
+  <div class="cl-item"><span class="cl-ver">1.1.0</span><div class="cl-body"><h4>wrap_redis() — NEDB as a Redis layer-2</h4><p>Wrap any existing <code>redis.Redis</code> connection with NEDB in one line: <code>r = wrap_redis(redis.Redis(...), db_name="...")</code>. Two surfaces coexist: Surface 1 — every Redis command passes through unchanged; Surface 2 — <code>r.nedb.*</code> gives time-travel, NQL, causal provenance, and hash-chain verification. NEDB persists via Redis Streams (<code>nedb:{db_name}:oplog</code>). Isolation guarantee: NEDB never writes outside its <code>nedb:{db_name}:</code> prefix. 44 tests; fakeredis demo.</p></div></div>
+
+  <div class="cl-item"><span class="cl-ver">1.0.5</span><div class="cl-body"><h4>License → GPL-3.0-or-later; npm homepage fix</h4><p>Updated license in <code>package.json</code> and <code>pyproject.toml</code> from Apache-2.0 to GPL-3.0-or-later. Added explicit <code>"homepage"</code> to <code>package.json</code> to prevent npm from appending <code>#readme</code>.</p></div></div>
+
+  <div class="cl-item"><span class="cl-ver">1.0.3</span><div class="cl-body"><h4>Rust NQL integer/float comparison fix</h4><p><code>serde_json::json!(3.0f64)</code> serialises as <code>Float(3.0)</code> but a document field parsed from JSON arrives as <code>PosInt(3)</code>. Fixed by comparing via <code>as_f64()</code> in the Rust <code>nql.rs</code> <code>cmp()</code> function so integer literals and float literals compare equal when numerically equal.</p></div></div>
+
+  <div class="cl-item"><span class="cl-ver">1.0.2</span><div class="cl-body"><h4>Rust AS OF index bypass fix</h4><p>The eq index was being used even for <code>AS OF</code> queries; since the index reflects HEAD only, AS OF queries returned stale current-version results. Fixed with an <code>as_of.is_none()</code> guard so the eq index is only used for HEAD reads.</p></div></div>
+
+  <div class="cl-item"><span class="cl-ver">1.0.1</span><div class="cl-body"><h4>napi-rs Node.js binding rewrite</h4><p>Complete rewrite of <code>rust/crates/nedb-node/src/lib.rs</code> to match the current NEDB core API. Fixes API drift from the original stub. All napi-rs bindings now match <code>put/get/query/createIndex/link/verify/head/seq/getAsOf</code>.</p></div></div>
 
   <div class="cl-item"><span class="cl-ver">0.6.0</span><div class="cl-body"><h4>RESP2 wire protocol — nedbd is a drop-in Redis replacement</h4><p>Enable with <code>NEDBD_RESP2_PORT=6379 nedbd</code>. redis-cli, redis-benchmark, and every Redis client library connects natively. <code>SELECT &lt;name&gt;</code> opens a named NEDB database. <code>EVAL "&lt;nql&gt;" 0</code> runs any NQL query. All major command groups supported (strings, hashes, sets, lists); EXPIRE/TTL/SUBSCRIBE/MULTI return clear <code>-ERR</code> with roadmap note. Also: auto backfill-encrypt existing plaintext AOF on first encrypted open (v0.5.6), eager database open at startup so backfill shows in boot log (v0.5.7), <code>cryptography</code> bundled as required dep (v0.5.5).</p></div></div>
 
