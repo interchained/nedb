@@ -2,234 +2,285 @@
 
 # NEDB
 
-**A versioned, self-compressing, time-traveling embedded database.**
+**Hash-chained · time-traveling · bi-temporal · causally-provable embedded database.**
 
-Replay-protected · idempotent · relational · filterable · sortable · searchable · provable.
+Replay-protected · idempotent · relational · filterable · sortable · searchable · concurrent.
 One Rust core → ships to **PyPI** and **npm** from a single source.
 
-**[Website & docs → eth-interchained.github.io/nedb](https://eth-interchained.github.io/nedb/)**
+[![PyPI](https://img.shields.io/pypi/v/nedb-engine?label=PyPI&color=6366f1)](https://pypi.org/project/nedb-engine/)
+[![npm](https://img.shields.io/npm/v/nedb-engine?label=npm&color=00d4ff)](https://www.npmjs.com/package/nedb-engine)
+[![Tests](https://img.shields.io/badge/tests-266%20passing-34d399)](https://github.com/Eth-Interchained/nedb/actions)
+
+**[Studio → studio.interchained.org](https://studio.interchained.org)**  ·  **[nedb.aiassist.net](https://nedb.aiassist.net)**
 
 </div>
 
 ---
 
-## Why NEDB
+## What makes NEDB different
 
-Redis is fast because it's in-memory and simple — but relations are hand-rolled, history is gone the moment you overwrite, and every call pays a network hop. NEDB keeps the speed and adds the things real systems actually need:
+Every database stores *what*. NEDB stores *what*, *when*, *when it was true*, and *why* — all sealed in a cryptographic hash chain that proves none of it was tampered with.
 
-- **Faster-than-Redis latency where it's honest to claim it** — NEDB runs **embedded, in-process**, so point reads pay *no socket hop*. The networked server (`nedbd`, RESP-compatible) competes on the Rust core's merits.
-- **Replay protection + idempotency in the core, not the app.** Every write carries a strictly-monotonic per-client nonce and an optional idempotency key. Retries are no-ops; stale/out-of-order ops are rejected. This is built into one **hash-chained, append-only log**.
-- **Time-travel.** Read the database *exactly as it existed* at any past sequence — `AS OF seq`. Debugging, audit, MVCC snapshots, and deterministic replay all fall out of the same log.
-- **Durable persistence, Redis-style.** Point a database at a path and every op is appended to the hash-chained log on disk (and `fsync`'d); it reloads by replaying that log on open. It's exactly Redis's AOF model — except the append-only log is the *same tamper-evident chain* the engine already trusts, so `verify()` and `AS OF` hold across restarts and the log is never rewritten.
-- **First-class relations.** Adjacency-list graph edges with O(1) traversal — *and the graph time-travels too*.
-- **Filter / sort / search.** Equality, ordered, and full-text inverted indexes, maintained incrementally.
-- **git-style files with maximum compression.** Content-defined chunking + content-addressed dedup + temperature tiers (fast warm codec, max-ratio cold archival). Every file version has a Merkle root you can **anchor on-chain**.
-
-> **The keystone:** one nonce-enforced append-only log is the substrate for idempotency, replay protection, crash recovery, MVCC, *and* time-travel — simultaneously.
+| Capability | NEDB | SQLite | Redis | MongoDB |
+|---|:---:|:---:|:---:|:---:|
+| Hash-chained tamper evidence | ✅ | ❌ | ❌ | ❌ |
+| Time-travel reads (`AS OF seq`) | ✅ | ❌ | ❌ | ❌ |
+| Bi-temporal (`VALID AS OF date`) | ✅ | ❌ | ❌ | ❌ |
+| Causal Write Provenance | ✅ | ❌ | ❌ | ❌ |
+| Replay-protected idempotent writes | ✅ | ❌ | ❌ | ❌ |
+| SQL + Redis + MongoDB adapters | ✅ | — | — | — |
+| Concurrent group-commit daemon | ✅ | ❌ | ✅ | ✅ |
+| At-rest AES-256-GCM encryption | ✅ | ❌ | ❌ | — |
 
 ---
 
-## Quickstart (Python reference engine — runs today, zero build)
+## Install
 
 ```bash
-git clone https://github.com/Eth-Interchained/nedb && cd nedb
-pip install -e .                 # pure-Python reference; no toolchain needed
-python3 examples/demo.py         # see every feature
-python3 tests/test_nedb.py       # 11/11 invariants
+pip install nedb-engine      # Python ≥ 3.8 — pure-Python + optional Rust native wheel
+npm install nedb-engine       # Node ≥ 16   — napi-rs prebuilt binaries
 ```
+
+---
+
+## Python — 5-minute tour
 
 ```python
 from nedb import NEDB
 
-db = NEDB("./mydata")            # durable: append-only log on disk, reloads on open
-# db = NEDB()                    # (no path = purely in-memory)
+db = NEDB("./mydata")          # durable: every op is AOF-logged, fsync'd, and hash-chained
+# db = NEDB()                  # or in-memory
+
 db.create_index("users", "status", "eq")
-db.create_index("users", "age", "ordered")
-db.create_index("users", "bio", "search")
+db.create_index("users", "bio",    "search")
 
-db.put("users", "alice", {"name": "Alice", "age": 31, "status": "active",
-                          "city": "Austin", "bio": "rust systems hacker"})
+db.put("users", "alice", {"name": "Alice", "age": 31, "status": "active", "bio": "rust hacker"})
+db.put("users", "bob",   {"name": "Bob",   "age": 24, "status": "active", "bio": "python dev"})
 
-# Idempotent, replay-protected write (safe to retry forever):
-db.put("orders", "o1", {"total": 42}, client="checkout", nonce=7, idem="charge-o1")
-
-# NQL — filter + sort
-db.query('FROM users WHERE age >= 25 AND status = "active" ORDER BY age DESC')
-
-# Full-text search
+# NQL: WHERE + ORDER BY + LIMIT + SEARCH + TRAVERSE + GROUP BY
+db.query('FROM users WHERE status = "active" ORDER BY age ASC')
 db.query('FROM users SEARCH "rust"')
+db.query('FROM users GROUP BY status COUNT')
+
+# Time-travel — AS OF any past sequence
+snap = db.seq
+db.put("users", "alice", {"name": "Alice", "age": 32, "status": "retired"})
+db.get("users", "alice", as_of=snap)          # → age 31, status active
+
+# Bi-temporal — VALID AS OF any past date
+db.put("policy", "rate_2024", {"pct": 5.0}, valid_from="2024-01-01", valid_to="2024-12-31")
+db.put("policy", "rate_2025", {"pct": 6.0}, valid_from="2025-01-01")
+db.query('FROM policy VALID AS OF "2024-06-15"')   # → rate 5.0
+
+# Causal Write Provenance — why did this write happen?
+db.put("inputs", "msg_1", {"text": "user prefers dark mode"})
+seq_msg = db.seq
+db.put("beliefs", "dark_mode", {"value": True},
+       caused_by=[seq_msg], evidence="user_message", confidence=0.95)
+db.query('FROM beliefs WHERE _id = "dark_mode" TRACE caused_by')   # → msg_1
+db.query('FROM inputs WHERE _id = "msg_1" TRACE caused_by REVERSE') # → dark_mode
 
 # Relations + graph traversal
 db.link("users:alice", "follows", "users:bob")
-db.q("users").where("_id", "=", "alice").traverse("follows").run()
+db.query('FROM users WHERE _id = "alice" TRAVERSE follows')
 
-# Time-travel
-s = db.seq
-db.put("users", "alice", {"name": "Alice", "city": "Lisbon", "age": 31, "status": "active"})
-db.get("users", "alice", as_of=s)["city"]      # -> "Austin"
+# Hash-chain integrity
+assert db.verify()             # cryptographic proof — no tampering
 
-# git-style files with Cascade compression + provable history
-v1 = db.put_file("notes.txt", open("notes.txt","rb").read())
-db.file_root("notes.txt", v1)                  # Merkle root — anchorable on ITC
-
-# Durable + provable across restarts
-db.close()
-db = NEDB("./mydata")                          # replays the log on open
-assert db.verify()                             # the hash chain is intact
-db.get("users", "alice", as_of=s)["city"]      # AS OF still works -> "Austin"
+# SQL, Redis, MongoDB compatibility adapters
+from nedb import sql_exec, RedisCompat, MongoClient
+sql_exec(db, "SELECT * FROM users WHERE status = 'active' ORDER BY age DESC")
+r = RedisCompat(db); r.execute("HSET", "user:1", "name", "Alice")
+MongoClient(db)["users"].find({"status": "active"}).sort("age", -1).to_list()
 ```
 
 ---
 
-## Persistence
+## Node.js
 
-NEDB persists the way Redis does — by writing the operations, not by dumping pages — because the engine's whole thesis is that **state is a pure function of the log**.
+```javascript
+import { NedbCore } from "nedb-engine";
 
-- `NEDB(path)` opens a **durable** database in a directory. Every op is appended to `log.aof` (one JSON line) and `fsync`'d; index configuration is snapshotted to `meta.json`. On open, NEDB replays the log to rebuild state.
-- `NEDB()` with no path is **in-memory** (unchanged).
-- The append-only log is the **same hash-chained, tamper-evident chain** that powers idempotency, replay protection, and time-travel — so `verify()`, `AS OF`, relations, and the anchorable head all survive a restart. The log is **never rewritten**, so the chain (and its commitment) stays provable.
+const db = new NedbCore();               // in-memory
+// const db = NedbCore.open("./data");   // durable
 
-```python
-db = NEDB("./mydata")
-db.put("users", "alice", {"name": "Alice", "status": "active"})
-db.close()                       # flush + fsync
+db.createIndex("users", "status", "eq");
+db.put("users", "alice", JSON.stringify({ name: "Alice", age: 31, status: "active" }));
 
-again = NEDB("./mydata")         # replays log.aof
-assert again.verify()            # chain intact across the restart
-again.get("users", "alice")      # -> {"name": "Alice", ...}
+// Time-travel
+const snap = db.seq();                   // BigInt
+db.put("users", "alice", JSON.stringify({ name: "Alice", age: 32, status: "retired" }));
+JSON.parse(db.getAsOf("users", "alice", snap)).age;  // → 31
+
+// Full NQL
+const rows = db.query('FROM users WHERE status = "active" ORDER BY age ASC');
+rows.map(r => JSON.parse(r));
+
+// Tamper evidence
+db.verify();   // → true
+db.head();     // → 64-char BLAKE2b commitment hash
+db.seq();      // → BigInt
 ```
-
-> Snapshotting (an RDB-style fast-load checkpoint that keeps the AOF intact) and Rust-core parity are tracked on the roadmap.
 
 ---
 
-## nedbd — run NEDB as a server
+## nedbd — the concurrent server daemon
 
-For client/server setups (multiple apps, a remote admin UI like NEDB Studio, or just keeping the database in its own process), `pip install nedb-engine` ships a daemon. It runs the engine as a long-lived process and serves an HTTP/JSON API; each named database is a durable `NEDB(path)` held open in memory. Connect to it the way you'd connect to Redis or Postgres — over a URL.
+nedbd runs NEDB as a long-lived process with an HTTP/JSON API and an optional RESP2 wire protocol. Built on a **single-writer group-commit sequencer** — parallel reads, batched durable writes, one hash-chain per database, zero write-write races.
 
 ```bash
-nedbd                       # http://127.0.0.1:7070, data in ./nedb-data
-# config via env: NEDBD_HOST, NEDBD_PORT, NEDBD_DATA, NEDBD_TOKEN (optional bearer auth)
+nedbd                                     # :7070, data ./nedb-data
+NEDBD_RESP2_PORT=6380 nedbd               # also speak RESP2 (redis-cli compatible)
+nedbd --log-level 2                       # 0=errors 1=requests 2=deploy 3=verbose
 ```
 
 ```bash
-# create a database (optionally seeded with indexes / rows / links)
-curl -X POST localhost:7070/v1/databases -d '{"name":"shop","init":{
-  "indexes":[["users","status","eq"]],
-  "seed":{"users":[{"id":"u1","name":"Ada","status":"active"}]}}}'
+# Create a database with seed data and relations
+curl -X POST :7070/v1/databases -d '{
+  "name": "shop",
+  "init": {
+    "indexes": [["users","status","eq"]],
+    "seed": {"users": [{"_id":"u1","name":"Alice","status":"active"}]},
+    "links": [["users:u1","buys","orders:o1"]]
+  }}'
 
-# query it (real NQL, real engine)
-curl -X POST localhost:7070/v1/databases/shop/query -d '{"nql":"FROM users WHERE status = \"active\""}'
+# Query (full NQL including time-travel and bi-temporal)
+curl -X POST :7070/v1/databases/shop/query \
+  -d '{"nql":"FROM users WHERE status = \"active\" ORDER BY name ASC"}'
 
-# write, verify, time-travel — all server-side on the durable log
-curl -X POST localhost:7070/v1/databases/shop/put   -d '{"coll":"users","id":"u2","doc":{"name":"Bo"}}'
-curl       localhost:7070/v1/databases/shop/verify
+# Verify the hash chain
+curl :7070/v1/databases/shop/verify
+
+# MongoDB-compatible endpoint
+curl -X POST :7070/v1/databases/shop/mongo \
+  -d '{"collection":"users","op":"find","filter":{"status":"active"},"limit":10}'
 ```
 
-API: `GET /health` · `GET|POST /v1/databases` · `GET|DELETE /v1/databases/<name>` · `POST …/query` · `POST …/put` · `POST …/index` · `POST …/link` · `DELETE …/rows/<coll>/<id>` · `GET …/verify` · `GET …/log`. Databases persist across daemon restarts (the engine replays its append-only log on open).
+**From redis-cli — no Redis installation needed:**
+```bash
+redis-cli -p 6380 SELECT shop
+redis-cli -p 6380 SELECT shop EVAL 'FROM users SEARCH "alice"' 0
+redis-cli -p 6380 SELECT shop EVAL 'FROM users AS OF 10 WHERE status = "active"' 0
+redis-cli -p 6380 SELECT shop EVAL 'FROM beliefs TRACE caused_by' 0
+```
 
 ---
 
 ## NQL — the NEDB Query Language
 
-One small grammar; the Rust parser is the single source of truth so Python and Node share identical semantics. A fluent builder compiles to the same plan.
-
 ```
 FROM <collection>
-  [ AS OF <seq> ]
-  [ WHERE <field> <op> <value> (AND ...)* ]      op ∈ = != < <= > >=
-  [ SEARCH "<text>" ]
+  [ AS OF <seq> ]                            transaction time (when was it written?)
+  [ VALID AS OF "<date>" ]                   valid time (when was it true in the world?)
+  [ WHERE <field> <op> <value> (AND ...) ]   op: = != < <= > >=
+  [ SEARCH "<text>" ]                        full-text search
   [ ORDER BY <field> [ASC|DESC] ]
-  [ TRAVERSE <relation> ]
+  [ TRAVERSE <relation> ]                    graph traversal
+  [ TRACE caused_by [REVERSE] ]              causal provenance (why? / what did this cause?)
   [ LIMIT <n> ]
+  [ GROUP BY <field> [COUNT|SUM f|AVG f|MIN f|MAX f] ]
+```
+
+Combine both time axes:
+```python
+# What did the system know at seq 200 about what was true on 2024-02-15?
+db.query('FROM policy AS OF 200 VALID AS OF "2024-02-15"')
 ```
 
 ---
 
-## What's measured (v0.4.1 · pure Python · Linux x86_64)
+## Performance (v1.0.x · Rust native · Linux x86_64 VPS)
 
-Numbers from `python3 bench/benchmarks.py` — reproducible, not cherry-picked.
-Full results in [`bench/RESULTS.md`](bench/RESULTS.md).
-
-| Operation | Throughput | Latency |
+| Operation | Throughput | Notes |
 |---|---|---|
-| GET (embedded, in-process) | **1.30M/s** | 0.77 µs |
-| GET AS OF (time-travel) | 997K/s | 1.00 µs |
-| PUT (logged, no index) | 63.7K/s | 15.7 µs |
-| PUT durable (AOF + fsync) | 7.0K/s | 143 µs |
-| QUERY: eq filter, eq index | **1.42M/s** | 0.71 µs |
-| QUERY: eq filter, no index (scan) | 515K/s | 1.94 µs |
-| QUERY: SEARCH (inverted index) | 467K/s | 2.14 µs |
-| SQL SELECT → NQL (adapter) | 1.70M/s | 0.59 µs |
-| AutoIndexDB wrapper overhead | ~0% | 0.54 µs |
-| File compression — warm | **39.9×** | — |
-| File compression — cold (LZMA) | **88.9×** | — |
-| Cross-version dedup | 20 of 22 chunks | — |
-
-The reference engine proves the **architecture**. Run `python3 bench/benchmarks.py --redis` to compare against Redis TCP on your own machine. The Rust core (`rust/`) is the future speed target.
+| PUT (Rust napi, per-op FFI) | ~70K/s | FFI-bound; batch path: ~15K writes/s group-commit |
+| GET (Rust napi, per-op FFI) | ~330K/s | FFI-bound |
+| NQL query (Rust engine) | ~23 µs | 5× faster than pure-Python (~120 µs) |
+| Python PUT (AOF + fsync) | ~7K/s | Durable, per-op |
+| Python GET (in-process) | ~1.3M/s | Zero socket hop |
 
 ---
 
 ## Architecture
 
 ```
-            ┌──────────────────────────────────────────────┐
-  put/del → │  OpLog  (append-only · BLAKE3 hash chain ·    │ ← single source of truth
-  link      │          per-client nonce · idempotency keys) │
-            └───────────────┬──────────────────────────────┘
+            ┌──────────────────────────────────────────────────────────┐
+  put/del → │  OpLog  (BLAKE2b hash chain · per-client nonce ·          │ ← single source of truth
+  link      │          idempotency keys · causal provenance fields)     │
+            └───────────────┬──────────────────────────────────────────┘
             deterministic fold │ (state = pure function of the log)
-        ┌──────────────┬───────┴────────┬───────────────────┐
-        ▼              ▼                ▼                   ▼
-   MVCC store     Relations         Indexes            BlobStore (Cascade)
-   (time-travel)  (graph, AS OF)    eq/ordered/search  CDC+dedup+tiers, Merkle roots
+     ┌──────────────┬──────────┴──────┬───────────────┬────────────────┐
+     ▼              ▼                 ▼               ▼                ▼
+MVCC store     Relations          Indexes         CauseMap          BlobStore
+(time-travel)  (graph+AS OF)      eq/ord/search   (reverse index)   (Cascade CDC)
+
+                     ┌─────────────────────────────────┐
+  Thread-safe →      │  Sequencer (group-commit)         │ ← single writer, parallel readers
+                     │  — one committer thread/db        │
+                     │  — batch fsync                    │
+                     └─────────────────────────────────┘
+
+Compatibility adapters:  SQL  ·  Redis  ·  MongoDB
+Wire protocols:          HTTP/JSON  ·  RESP2
+Encryption:              AES-256-GCM at-rest (TMK/DEK double-envelope)
 ```
-
-PyPI ships a **universal pure-Python wheel** (`pip install nedb-engine` works on every platform/Python, and includes the `nedbd` server) — the engine, persistence, and daemon are all pure Python. npm ships **napi-rs** native addons. Native PyO3 acceleration for PyPI is additive/roadmap (the public API is identical with or without it). A RESP-compatible `nedbd` wire protocol and a WASM build are also on the roadmap.
-
-Full design: [`docs/SPEC.md`](docs/SPEC.md).
 
 ---
 
 ## Repo layout
 
 ```
-nedb/            pure-Python reference engine (this is what `pip install` ships today)
-rust/            production core — nedb-core + nedb-py (PyO3) + nedb-node (napi-rs)
-examples/demo.py end-to-end walkthrough
-tests/           invariant tests
-bench/           embedded micro-bench + Redis head-to-head harness
-docs/SPEC.md     architecture specification
-.github/         release CI → PyPI + npm on tag
+python/nedb/        reference engine (pure Python — always-works baseline)
+rust/
+  nedb-core/        production Rust engine (shared by both runtimes)
+  nedb-py/          maturin PyO3 binding → PyPI native wheels
+  nedb-node/        napi-rs binding → npm native addons
+tests/              engine + concurrent + causal + bitemporal + deploy tests
+examples/           resp2_python.py  resp2_demo.sh
 ```
+
+---
 
 ## Roadmap
 
-- [x] Reference engine: log, MVCC, relations, indexes, NQL, Cascade, Merkle
-- [x] Durable persistence: append-only log (AOF) on disk + replay-on-open; `verify()` / `AS OF` survive restarts
-- [ ] RDB-style snapshot checkpoint (fast load) that keeps the AOF chain intact
-- [ ] Rust core parity (persistence in `nedb._native`) + criterion benches + `cargo test`
-- [x] Universal pure-Python wheel + sdist on PyPI (installs everywhere; ships the `nedbd` command); napi-rs binaries on npm
-- [ ] Additive native PyO3 acceleration wheels for PyPI (optional speed; same API)
-- [x] `nedbd` server: HTTP/JSON daemon — durable, multi-database; `pip install` ships the `nedbd` command
-- [ ] `nedbd`: RESP-compatible wire protocol + native protocol
-- [ ] Similarity-picked deltas + schema-aware columnar transforms
-- [ ] On-chain (ITC) root anchoring; WASM build
+- [x] Hash-chained append-only log — tamper evidence, replay protection, idempotency
+- [x] MVCC time-travel — `AS OF seq`
+- [x] Bi-temporal — `VALID AS OF "date"` (transaction time + valid time)
+- [x] Causal Write Provenance — `caused_by`, `evidence`, `confidence`, `TRACE`
+- [x] Durable AOF persistence + snapshot checkpoints
+- [x] Concurrent group-commit sequencer (nedbd, 15K writes/s under load)
+- [x] AES-256-GCM at-rest encryption (TMK/DEK double-envelope)
+- [x] SQL / Redis / MongoDB compatibility adapters
+- [x] RESP2 wire protocol (redis-cli / redis-benchmark compatible)
+- [x] Rust native core — napi-rs (npm) + maturin PyO3 (PyPI)
+- [x] Self-healing chains (auto-repair structural gaps, detect real tampering)
+- [ ] Merkle inclusion proofs — prove a document existed at a specific time to a third party
+- [ ] Git-style branching — fork database state, experiment, merge or discard
+- [ ] Agent Memory SDK — `Memory.remember()` / `Memory.recall()` / `Memory.trace()`
+- [ ] Live query subscriptions (SSE) — push diffs when query results change
+
+---
 
 ## NEDB Studio
 
-The agentic, prompt-to-database GUI for NEDB — natural language → schema, NQL, seed data, and Python/Node snippets — lives in its own repo: **[Eth-Interchained/nedb-studio](https://github.com/Eth-Interchained/nedb-studio)** (Portal-powered, GPLv3).
+Prompt-to-database scaffolding GUI with schema graph, NQL console, time-travel slider, causal provenance panel, and MongoDB/SQL/Redis tabs. Deploy from a description, query live data, edit inline.
+
+**[studio.interchained.org](https://studio.interchained.org)** · **[github.com/Eth-Interchained/nedb-studio](https://github.com/Eth-Interchained/nedb-studio)** (GPLv3)
+
+---
 
 ## License
 
-Apache-2.0 · © INTERCHAINED, LLC — [interchained.org](https://interchained.org). Built with [AiAssist](https://aiassist.net).
+See `LICENSE` file. · © INTERCHAINED, LLC — [interchained.org](https://interchained.org)
 
 ---
 
 ## Authors
 
-Built by **[Mark Allen Evans Jr.](https://interchained.org)** (INTERCHAINED, LLC) with **Claude Sonnet 4.6** on [Hyperagent](https://hyperagent.com/refer/J2G6TCD7).
+Built by **[Mark Allen Evans Jr.](https://interchained.org)** (INTERCHAINED, LLC)
+with **Claude Sonnet 4.6** on [Hyperagent](https://hyperagent.com/refer/J2G6TCD7).
 
 > *"Take one idea, turn it into an LP, then an app, then a system, then a platform, then infrastructure that is irreplaceable."*
 
-[![Built with Hyperagent](https://img.shields.io/badge/Built%20with-Hyperagent-6366f1?style=flat-square&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSIxMiIgZmlsbD0id2hpdGUiLz48L3N2Zz4=)](https://hyperagent.com/refer/J2G6TCD7)
-
+[![Built with Hyperagent](https://img.shields.io/badge/Built%20with-Hyperagent-6366f1?style=flat-square)](https://hyperagent.com/refer/J2G6TCD7)
+[![AiAssist](https://img.shields.io/badge/Powered%20by-AiAssist-00d4ff?style=flat-square)](https://aiassist.net)
