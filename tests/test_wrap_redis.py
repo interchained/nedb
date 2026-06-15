@@ -223,6 +223,148 @@ check("NEDB query concurrent",  len(r9.nedb.query('FROM driver WHERE status = "a
 check("nedb.verify with mixed", r9.nedb.verify())
 
 # ─────────────────────────────────────────────────────────────────────────────
+section("Backfill: import existing Redis data into NEDB")
+# ─────────────────────────────────────────────────────────────────────────────
+# Pre-populate a fakeredis with existing data (Alice's pre-NEDB world)
+raw_bf = fakeredis.FakeRedis()
+raw_bf.set("driver:d1", json.dumps({"name": "Bob",   "status": "active",   "lat": 37.7749}))
+raw_bf.set("driver:d2", json.dumps({"name": "Carol", "status": "active",   "lat": 37.8044}))
+raw_bf.set("driver:d3", json.dumps({"name": "Dave",  "status": "inactive", "lat": 37.6879}))
+raw_bf.hset("trip:t1", mapping={"rider_id": "u1", "status": "requested"})
+raw_bf.hset("trip:t2", mapping={"rider_id": "u2", "status": "en_route"})
+
+rb = wrap_redis(raw_bf, db_name="backfill_test")
+
+# Register collection mappings
+rb.nedb.register("driver:*", "driver", value_parser=json.loads)
+rb.nedb.register("trip:*",   "trip",   value_type="hash")
+
+# Backfill — returns number of keys imported
+imported = rb.nedb.backfill()
+check("backfill returns count",       imported == 5)
+check("_backfilled flag set",         rb.nedb._backfilled)
+
+# Imported driver data is NQL-queryable
+active = rb.nedb.query('FROM driver WHERE status = "active"')
+check("backfilled drivers queryable", len(active) == 2)
+inactive = rb.nedb.query('FROM driver WHERE status = "inactive"')
+check("inactive driver backfilled",   len(inactive) == 1)
+check("driver name intact",           any(d["name"] == "Bob" for d in active))
+
+# Imported trip data (hash type) is accessible
+trip = rb.nedb.get("trip", "t1")
+check("trip hash backfilled",         trip is not None)
+check("trip status intact",           trip.get("status") == "requested")
+
+# Backfill evidence is recorded
+doc = rb.nedb.get("driver", "d1")
+check("backfill evidence on doc",     doc.get("_source") == "backfill")
+
+# Hash chain stays valid after backfill
+check("verify() after backfill",      rb.nedb.verify())
+
+# Backfill direct (no prior register)
+raw_bf2 = fakeredis.FakeRedis()
+raw_bf2.set("zone:z1", json.dumps({"name": "SoMa", "active": True}))
+raw_bf2.set("zone:z2", json.dumps({"name": "BART", "active": False}))
+rb2 = wrap_redis(raw_bf2, db_name="direct_bf")
+imported2 = rb2.nedb.backfill("zone:*", "zone", value_parser=json.loads)
+check("direct backfill (no register)", imported2 == 2)
+check("direct backfill queryable",     len(rb2.nedb.query('FROM zone')) == 2)
+
+# Empty backfill (no mappings, no pattern) returns 0
+rb3 = wrap_redis(fakeredis.FakeRedis(), db_name="empty_bf")
+check("backfill with no mappings → 0", rb3.nedb.backfill() == 0)
+
+# ─────────────────────────────────────────────────────────────────────────────
+section("Write shadowing: surface-1 writes auto-chain into NEDB")
+# ─────────────────────────────────────────────────────────────────────────────
+raw_ws = fakeredis.FakeRedis()
+rw = wrap_redis(raw_ws, db_name="shadow_test")
+
+rw.nedb.register("driver:*", "driver", value_parser=json.loads)
+rw.nedb.register("trip:*",   "trip",   value_type="hash")
+
+# Write shadowing OFF by default — surface-1 writes don't touch NEDB
+rw.set("driver:d1", json.dumps({"name": "Bob", "status": "active"}))
+check("shadow_writes=False default",  not rw.nedb.shadow_writes)
+check("no shadow without flag",        rw.nedb.get("driver", "d1") is None)
+
+# Enable write shadowing
+rw.nedb.shadow_writes = True
+
+# SET is shadowed
+rw.set("driver:d1", json.dumps({"name": "Bob", "status": "active", "lat": 37.7}))
+shadowed = rw.nedb.get("driver", "d1")
+check("SET shadowed into NEDB",        shadowed is not None)
+check("SET value correct",             shadowed.get("name") == "Bob")
+check("SET evidence recorded",         shadowed.get("_source") == "shadow")
+
+# HSET is shadowed
+rw.hset("trip:t1", mapping={"rider_id": "u1", "status": "requested"})
+trip_sh = rw.nedb.get("trip", "t1")
+check("HSET shadowed into NEDB",       trip_sh is not None)
+check("HSET status correct",           trip_sh.get("status") == "requested")
+
+# HSET update merges with existing NEDB doc
+rw.hset("trip:t1", mapping={"status": "en_route", "driver_id": "d1"})
+merged = rw.nedb.get("trip", "t1")
+check("HSET merge: new field present", merged.get("driver_id") == "d1")
+check("HSET merge: rider_id preserved", merged.get("rider_id") == "u1")
+
+# Multiple SETs time-travel
+snap_ws = rw.nedb.seq
+rw.set("driver:d1", json.dumps({"name": "Bob", "status": "offline", "lat": 37.9}))
+current_ws = rw.nedb.get("driver", "d1")
+past_ws    = rw.nedb.get_as_of("driver", "d1", snap_ws)
+check("shadowed SET time-travel",      current_ws["status"] == "offline")
+check("past state before shadow SET",  past_ws["status"] == "active")
+
+# Unregistered keys still get raw chain entry
+rw.lpush("dispatch:queue", "trip:t1")   # list push — no collection mapping
+check("unregistered write doesn't crash",  True)   # shadow failure must be silent
+
+# Disable shadowing — subsequent writes not chained
+seq_before_disable = rw.nedb.seq
+rw.nedb.shadow_writes = False
+rw.set("driver:d2", json.dumps({"name": "Carol", "status": "active"}))
+check("no shadow after disable",       rw.nedb.seq == seq_before_disable
+                                       or rw.nedb.get("driver", "d2") is None)
+
+# Hash chain stays valid after shadowing
+rw.nedb.shadow_writes = True
+rw.set("driver:d2", json.dumps({"name": "Carol", "status": "active"}))
+check("verify() after write shadowing", rw.nedb.verify())
+
+# ─────────────────────────────────────────────────────────────────────────────
+section("Full pipeline: backfill → shadow → restart")
+# ─────────────────────────────────────────────────────────────────────────────
+raw_fp = fakeredis.FakeRedis()
+# Pre-existing data
+raw_fp.set("driver:d1", json.dumps({"name": "Bob",   "status": "active"}))
+raw_fp.set("driver:d2", json.dumps({"name": "Carol", "status": "active"}))
+
+rp = wrap_redis(raw_fp, db_name="pipeline_test")
+rp.nedb.register("driver:*", "driver", value_parser=json.loads)
+rp.nedb.backfill()
+rp.nedb.shadow_writes = True
+
+# New write via surface 1
+rp.set("driver:d3", json.dumps({"name": "Dave", "status": "inactive"}))
+seq_fp = rp.nedb.seq
+
+# All 3 drivers in NEDB
+all_drivers = rp.nedb.query("FROM driver")
+check("all 3 drivers in NEDB",        len(all_drivers) == 3)
+
+# Restart: new wrapper on the same Redis
+rp2 = wrap_redis(raw_fp, db_name="pipeline_test")
+check("head stable after restart",    rp2.nedb.verify())
+check("seq stable after restart",     rp2.nedb.seq == seq_fp)
+rp2.nedb.query("FROM driver")  # replay doesn't crash
+check("data intact after restart",    rp2.nedb.get("driver", "d1") is not None)
+
+# ─────────────────────────────────────────────────────────────────────────────
 total = PASS + FAIL
 print(f"\n  {'═'*52}")
 print(f"  wrap_redis  |  {PASS}/{total} passed{'  ✅' if not FAIL else f'  ❌  {FAIL} FAILED'}")

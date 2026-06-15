@@ -96,6 +96,50 @@ MongoClient(db)["users"].find({"status": "active"}).sort("age", -1).to_list()
 
 ---
 
+## Redis layer-2 — wrap_redis()
+
+Already running on Redis? Wrap your connection in one line and gain NEDB features *alongside* your existing Redis app — no migration required.
+
+```python
+import redis, json
+from nedb import wrap_redis
+
+r = wrap_redis(redis.Redis("localhost", 6379), db_name="rideshare")
+
+# Step 1 — register: map Redis key globs to NEDB collections (chainable)
+(r.nedb
+ .register("driver:*", collection="driver", value_parser=json.loads)
+ .register("trip:*",   collection="trip",   value_type="hash")
+)
+
+# Step 2 — backfill: import all existing Redis data into NEDB in one pass
+imported = r.nedb.backfill()           # → int (keys imported)
+
+# Step 3 — shadow: all future r.set/hset/... auto-chain into NEDB
+r.nedb.shadow_writes = True
+
+# ─── Alice's app keeps running — zero changes ───────────────────────────
+r.set("driver:d1", json.dumps({"name": "Bob", "status": "active"}))   # ← shadowed
+r.hset("trip:t1", mapping={"status": "en_route", "driver_id": "d1"})  # ← shadowed
+
+# ─── New features available on the same connection ──────────────────────
+r.nedb.query('FROM driver WHERE status = "active" ORDER BY lat ASC')
+r.nedb.verify()       # → True  (every write chain-verified)
+r.nedb.head()         # → 64-char BLAKE2b commitment hash
+```
+
+**Isolation guarantee:** NEDB never writes to Alice's namespace. It owns only:
+
+| Key | Type | Purpose |
+|-----|------|---------|
+| `nedb:{db_name}:oplog` | Redis Stream | append-only op log |
+| `nedb:{db_name}:snapshot` | Redis Hash | checkpoint |
+| `nedb:{db_name}:meta` | Redis Hash | index config |
+
+See [`examples/fakeredis_demo.py`](examples/fakeredis_demo.py) for a full local demo (no Redis server needed).
+
+---
+
 ## Node.js
 
 ```javascript

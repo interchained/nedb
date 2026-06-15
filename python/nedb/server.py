@@ -54,13 +54,15 @@ from .log import ReplayError
 
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
-# Verbose request logging — set NEDBD_DEBUG=1 to enable.
-_DEBUG = os.environ.get("NEDBD_DEBUG", "").strip() in ("1", "true", "yes")
+# Log level — resolved at startup in main() from --log-level flag or NEDBD_DEBUG env.
+# 0 = errors only (default), 1 = requests, 2 = deploy phases, 3 = everything.
+# main() patches _log_level on this module after argument parsing.
+_log_level: int = 3 if os.environ.get("NEDBD_DEBUG", "").strip() in ("1", "true", "yes") else 0
 
-def _log(*args: object) -> None:
-    """Print only when NEDBD_DEBUG=1."""
-    if _DEBUG:
-        print(*args, flush=True)
+def _log(msg: str, level: int = 3) -> None:
+    """Print if current log level >= required level."""
+    if _log_level >= level:
+        print(msg, flush=True)
 
 
 class HttpError(Exception):
@@ -121,27 +123,24 @@ class Manager:
         self._valid(name)
         if self.exists(name):
             raise HttpError(409, f"database already exists: {name}")
-        _log(f"  [nedbd] creating db '{name}'…")
+        _log(f"  [nedbd] creating db '{name}'…", level=2)
         db = self.open(name)
         init = init or {}
-        # Phase 1 — indexes
         for spec in init.get("indexes", []):
             coll, field, kind = spec[0], spec[1], (spec[2] if len(spec) > 2 else "eq")
-            _log(f"  [nedbd]   index  {coll}.{field} ({kind})")
+            _log(f"  [nedbd]   index  {coll}.{field} ({kind})", level=3)
             db.create_index(coll, field, kind)
-        # Phase 2 — seed data
         for coll, docs in (init.get("seed") or {}).items():
-            _log(f"  [nedbd]   seed   {coll} × {len(docs)} rows")
+            _log(f"  [nedbd]   seed   {coll} × {len(docs)} rows", level=2)
             for i, doc in enumerate(docs):
                 rid = str(doc.get("_id") or doc.get("id") or f"{coll}-{i + 1}")
                 db.put(coll, rid, dict(doc))
-        # Phase 3 — links
         links = init.get("links", [])
         if links:
-            _log(f"  [nedbd]   links  {len(links)}")
+            _log(f"  [nedbd]   links  {len(links)}", level=2)
         for link in links:
             db.link(link[0], link[1], link[2])
-        _log(f"  [nedbd] db '{name}' created  seq={db.seq}")
+        _log(f"  [nedbd] db '{name}' created  seq={db.seq}", level=2)
         return self.summary(name)
 
     def drop(self, name: str) -> bool:
@@ -263,7 +262,7 @@ def make_handler(manager: Manager, token: Optional[str]):
             self._handle("DELETE")
 
         def _handle(self, method: str) -> None:
-            _log(f"  [nedbd] {method} {self.path}")
+            _log(f"  [nedbd] {method} {self.path}", level=1)
             try:
                 parts, query = self._parts()
 
@@ -290,7 +289,7 @@ def make_handler(manager: Manager, token: Optional[str]):
                         n_idx  = len(init.get("indexes", []))
                         n_seed = sum(len(v) for v in (init.get("seed") or {}).values())
                         n_lnk  = len(init.get("links", []))
-                        _log(f"  [nedbd] deploy '{name}' — {n_idx} indexes, {n_seed} seed rows, {n_lnk} links")
+                        _log(f"  [nedbd] deploy '{name}' — {n_idx} indexes, {n_seed} seed rows, {n_lnk} links", level=2)
                         self._send(201, {"database": manager.create(name, init)})
                         return
 
@@ -487,7 +486,7 @@ def make_handler(manager: Manager, token: Optional[str]):
 
                 raise HttpError(404, "no such route")
             except HttpError as e:
-                _log(f"  [nedbd] HTTP {e.status}: {e.message}")
+                _log(f"  [nedbd] HTTP {e.status}: {e.message}", level=1)
                 self._send(e.status, {"error": e.message})
             except Exception as e:  # noqa: BLE001
                 # Always print errors (regardless of debug flag) so failures are visible.
@@ -531,16 +530,42 @@ def make_handler(manager: Manager, token: Optional[str]):
 
 
 def main() -> None:
-    host = os.environ.get("NEDBD_HOST", "127.0.0.1")
-    port = int(os.environ.get("NEDBD_PORT", "7070"))
-    data = os.environ.get("NEDBD_DATA", "./nedb-data")
-    token = os.environ.get("NEDBD_TOKEN") or None
-
-    import signal
-    import threading
+    import argparse as _ap, signal, threading
     from .resp2 import make_resp2_server
 
-    resp2_port = int(os.environ.get("NEDBD_RESP2_PORT", "0"))  # 0 = disabled
+    parser = _ap.ArgumentParser(
+        prog="nedbd",
+        description="NEDB server daemon — serves durable, time-traveling databases over HTTP/JSON.",
+    )
+    parser.add_argument("--host",       default=os.environ.get("NEDBD_HOST",  "127.0.0.1"))
+    parser.add_argument("--port",       type=int, default=int(os.environ.get("NEDBD_PORT", "7070")))
+    parser.add_argument("--data",       default=os.environ.get("NEDBD_DATA",  "./nedb-data"))
+    parser.add_argument("--token",      default=os.environ.get("NEDBD_TOKEN") or None)
+    parser.add_argument("--resp2-port", type=int, default=int(os.environ.get("NEDBD_RESP2_PORT", "0")))
+    parser.add_argument(
+        "--log-level", type=int, default=None, metavar="N",
+        help="Verbosity: 0=errors only (default), 1=requests, 2=deploy phases, 3=everything. "
+             "Env var NEDBD_DEBUG=1 is equivalent to --log-level 3.",
+    )
+    args = parser.parse_args()
+
+    # Resolve log level: CLI flag beats env var.
+    # Level 0: only errors (always printed)
+    # Level 1: every request method+path
+    # Level 2: deploy phases (index/seed/link counts)
+    # Level 3: all of the above — equivalent to old NEDBD_DEBUG=1
+    _env_level = 3 if os.environ.get("NEDBD_DEBUG", "").strip() in ("1", "true", "yes") else 0
+    _log_level: int = args.log_level if args.log_level is not None else _env_level
+
+    # Patch the module-level _log and _DEBUG so the handler uses the resolved level.
+    import nedb.server as _srv_mod  # noqa: PLC0415
+    _srv_mod._log_level = _log_level  # type: ignore[attr-defined]
+
+    host  = args.host
+    port  = args.port
+    data  = args.data
+    token = args.token
+    resp2_port = args.resp2_port
     manager = Manager(data)
     httpd = ThreadingHTTPServer((host, port), make_handler(manager, token))
     auth = "on" if token else "off"
@@ -558,7 +583,8 @@ def main() -> None:
   interchained.org       hyperagent.com/refer/J2G6TCD7
 """
     print(BANNER)
-    print(f"  nedbd {__version__} — http://{host}:{port}  data={os.path.abspath(data)}  auth={auth}")
+    level_label = {0: "errors-only", 1: "requests", 2: "deploy", 3: "verbose"}.get(_log_level, str(_log_level))
+    print(f"  nedbd {__version__} — http://{host}:{port}  data={os.path.abspath(data)}  auth={auth}  log={level_label}")
     # Eagerly open all known databases so backfill-encrypt (if needed) runs
     # immediately and is visible in the boot log, not hidden on first request.
     names = manager.names()
