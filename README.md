@@ -283,7 +283,6 @@ Prompt-to-database scaffolding GUI with schema graph, NQL console, time-travel s
 ---
 
 ## License
-## License
 
 NEDB is licensed under the Business Source License 1.1.
 
