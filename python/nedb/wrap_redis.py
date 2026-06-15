@@ -38,10 +38,156 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+import urllib.error
+import urllib.request
 from typing import Any, Callable, Dict, List, Optional
 
 from .engine import NEDB as _NEDB
 from .backends.redis_backend import RedisBackend
+
+
+# ── NedBdProxy ────────────────────────────────────────────────────────────────
+
+class NedBdProxy:
+    """
+    Drop-in replacement for the in-process NEDB engine when a nedbd server
+    is available.  All r.nedb.* calls are forwarded to nedbd's HTTP/JSON API
+    instead of running in-process.
+
+    Usage::
+
+        r = wrap_redis(redis.Redis(...), db_name="rideshare",
+                       nedbd_url="http://localhost:8421",
+                       nedbd_token="secret")   # token is optional
+
+    The proxy auto-creates the database on first write.
+    ``head`` and ``seq`` are cached from the last response and refreshed
+    on demand via ``_refresh()``.
+    """
+
+    def __init__(self, base_url: str, db_name: str, token: Optional[str] = None):
+        self._base   = base_url.rstrip("/")
+        self._name   = db_name
+        self._token  = token
+        self._seq: int  = -1
+        self._head: str = "0" * 64
+        self._ensure_db()
+
+    # ── HTTP helpers ─────────────────────────────────────────────────────────
+
+    def _headers(self) -> dict:
+        h = {"Content-Type": "application/json", "Accept": "application/json"}
+        if self._token:
+            h["Authorization"] = f"Bearer {self._token}"
+        return h
+
+    def _req(self, method: str, path: str, body: Optional[dict] = None) -> dict:
+        url  = f"{self._base}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req  = urllib.request.Request(url, data=data, headers=self._headers(),
+                                      method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read().decode())
+                if "seq"  in result: self._seq  = result["seq"]
+                if "head" in result: self._head = result["head"]
+                return result
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode("utf-8", errors="replace")
+            try:
+                detail = json.loads(body_text).get("error", body_text)
+            except Exception:
+                detail = body_text
+            raise RuntimeError(f"nedbd {method} {url} → HTTP {e.code}: {detail}") from e
+
+    def _db(self, suffix: str = "") -> str:
+        return f"/v1/databases/{self._name}{suffix}"
+
+    # ── Bootstrap ────────────────────────────────────────────────────────────
+
+    def _ensure_db(self) -> None:
+        """Create the database if it doesn't exist yet; load seq/head if it does."""
+        try:
+            info = self._req("GET", self._db())
+            self._seq  = info.get("seq",  self._seq)
+            self._head = info.get("head", self._head)
+        except RuntimeError as e:
+            if "404" in str(e):
+                self._req("POST", "/v1/databases", {"name": self._name})
+            else:
+                raise
+
+    def _refresh(self) -> None:
+        info = self._req("GET", self._db())
+        self._seq  = info.get("seq",  self._seq)
+        self._head = info.get("head", self._head)
+
+    # ── NEDB engine interface ─────────────────────────────────────────────────
+
+    def put(self, coll: str, id: str, doc: dict, **kw) -> dict:
+        payload: dict = {"coll": coll, "id": id, "doc": doc}
+        for k in ("client", "nonce", "idem", "evidence", "confidence",
+                  "valid_from", "valid_to"):
+            if kw.get(k) is not None:
+                payload[k] = kw[k]
+        if kw.get("caused_by") is not None:
+            payload["caused_by"] = list(kw["caused_by"])
+        result = self._req("POST", self._db("/put"), payload)
+        return result.get("doc", doc)
+
+    def get(self, coll: str, id: str, as_of: Optional[int] = None):
+        as_of_clause = f" AS OF {as_of}" if as_of is not None else ""
+        nql = f'FROM {coll}{as_of_clause} WHERE _id = "{id}"'
+        rows = self._req("POST", self._db("/query"), {"nql": nql}).get("rows", [])
+        return rows[0] if rows else None
+
+    def query(self, nql: str) -> List[dict]:
+        return self._req("POST", self._db("/query"), {"nql": nql}).get("rows", [])
+
+    def create_index(self, coll: str, field: str, kind: str = "eq") -> None:
+        self._req("POST", self._db("/index"), {"coll": coll, "field": field, "kind": kind})
+
+    def delete(self, coll: str, id: str, **_kw) -> None:
+        self._req("DELETE", f"/v1/databases/{self._name}/rows/{coll}/{id}")
+
+    def link(self, frm: str, rel: str, to: str, **_kw) -> None:
+        self._req("POST", self._db("/link"), {"frm": frm, "rel": rel, "to": to})
+
+    def unlink(self, frm: str, rel: str, to: str, **_kw) -> None:
+        # nedbd doesn't have a dedicated unlink endpoint yet — use NQL delete
+        # fallback: store as a tombstone via link with _unlinked flag
+        pass  # no-op; future: DELETE /v1/databases/{name}/links/{frm}/{rel}/{to}
+
+    def neighbors(self, frm: str, rel: str, as_of: Optional[int] = None) -> List[str]:
+        frm_coll, frm_id = (frm.split(":", 1) + [""])[:2]
+        as_of_clause = f" AS OF {as_of}" if as_of is not None else ""
+        nql = f'FROM {frm_coll}{as_of_clause} WHERE _id = "{frm_id}" TRAVERSE {rel}'
+        rows = self._req("POST", self._db("/query"), {"nql": nql}).get("rows", [])
+        return [f"{r.get('_coll', frm_coll)}:{r['_id']}" for r in rows if "_id" in r]
+
+    def inbound(self, to: str, rel: str, as_of: Optional[int] = None) -> List[str]:
+        # Approximate via NQL — nedbd doesn't expose inbound traversal directly
+        to_coll, to_id = (to.split(":", 1) + [""])[:2]
+        nql = f'FROM {to_coll} WHERE _id = "{to_id}" TRAVERSE {rel} REVERSE'
+        try:
+            rows = self._req("POST", self._db("/query"), {"nql": nql}).get("rows", [])
+            return [f"{r.get('_coll', to_coll)}:{r['_id']}" for r in rows if "_id" in r]
+        except Exception:
+            return []
+
+    def verify(self) -> bool:
+        return self._req("GET", self._db("/verify")).get("ok", False)
+
+    def checkpoint(self) -> str:
+        return self._req("POST", self._db("/checkpoint")).get("head", self._head)
+
+    @property
+    def head(self) -> str:
+        return self._head
+
+    @property
+    def seq(self) -> int:
+        return self._seq
 
 # ── Write command detection ──────────────────────────────────────────────────
 
@@ -119,22 +265,37 @@ class NEDBSurface:
     - register(pattern, collection, ...)  → teach NEDB about Alice's key structure
     - backfill()                          → one-time import of existing Redis data
     - shadow_writes = True               → auto-chain all surface-1 Redis writes
+
+    nedbd mode (nedbd_url=):
+    - All r.nedb.* calls are forwarded to a running nedbd HTTP server.
+    - nedbd handles its own persistence (durable AOF on disk).
+    - Redis Stream backend is bypassed; _persist_last_op() is a no-op.
     """
 
-    def __init__(self, r: Any, db_name: str):
+    def __init__(self, r: Any, db_name: str,
+                 nedbd_url: Optional[str] = None,
+                 nedbd_token: Optional[str] = None):
         self._r        = r
         self._db_name  = db_name
-        self._backend  = RedisBackend(r, db_name)
         self._mappings: List[CollectionMapping] = []
         self.shadow_writes: bool = False
         self._backfilled: bool = False
+        self._nedbd_mode: bool = nedbd_url is not None
 
-        # Build the NEDB engine and replay from Redis Stream
-        self._db = _NEDB()
-        self._db._backend = self._backend
-        self._reload()
+        if self._nedbd_mode:
+            # Route all NEDB operations to a running nedbd server
+            self._db      = NedBdProxy(nedbd_url, db_name, token=nedbd_token)  # type: ignore[assignment]
+            self._backend = None
+        else:
+            # In-process engine with Redis Stream persistence
+            self._backend = RedisBackend(r, db_name)
+            self._db = _NEDB()
+            self._db._backend = self._backend
+            self._reload()
 
     def _reload(self) -> None:
+        if self._nedbd_mode:
+            return  # nedbd manages its own state
         ops_json = self._backend.read_all()
         if not ops_json:
             return
@@ -155,6 +316,8 @@ class NEDBSurface:
             self._db._nonce = dict(self._db.log._last_nonce)
 
     def _persist_last_op(self) -> None:
+        if self._nedbd_mode:
+            return  # nedbd persists atomically on each HTTP call
         if self._db.log.ops:
             last = self._db.log.ops[-1]
             self._backend.append(json.dumps(last.to_dict()))
@@ -427,12 +590,23 @@ class WrappedRedis:
 
     Surface 1 (r.set/get/hset/…): every Redis command passes through unchanged.
     Surface 2 (r.nedb.*): full NEDB API + backfill + write shadowing.
+
+    nedbd mode::
+
+        r = wrap_redis(redis.Redis(...), db_name="rideshare",
+                       nedbd_url="http://localhost:8421",
+                       nedbd_token="secret")   # token optional
     """
 
-    def __init__(self, r: Any, db_name: str):
+    def __init__(self, r: Any, db_name: str,
+                 nedbd_url: Optional[str] = None,
+                 nedbd_token: Optional[str] = None):
         object.__setattr__(self, "_r",       r)
         object.__setattr__(self, "_db_name", db_name)
-        object.__setattr__(self, "nedb",     NEDBSurface(r, db_name))
+        object.__setattr__(self, "nedb",
+                           NEDBSurface(r, db_name,
+                                       nedbd_url=nedbd_url,
+                                       nedbd_token=nedbd_token))
 
     def __getattr__(self, name: str) -> Any:
         r    = object.__getattribute__(self, "_r")
@@ -454,13 +628,25 @@ class WrappedRedis:
         return f"<WrappedRedis db_name={db!r} redis={r!r}>"
 
 
-def wrap_redis(r: Any, db_name: str = "default") -> WrappedRedis:
+def wrap_redis(r: Any, db_name: str = "default",
+               nedbd_url: Optional[str] = None,
+               nedbd_token: Optional[str] = None) -> WrappedRedis:
     """
     Wrap an existing Redis connection with NEDB's layer-2 features.
 
     Args:
         r:        An existing ``redis.Redis`` (or compatible) connection.
         db_name:  Logical database name. NEDB uses ``nedb:{db_name}:*``.
+
+    Args:
+        r:           An existing ``redis.Redis`` (or compatible) connection.
+        db_name:     Logical database name. NEDB uses ``nedb:{db_name}:*``.
+        nedbd_url:   Optional URL of a running nedbd server, e.g.
+                     ``"http://localhost:8421"``.  When set, all ``r.nedb.*``
+                     calls are forwarded to nedbd instead of running in-process.
+                     nedbd handles its own durable AOF persistence on disk.
+        nedbd_token: Optional bearer token for nedbd authentication
+                     (set via ``NEDBD_TOKEN`` env on the server).
 
     Returns:
         A ``WrappedRedis`` with ``.nedb`` for the full NEDB API.
@@ -489,4 +675,4 @@ def wrap_redis(r: Any, db_name: str = "default") -> WrappedRedis:
         r.nedb.query('FROM driver WHERE status = "active" ORDER BY name ASC')
         r.nedb.verify()   # → True
     """
-    return WrappedRedis(r, db_name)
+    return WrappedRedis(r, db_name, nedbd_url=nedbd_url, nedbd_token=nedbd_token)

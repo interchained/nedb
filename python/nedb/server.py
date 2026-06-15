@@ -320,7 +320,11 @@ def make_handler(manager: Manager, token: Optional[str]):
                         coll, rid, doc = b.get("coll"), b.get("id"), b.get("doc")
                         if not coll or rid is None or not isinstance(doc, dict):
                             raise HttpError(400, "coll, id, and doc are required")
-                        kw = {k: b[k] for k in ("client", "nonce", "idem") if b.get(k) is not None}
+                        _scalar = ("client", "nonce", "idem", "evidence", "confidence",
+                                   "valid_from", "valid_to")
+                        kw = {k: b[k] for k in _scalar if b.get(k) is not None}
+                        if b.get("caused_by") is not None:
+                            kw["caused_by"] = list(b["caused_by"])
                         try:
                             stored = db.put(str(coll), str(rid), dict(doc), **kw)
                         except ReplayError as e:
