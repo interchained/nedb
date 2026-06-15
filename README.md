@@ -283,6 +283,20 @@ Prompt-to-database scaffolding GUI with schema graph, NQL console, time-travel s
 ---
 
 ## License
+## License
+
+NEDB is licensed under the Business Source License 1.1.
+
+The source is available for review, development, testing, research, benchmarking, personal experimentation, and other non-production use.
+
+Production, commercial, hosted, SaaS, managed-service, embedded, enterprise, resale, white-label, competitive, or customer-facing use is not permitted unless expressly authorized in writing by the Licensor.
+
+Additional use grants and commercial permissions may be requested from:
+
+* [founders@vibecode-101.com](mailto:founders@vibecode-101.com)
+* [dev@interchained.org](mailto:dev@interchained.org)
+
+On the applicable Change Date, each version of NEDB converts to the GNU Affero General Public License v3.0 or later, as described in the LICENSE file.
 
 See `LICENSE` file. · © INTERCHAINED, LLC — [interchained.org](https://interchained.org)
 
