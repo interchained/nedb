@@ -10,7 +10,8 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 [![PyPI](https://img.shields.io/pypi/v/nedb-engine?label=PyPI&color=6366f1)](https://pypi.org/project/nedb-engine/)
 [![npm](https://img.shields.io/npm/v/nedb-engine?label=npm&color=00d4ff)](https://www.npmjs.com/package/nedb-engine)
 [![Tests](https://img.shields.io/badge/tests-266%20passing-34d399)](https://github.com/Eth-Interchained/nedb/actions)
-[![nedb-client PyPI](https://img.shields.io/pypi/v/nedb-client?label=nedb-client&color=34d399)](https://pypi.org/project/nedb-client/)
+[![nedb-engine-client PyPI](https://img.shields.io/pypi/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://pypi.org/project/nedb-engine-client/)
+[![nedb-engine-client npm](https://img.shields.io/npm/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://www.npmjs.com/package/nedb-engine-client)
 
 **[Studio → studio.interchained.org](https://studio.interchained.org)**  ·  **[nedb.aiassist.net](https://nedb.aiassist.net)**
 
