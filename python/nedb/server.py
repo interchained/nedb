@@ -551,7 +551,36 @@ def main() -> None:
         help="Verbosity: 0=errors only (default), 1=requests, 2=deploy phases, 3=everything. "
              "Env var NEDBD_DEBUG=1 is equivalent to --log-level 3.",
     )
+    parser.add_argument(
+        "--dag", action="store_true",
+        default=os.environ.get("NEDBD_DAG", "").lower() in ("1", "true", "yes"),
+        help="Run the v2 content-addressed DAG engine (Rust binary) instead of the v1 AOF engine. "
+             "No AOF, no global lock, instant cold start. Env var NEDBD_DAG=1 also enables this.",
+    )
     args = parser.parse_args()
+
+    # ── DAG mode: exec into the Rust v2 binary, replacing this process entirely ──
+    if args.dag:
+        import shutil as _shutil, sys as _sys
+        _pkg_dir = os.path.dirname(os.path.abspath(__file__))
+        _candidates = [
+            os.path.join(_pkg_dir, "nedbd-v2"),
+            os.path.join(_pkg_dir, "nedbd_v2"),
+            _shutil.which("nedbd-v2") or "",
+            _shutil.which("nedbd_v2") or "",
+        ]
+        _bin = next((c for c in _candidates if c and os.path.isfile(c)), None)
+        if _bin is None:
+            print("nedbd --dag: v2 Rust binary not found.", file=_sys.stderr)
+            print("  Expected 'nedbd-v2' alongside the package or in PATH.", file=_sys.stderr)
+            print("  Build: cd rust/nedb-v2 && cargo build --release", file=_sys.stderr)
+            print("  Copy:  cp rust/nedb-v2/target/release/nedbd nedbd-v2 && nedbd --dag", file=_sys.stderr)
+            _sys.exit(1)
+        os.environ["NEDBD_PORT"] = str(args.port)
+        if args.token:
+            os.environ["NEDBD_TOKEN"] = args.token
+        # exec replaces this process — clean signal handling, no Python overhead
+        os.execv(_bin, [_bin, args.data])
 
     # Resolve log level: CLI flag beats env var.
     # Level 0: only errors (always printed)

@@ -4,10 +4,11 @@ members = [
     "crates/nedb-core",
     "crates/nedb-py",
     "crates/nedb-node",
+    "nedb-v2",
 ]
 
 [workspace.package]
-version = "1.3.0"
+version = "2.0.4"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Eth-Interchained/nedb"

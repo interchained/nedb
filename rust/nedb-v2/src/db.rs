@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use anyhow::{bail, Result};
+use anyhow::Result;
 use serde_json::Value;
 
 use crate::store::{Dek, Node, ObjectStore};
@@ -16,7 +16,7 @@ pub struct Db {
     pub sorted_indexes: SortedIndexes,
     pub graph:          GraphStore,
     pub root:           PathBuf,
-    seq:                AtomicU64,
+    pub seq:            AtomicU64,
 }
 
 impl Db {
@@ -24,7 +24,7 @@ impl Db {
     pub fn open(db_root: &Path, dek: Option<Dek>) -> Result<Self> {
         std::fs::create_dir_all(db_root)?;
 
-        let objects        = ObjectStore::new(db_root, dek)?;
+        let objects        = ObjectStore::new(db_root, dek.clone())?;
         let id_index       = IdIndex::new(db_root)?;
         let sorted_indexes = SortedIndexes::new();
         let graph          = GraphStore::new(db_root)?;
@@ -38,14 +38,14 @@ impl Db {
             seq:  AtomicU64::new(0),
         };
 
-        // Auto-migrate v1 → v2 if needed
+        // Auto-migrate v1 → v2 if needed (pass DEK so encrypted AOFs convert correctly)
         migrate::migrate_if_needed(
             db_root,
             &db.objects,
             &db.id_index,
             &db.sorted_indexes,
             &db.graph,
-            None, // TODO: pass dek through
+            dek.as_ref(),
         )?;
 
         // Rebuild sorted indexes + find max seq from existing objects
@@ -139,6 +139,32 @@ impl Db {
         }
 
         Ok(node)
+    }
+
+    /// Delete a document — writes a tombstone node and removes the id from the index.
+    /// The object history is preserved in the DAG; only the live id pointer is cleared.
+    pub fn delete(&self, coll: &str, id: &str) -> Result<bool> {
+        let prev = match self.id_index.get(coll, id) {
+            None => return Ok(false),   // already gone
+            Some(h) => h,
+        };
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        let mut tombstone = Node {
+            id:         format!("_del_{}", id),
+            coll:       coll.to_string(),
+            seq,
+            data:       serde_json::json!({"_deleted": id, "_prev": prev}),
+            prev:       Some(prev),
+            caused_by:  vec![],
+            ts:         now(),
+            valid_from: None,
+            valid_to:   None,
+            hash:       String::new(),
+        };
+        self.objects.write(&mut tombstone)?;
+        // Remove the live id pointer — doc is now invisible to queries and list()
+        self.id_index.remove(coll, id)?;
+        Ok(true)
     }
 
     /// Get the current version of a document by id.

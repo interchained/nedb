@@ -261,13 +261,32 @@ class NEDB:
                 for coll, field, kind in json.load(fh).get("indexes", []):
                     self.indexes.ensure(coll, field, kind)
         # 2) the hash-chained op log
+        # Self-healing AOF load — never crash on corruption.
         ops = []
+        corrupt_count = 0
         if os.path.exists(self._aof_path):
             with open(self._aof_path, encoding="utf-8") as fh:
                 for raw_line in fh:
-                    line = _crypto.aof_decode(raw_line, self._dek)
-                    if line:
-                        ops.append(Op.from_dict(json.loads(line)))
+                    try:
+                        line = _crypto.aof_decode(raw_line, self._dek)
+                        if line:
+                            ops.append(Op.from_dict(json.loads(line)))
+                    except Exception as exc:
+                        corrupt_count += 1
+                        print(
+                            f"  [nedb] AOF self-repair: corrupt entry in"
+                            f" {self._aof_path!r}"
+                            f" ({type(exc).__name__}: {exc})"
+                            f" -- truncating and recovering {len(ops)} op(s)."
+                        )
+                        break
+        if corrupt_count:
+            self._rewrite_aof(ops)
+            print(
+                f"  [nedb] AOF self-repair complete:"
+                f" {len(ops)} op(s) recovered,"
+                f" {corrupt_count} corrupt entry/entries removed."
+            )
         self.log.load(ops)
         # 3) fold
         for op in self.log.ops:

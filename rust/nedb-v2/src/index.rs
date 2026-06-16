@@ -122,6 +122,15 @@ impl IdIndex {
             .collect()
     }
 
+    /// Remove the id index entry for a document (tombstone / delete).
+    pub fn remove(&self, coll: &str, id: &str) -> Result<()> {
+        let path = self.path(coll, id);
+        if path.exists() {
+            fs::remove_file(&path).context("remove id index entry")?;
+        }
+        Ok(())
+    }
+
     /// List all known collections.
     pub fn collections(&self) -> Vec<String> {
         fs::read_dir(&self.root)

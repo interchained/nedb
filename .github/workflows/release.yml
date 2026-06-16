@@ -54,24 +54,43 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build nedbd-v2 (DAG engine binary)
+        shell: bash
+        run: |
+          # Build from the workspace root so cargo uses the workspace Cargo.lock.
+          # Output lands in rust/target/<triple>/release/nedbd (workspace target dir).
+          cd rust
+          cargo build --release --bin nedbd --package nedb-core-v2 --target ${{ matrix.target }}
+          cd ..
+          EXT=""
+          [[ "${{ matrix.os }}" == "windows-latest" ]] && EXT=".exe"
+          BIN="rust/target/${{ matrix.target }}/release/nedbd${EXT}"
+          # Make executable and stage alongside the Python package
+          chmod +x "$BIN" || true
+          cp "$BIN" "python/nedb/nedbd-v2${EXT}"
+          echo "nedbd-v2 binary: $(ls -lh python/nedb/nedbd-v2${EXT})"
       - name: Stage Python source into crate (maturin mixed layout)
         # maturin only bundles a python-source that lives inside the project root.
         # Copy python/nedb -> rust/crates/nedb-py/python/nedb so the native wheel
-        # ships the full package (all .py modules + nedbd) next to _native.so,
-        # not just the bare extension. Runs on the host; the repo is mounted into
-        # the manylinux container, so the staged dir is visible to maturin.
+        # ships the full package (all .py modules + nedbd + nedbd-v2 binary) next
+        # to _native.so. Runs on the host; the repo is mounted into the manylinux
+        # container, so the staged dir is visible to maturin.
         shell: bash
         run: |
           rm -rf rust/crates/nedb-py/python
           mkdir -p rust/crates/nedb-py/python
           cp -r python/nedb rust/crates/nedb-py/python/nedb
           echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) python files"
+          ls -lh rust/crates/nedb-py/python/nedb/nedbd-v2* 2>/dev/null || echo "(nedbd-v2 not present in staged dir — ok if binary build was skipped)"
       - name: Build wheel (maturin)
         uses: PyO3/maturin-action@v1
         with:
           command: build
           # Run from inside the crate so maturin finds pyproject.toml +
-          # ./python/nedb and bundles the full package with the .so extension.
+          # ./python/nedb (with nedbd-v2 binary) and bundles everything.
           working-directory: rust/crates/nedb-py
           args: --release --out ../../../dist
           manylinux: auto
@@ -158,4 +177,14 @@ jobs:
       - name: Publish to npm (all platform binaries bundled)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public
+        run: |
+          # Determine npm dist-tag from version string
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          if echo "$VERSION" | grep -qE '(alpha|beta|rc|pre)'; then
+            TAG=$(echo "$VERSION" | grep -oE '(alpha|beta|rc|pre)[.0-9]*' | head -1 | sed 's/[.].*$//')
+            echo "Publishing pre-release with --tag $TAG"
+            npm publish --access public --tag "$TAG"
+          else
+            echo "Publishing stable release as latest"
+            npm publish --access public
+          fi

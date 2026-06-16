@@ -17,7 +17,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
@@ -138,8 +138,29 @@ fn ok(body: Value) -> Response {
 }
 
 fn db_seq_head(db: &Db) -> (u64, String) {
+    use blake2::{Blake2b512, Digest};
     let seq = db.seq.load(std::sync::atomic::Ordering::SeqCst);
-    (seq, format!("{:064x}", seq)) // placeholder: use actual BLAKE2b in prod
+    // BLAKE2b Merkle head: hash of all current id-index hashes sorted, chained with seq.
+    // This gives a deterministic, tamper-evident root that changes on every write.
+    let mut entries: Vec<String> = db.id_index
+        .collections()
+        .into_iter()
+        .flat_map(|coll| {
+            let mut ids = db.id_index.list_ids(&coll);
+            ids.sort();
+            ids.into_iter()
+                .filter_map(|id| db.id_index.get(&coll, &id))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    entries.sort();
+    let mut h = Blake2b512::new();
+    h.update(seq.to_le_bytes());
+    for entry in &entries {
+        h.update(entry.as_bytes());
+    }
+    let head = hex::encode(&h.finalize()[..32]);
+    (seq, head)
 }
 
 // ── Route handlers ────────────────────────────────────────────────────────────
@@ -149,7 +170,7 @@ async fn health(State(mgr): State<Manager>) -> Response {
     ok(json!({
         "ok": true,
         "service": "nedbd",
-        "version": "2.0.0",
+        "version": env!("CARGO_PKG_VERSION"),
         "databases": names,
         "encrypted": mgr.inner.read().await.tmk.is_some(),
     }))
@@ -304,17 +325,12 @@ async fn delete_document(
         None => return err(StatusCode::NOT_FOUND, &format!("database not found: {}", name)),
         Some(db) => db,
     };
-    // v2 DAG: "delete" marks the id as gone by removing from id index
-    // In a true DAG, the object still exists (immutable) but the id no longer points to it
-    // For now: remove from id index (the objects remain for history/audit)
-    // Full tombstone support can be added in v2.1
-    let existed = db.id_index.get(&coll, &id).is_some();
-    if existed {
-        // Write a tombstone node
-        let _ = db.put(&coll, &format!("_del_{}", id), json!({"_deleted": id}), vec![], None, None);
-        // Remove from index by overwriting with a special marker... for now just acknowledge
-        // TODO: proper tombstone in v2.1
-    }
+    // v2 DAG: tombstone write + id index removal — doc history is preserved in the DAG,
+    // but the live id pointer is cleared so queries and list() never return the doc.
+    let existed = match db.delete(&coll, &id) {
+        Ok(v)  => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
     let (seq, head) = db_seq_head(&db);
     ok(json!({"ok": existed, "seq": seq, "head": head}))
 }
@@ -359,7 +375,10 @@ async fn batch_operations(
                 }
             }
             "del" | "delete" => {
-                json!({"op": "del", "id": id, "ok": true})
+                match db.delete(&coll, &id) {
+                    Ok(existed) => json!({"op": "del", "id": id, "ok": existed}),
+                    Err(e)      => json!({"op": "del", "id": id, "error": e.to_string()}),
+                }
             }
             _ => json!({"op": op_type, "error": "unknown op"}),
         };
@@ -487,8 +506,9 @@ pub async fn run(port: u16, data_dir: &str, tmk: Option<[u8; 32]>, token: Option
 
     let app = router(mgr);
     let addr = format!("0.0.0.0:{}", port).parse::<std::net::SocketAddr>()?;
-    println!("  nedbd 2.0.0 — http://{}  data={}  auth={}",
-             addr, data_dir, if tmk.is_some() { "AES-256-GCM" } else { "off" });
+    println!("  nedbd {} [DAG] — http://{}  data={}  enc={}",
+             env!("CARGO_PKG_VERSION"), addr, data_dir,
+             if tmk.is_some() { "AES-256-GCM" } else { "off" });
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

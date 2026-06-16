@@ -1,6 +1,6 @@
 [package]
 name        = "nedb-core-v2"
-version     = "2.0.0"
+version     = "2.0.4"
 edition     = "2021"
 description = "NEDB v2 — content-addressed DAG storage engine with NQL and HTTP server"
 license     = "BUSL-1.1"
@@ -26,7 +26,7 @@ hex          = "0.4"
 # Concurrency
 rayon        = "1"
 dashmap      = "5"
-parking_lot  = "1"
+parking_lot  = "0.12"
 
 # HTTP server
 axum         = { version = "0.7", features = ["json", "query"] }
