@@ -487,6 +487,7 @@ pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, t
     let mgr = Manager::new(Path::new(data_dir), tmk, token);
     mgr.open_all().await?;
 
+    let has_token = mgr.token.is_some();
     let app = router(mgr);
     let addr = format!("{}:{}", host, port).parse::<std::net::SocketAddr>()?;
     let banner = format!(r#"
@@ -510,7 +511,7 @@ pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, t
         addr,
         data_dir,
         if tmk.is_some() { "AES-256-GCM" } else { "off" },
-        if mgr.token.is_some() { "on" } else { "off (set NEDBD_TOKEN to require auth)" }
+        if has_token { "on" } else { "off (set NEDBD_TOKEN to require auth)" }
     );
     print!("{}", banner);
 
