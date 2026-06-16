@@ -51,6 +51,7 @@ impl NedbCore {
     pub fn create_index(&mut self, coll: String, field: String, kind: String) {
         let k = match kind.as_str() {
             "ordered" => IndexKind::Ordered,
+            "sorted"  => IndexKind::Sorted,
             "search"  => IndexKind::Search,
             _         => IndexKind::Eq,
         };

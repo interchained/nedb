@@ -10,7 +10,7 @@ pub mod nql;
 pub mod relations;
 pub mod store;
 
-pub use index::{IndexKind, Indexes};
+pub use index::{IndexKind, Indexes, OrderedValue};
 pub use log::{LogError, Op, OpLog, GENESIS};
 pub use nql::{cmp, parse, Plan};
 pub use relations::Relations;
@@ -313,17 +313,49 @@ impl Db {
             .collect();
 
         // ── Sort ──────────────────────────────────────────────────────────────
-        if let Some((field, desc)) = &plan.order_by {
-            rows.sort_by(|(_, a), (_, b)| {
-                let av = a.get(field).unwrap_or(&Value::Null);
-                let bv = b.get(field).unwrap_or(&Value::Null);
-                let ord = match (av.as_f64(), bv.as_f64()) {
-                    (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
-                    _ => av.as_str().unwrap_or("").cmp(bv.as_str().unwrap_or("")),
+        //
+        // Sorted-index fast-path:
+        //   ORDER BY field [ASC|DESC] LIMIT n   +  a Sorted index on `field`
+        //   +  no WHERE / SEARCH / TRAVERSE / AS OF that narrowed the candidate set
+        //   ⇒ pull the top-n keys straight out of the BTreeMap and skip the
+        //     O(n log n) sort over the full collection.
+        //
+        // The fast-path is only safe when nothing else has filtered `rows`; if
+        // WHERE narrowed the set we must sort the filtered rows the slow way.
+        let _used_sorted_fast_path = if let Some((field, desc)) = &plan.order_by {
+            let can_fast = as_of.is_none()
+                && plan.search.is_none()
+                && plan.traverse.is_none()
+                && plan.where_.is_empty()
+                && self.idx.has_sorted(&plan.from, field);
+            if can_fast {
+                let want = plan.limit.unwrap_or(usize::MAX);
+                let keys = if plan.limit.is_some() {
+                    self.idx.sorted_top_k(&plan.from, field, *desc, want)
+                } else {
+                    self.idx.sorted_all(&plan.from, field, *desc)
                 };
-                if *desc { ord.reverse() } else { ord }
-            });
-        }
+                let mut out: Vec<(String, Value)> = Vec::with_capacity(keys.len());
+                for k in keys {
+                    if let Some(doc) = self.store.get(&k, None) {
+                        out.push((k, doc.clone()));
+                    }
+                }
+                rows = out;
+                true
+            } else {
+                rows.sort_by(|(_, a), (_, b)| {
+                    let av = a.get(field).unwrap_or(&Value::Null);
+                    let bv = b.get(field).unwrap_or(&Value::Null);
+                    let ord = index::OrderedValue(av.clone())
+                        .cmp(&index::OrderedValue(bv.clone()));
+                    if *desc { ord.reverse() } else { ord }
+                });
+                false
+            }
+        } else {
+            false
+        };
 
         // ── Traverse ──────────────────────────────────────────────────────────
         if let Some(rel) = &plan.traverse {
@@ -473,6 +505,78 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let active = rows.iter().find(|r| r["status"].as_str() == Some("active")).unwrap();
         assert_eq!(active["count"], 2);
+    }
+
+    #[test]
+    fn sorted_index_order_by_limit_fast_path() {
+        // ORDER BY age ASC LIMIT 1 — should return Bob (youngest) without
+        // scanning the full collection. With a sorted index in place, the
+        // engine plucks the top entry straight out of the BTreeMap.
+        let mut db = Db::new();
+        db.create_index("users", "age", IndexKind::Sorted);
+        db.put("users","alice", serde_json::json!({"name":"Alice","age":31}), None, None, None).unwrap();
+        db.put("users","bob",   serde_json::json!({"name":"Bob",  "age":24}), None, None, None).unwrap();
+        db.put("users","carol", serde_json::json!({"name":"Carol","age":41}), None, None, None).unwrap();
+        db.put("users","dave",  serde_json::json!({"name":"Dave", "age":27}), None, None, None).unwrap();
+
+        let asc = db.query("FROM users ORDER BY age ASC LIMIT 1").unwrap();
+        assert_eq!(asc.len(), 1);
+        assert_eq!(asc[0]["name"], "Bob");
+
+        let desc = db.query("FROM users ORDER BY age DESC LIMIT 1").unwrap();
+        assert_eq!(desc.len(), 1);
+        assert_eq!(desc[0]["name"], "Carol");
+
+        let top3 = db.query("FROM users ORDER BY age ASC LIMIT 3").unwrap();
+        let names: Vec<&str> = top3.iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["Bob", "Dave", "Alice"]);
+    }
+
+    #[test]
+    fn sorted_index_backfill_on_create() {
+        // create_index after data was inserted must backfill from the store.
+        let mut db = Db::new();
+        db.put("users","alice", serde_json::json!({"name":"Alice","age":31}), None, None, None).unwrap();
+        db.put("users","bob",   serde_json::json!({"name":"Bob",  "age":24}), None, None, None).unwrap();
+        db.create_index("users", "age", IndexKind::Sorted);
+
+        let asc = db.query("FROM users ORDER BY age ASC LIMIT 1").unwrap();
+        assert_eq!(asc[0]["name"], "Bob");
+    }
+
+    #[test]
+    fn sorted_index_updates_on_put_and_delete() {
+        let mut db = Db::new();
+        db.create_index("users", "age", IndexKind::Sorted);
+        db.put("users","alice", serde_json::json!({"name":"Alice","age":31}), None, None, None).unwrap();
+        db.put("users","bob",   serde_json::json!({"name":"Bob",  "age":24}), None, None, None).unwrap();
+
+        // Update Bob to be older than Alice
+        db.put("users","bob", serde_json::json!({"name":"Bob","age":99}), None, None, None).unwrap();
+        let oldest = db.query("FROM users ORDER BY age DESC LIMIT 1").unwrap();
+        assert_eq!(oldest[0]["name"], "Bob");
+
+        // Delete Bob, Alice is oldest again
+        db.delete("users","bob", None, None, None).unwrap();
+        let oldest = db.query("FROM users ORDER BY age DESC LIMIT 1").unwrap();
+        assert_eq!(oldest[0]["name"], "Alice");
+    }
+
+    #[test]
+    fn sorted_index_with_where_still_correct() {
+        // When WHERE is present, the fast-path is skipped and the engine
+        // sorts the filtered rows using OrderedValue ordering — result must
+        // still be correct.
+        let mut db = Db::new();
+        db.create_index("users", "status", IndexKind::Eq);
+        db.create_index("users", "age",    IndexKind::Sorted);
+        db.put("users","alice", serde_json::json!({"name":"Alice","age":31,"status":"active"}), None, None, None).unwrap();
+        db.put("users","bob",   serde_json::json!({"name":"Bob",  "age":24,"status":"active"}), None, None, None).unwrap();
+        db.put("users","carol", serde_json::json!({"name":"Carol","age":21,"status":"inactive"}), None, None, None).unwrap();
+
+        let rows = db.query(r#"FROM users WHERE status = "active" ORDER BY age ASC LIMIT 1"#).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "Bob");
     }
 
     #[test]

@@ -43,6 +43,7 @@ impl NedbCore {
         let k = match kind {
             "eq"      => IndexKind::Eq,
             "ordered" => IndexKind::Ordered,
+            "sorted"  => IndexKind::Sorted,
             "search"  => IndexKind::Search,
             _         => IndexKind::Eq,
         };
