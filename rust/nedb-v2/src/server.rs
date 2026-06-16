@@ -17,7 +17,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 

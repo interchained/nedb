@@ -14,7 +14,6 @@
 use std::fs;
 use std::path::Path;
 use anyhow::{Context, Result};
-use rayon::prelude::*;
 use serde_json::Value;
 
 use crate::store::{Dek, Node, ObjectStore};
@@ -119,10 +118,7 @@ fn try_decode_line(line: &str, dek: Option<&Dek>) -> Result<Value> {
 }
 
 fn base64_decode(s: &str) -> Result<Vec<u8>> {
-    use std::io::Read;
-    // Simple base64 decoder using only stdlib
-    // Replace with a proper crate in full implementation
-    Ok(base64_simple::decode(s)?)
+    base64_simple::decode(s).map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 fn decrypt_v1(data: &[u8], dek: &Dek) -> Result<Vec<u8>> {

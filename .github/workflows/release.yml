@@ -60,12 +60,17 @@ jobs:
       - name: Build nedbd-v2 (DAG engine binary)
         shell: bash
         run: |
-          cargo build --release --bin nedbd --manifest-path rust/nedb-v2/Cargo.toml --target ${{ matrix.target }}
-          # Rename for inclusion in the Python wheel
-          BIN=rust/nedb-v2/target/${{ matrix.target }}/release/nedbd
+          # Build from the workspace root so cargo uses the workspace Cargo.lock.
+          # Output lands in rust/target/<triple>/release/nedbd (workspace target dir).
+          cd rust
+          cargo build --release --bin nedbd --package nedb-core-v2 --target ${{ matrix.target }}
+          cd ..
           EXT=""
           [[ "${{ matrix.os }}" == "windows-latest" ]] && EXT=".exe"
-          cp "${BIN}${EXT}" "python/nedb/nedbd-v2${EXT}"
+          BIN="rust/target/${{ matrix.target }}/release/nedbd${EXT}"
+          # Make executable and stage alongside the Python package
+          chmod +x "$BIN" || true
+          cp "$BIN" "python/nedb/nedbd-v2${EXT}"
           echo "nedbd-v2 binary: $(ls -lh python/nedb/nedbd-v2${EXT})"
       - name: Stage Python source into crate (maturin mixed layout)
         # maturin only bundles a python-source that lives inside the project root.
@@ -79,7 +84,7 @@ jobs:
           mkdir -p rust/crates/nedb-py/python
           cp -r python/nedb rust/crates/nedb-py/python/nedb
           echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) python files"
-          ls -lh rust/crates/nedb-py/python/nedb/nedbd-v2* 2>/dev/null || echo "(no nedbd-v2 in staged dir)"
+          ls -lh rust/crates/nedb-py/python/nedb/nedbd-v2* 2>/dev/null || echo "(nedbd-v2 not present in staged dir — ok if binary build was skipped)"
       - name: Build wheel (maturin)
         uses: PyO3/maturin-action@v1
         with:

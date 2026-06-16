@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use anyhow::{bail, Result};
+use anyhow::Result;
 use serde_json::Value;
 
 use crate::store::{Dek, Node, ObjectStore};
@@ -16,7 +16,7 @@ pub struct Db {
     pub sorted_indexes: SortedIndexes,
     pub graph:          GraphStore,
     pub root:           PathBuf,
-    seq:                AtomicU64,
+    pub seq:            AtomicU64,
 }
 
 impl Db {
@@ -24,7 +24,7 @@ impl Db {
     pub fn open(db_root: &Path, dek: Option<Dek>) -> Result<Self> {
         std::fs::create_dir_all(db_root)?;
 
-        let objects        = ObjectStore::new(db_root, dek)?;
+        let objects        = ObjectStore::new(db_root, dek.clone())?;
         let id_index       = IdIndex::new(db_root)?;
         let sorted_indexes = SortedIndexes::new();
         let graph          = GraphStore::new(db_root)?;

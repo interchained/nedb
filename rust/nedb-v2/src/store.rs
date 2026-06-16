@@ -43,6 +43,7 @@ pub struct Node {
 
 /// Encryption key material (AES-256-GCM).
 /// In v1 this was called DEK; the structure is the same.
+#[derive(Clone)]
 pub struct Dek(pub [u8; 32]);
 
 impl Dek {
