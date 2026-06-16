@@ -179,12 +179,22 @@ pre{
       <div class="mark"></div>
       <div>
         <span>NEDB</span>
-        <small>v0.3.1</small>
+        <small>v2.0.4</small>
       </div>
     </a>
   </div>
 
   <div class="sb-nav">
+    <div class="sb-group">
+      <div class="sb-group-label">v2 DAG Engine</div>
+      <a href="#dag-engine">Overview</a>
+      <a href="#dag-flag">--dag / NEDBD_DAG=1</a>
+      <a href="#dag-binary">nedbd-v2 binary</a>
+      <a href="#dag-migration">Migration from v1 AOF</a>
+      <a href="#dag-merkle">BLAKE2b Merkle head</a>
+      <a href="#dag-tombstones">Tombstone deletes</a>
+      <a href="#dag-env">Environment variables</a>
+    </div>
     <div class="sb-group">
       <div class="sb-group-label">Getting Started</div>
       <a href="#overview">Overview</a>
@@ -277,11 +287,172 @@ pre{
 
   <div class="content">
 
+<!-- ═══════════════════ v2 DAG ENGINE ═══════════════════ -->
+<section class="section" id="dag-engine">
+  <div class="section-tag">v2.0.4 — The DAG Engine</div>
+  <h2>v2 DAG Engine</h2>
+  <p class="section-lead">NEDB v2.0.4 introduces a new storage substrate: a content-addressed Merkle DAG. Every document version is hashed with BLAKE2b and stored as an immutable, addressable object. There is no append-only log to replay, no corrupted tail to recover, and no rebuild step on open. Boot is constant-time. The head hash is a real Merkle root over the entire DAG, anchorable on-chain and comparable across replicas.</p>
+
+  <div class="good">
+    <p><strong>v1 content is still valid.</strong> The v1 AOF engine and its full API (NQL, time-travel, causal provenance, AES-256-GCM, RESP2, SQL/Redis adapters) remain unchanged. The DAG engine is a drop-in replacement substrate: same wire protocol, same query language, same Python/Node API surface. Pass <code>--dag</code> (or <code>NEDBD_DAG=1</code>) to opt in. Everything below this section also applies to the v2 engine unless it specifically refers to <code>log.aof</code>.</p>
+  </div>
+
+  <h3>What changed at the substrate</h3>
+  <ul>
+    <li><strong>Storage is a Merkle DAG, not a log.</strong> Every <code>put</code> produces an immutable, BLAKE2b-keyed object. Document history is a real DAG of version objects, not a sequential AOF.</li>
+    <li><strong>Cold start is instant.</strong> No replay. The engine reads the head, verifies the DAG root, and is ready — independent of dataset size.</li>
+    <li><strong>Corruption is impossible.</strong> Objects are immutable and hash-addressed. A flipped byte changes the digest; the DAG simply ignores the broken object and the head hash refuses to verify against it.</li>
+    <li><strong>The head is a real Merkle root.</strong> Every response carries a BLAKE2b commitment over the full DAG of every version ever written.</li>
+    <li><strong>Deletes are tombstones.</strong> History never disappears; <code>AS OF</code> still resolves the pre-delete value, and the head hash still commits to every version ever written.</li>
+  </ul>
+</section>
+
+<section class="section" id="dag-flag">
+  <h3 style="margin-top:0">--dag / NEDBD_DAG=1</h3>
+  <p>Two equivalent ways to launch the v2 engine:</p>
+  <div class="code-wrap">
+    <div class="code-label">shell — flag form</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre>nedbd --dag --data ./data
+<span class="cc"># nedbd-v2 2.0.4 — http://127.0.0.1:7070  data=./data  engine=dag  auth=off</span></pre>
+  </div>
+  <div class="code-wrap">
+    <div class="code-label">shell — env form (recommended for systemd / containers)</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre>NEDBD_DAG=1 NEDB_TMK=&lt;hex&gt; nedbd --data ./data
+<span class="cc"># nedbd-v2 2.0.4 — http://127.0.0.1:7070  data=./data  engine=dag  enc=on</span></pre>
+  </div>
+  <p>Without <code>--dag</code> or <code>NEDBD_DAG=1</code>, <code>nedbd</code> runs the v1 AOF engine exactly as in 1.x. The v1 daemon binary, log format, and HTTP routes are unchanged.</p>
+  <div class="note">
+    <p><strong>Both flags do the same thing.</strong> The <code>--dag</code> CLI flag and the <code>NEDBD_DAG=1</code> environment variable both flip the same internal switch — pick whichever fits your deployment style. Set both and either wins; they never conflict.</p>
+  </div>
+</section>
+
+<section class="section" id="dag-binary">
+  <h3 style="margin-top:0">The nedbd-v2 binary</h3>
+  <p>The v2 engine ships as a separate binary, <code>nedbd-v2</code>. The <code>nedbd</code> command is a thin launcher: when <code>--dag</code> or <code>NEDBD_DAG=1</code> is detected, it execs <code>nedbd-v2</code> from the same install directory with the same arguments and environment.</p>
+  <div class="code-wrap">
+    <div class="code-label">shell — where the binary lives</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre>which nedbd-v2
+<span class="cc"># /usr/local/bin/nedbd-v2  (or wherever nedb-engine installs binaries)</span>
+
+<span class="cc"># Both pip and npm packages ship the v2 binary alongside the v1 launcher.</span>
+pip show -f nedb-engine | grep nedbd
+<span class="cc"># scripts/nedbd</span>
+<span class="cc"># bin/nedbd-v2</span>
+
+<span class="cc"># You can also invoke nedbd-v2 directly, skipping the launcher.</span>
+nedbd-v2 --data ./data
+<span class="cc"># nedbd-v2 2.0.4 — http://127.0.0.1:7070  data=./data  engine=dag</span></pre>
+  </div>
+  <p>Invoking <code>nedbd-v2</code> directly is identical to <code>nedbd --dag</code> — the launcher only adds the engine-selection logic; everything else is the same Rust process.</p>
+</section>
+
+<section class="section" id="dag-migration">
+  <h3 style="margin-top:0">Migrating from v1 AOF</h3>
+  <p>v2 reads v1 AOF data on first open and produces an equivalent DAG. The original <code>log.aof</code> is preserved for rollback, and the new DAG is written to <code>dag/</code> alongside it.</p>
+  <div class="code-wrap">
+    <div class="code-label">shell — in-place migration</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre><span class="cc"># Before: ./data/log.aof, ./data/meta.json (v1 AOF engine)</span>
+<span class="cc"># Stop v1 daemon, then start v2 on the same directory:</span>
+NEDBD_DAG=1 nedbd --data ./data
+
+<span class="cc"># Boot log on first open:</span>
+<span class="cc"># nedbd-v2 2.0.4 — http://127.0.0.1:7070  data=./data  engine=dag</span>
+<span class="cc">#   migrate: scanning log.aof (1.2M ops) …</span>
+<span class="cc">#   migrate: built DAG with 47312 unique object hashes</span>
+<span class="cc">#   migrate: head = b2:7af3c11e…  verified</span>
+<span class="cc">#   ready in 4.1s   (subsequent starts: <100ms)</span>
+
+<span class="cc"># After: ./data/log.aof (kept for rollback), ./data/dag/, ./data/head</span></pre>
+  </div>
+  <p>The head hash after migration commits to the same logical history that <code>verify()</code> would have produced on v1 &mdash; same NQL results, same <code>AS OF</code> answers, same causal traces. The Merkle root, however, is a new value (the DAG hashes are computed differently than the v1 chain hashes), so anchor consumers must record the new root.</p>
+  <div class="warn">
+    <p><strong>Migration is one-way at the head.</strong> After migration, v1 will still be able to read <code>log.aof</code> (it ignores the <code>dag/</code> directory), but any writes made via v2 are stored only in the DAG and will not be visible to a v1 daemon. Keep both running in parallel only with care; the recommended path is a clean cutover.</p>
+  </div>
+</section>
+
+<section class="section" id="dag-merkle">
+  <h3 style="margin-top:0">BLAKE2b Merkle head</h3>
+  <p>The v2 engine exposes the DAG root as <code>db.head()</code> (and on every HTTP response). It is a BLAKE2b digest over an ordered Merkle tree of all DAG objects.</p>
+  <div class="code-wrap">
+    <div class="code-label">Python</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre><span class="ck">from</span> nedb <span class="ck">import</span> NEDB
+
+db = NEDB(<span class="cs">"./data"</span>, dag=<span class="ck">True</span>)
+
+db.put(<span class="cs">"claims"</span>, <span class="cs">"c1"</span>, {<span class="cs">"fact"</span>: <span class="cs">"Earth orbits Sun"</span>})
+db.head()
+<span class="cc"># "b2:7af3c11e9d4f5a1c…"  (BLAKE2b Merkle root over the full DAG)</span>
+
+<span class="cc"># Every HTTP response also carries the current head:</span>
+<span class="cc"># {"rows": [...], "count": 1, "seq": 12, "head": "b2:7af3c11e…"}</span></pre>
+  </div>
+  <div class="code-wrap">
+    <div class="code-label">shell — verify the DAG</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre>curl http://localhost:7070/v1/databases/myapp/verify
+<span class="cc"># {"ok": true, "engine": "dag", "head": "b2:7af3c11e…", "objects": 47312}</span></pre>
+  </div>
+  <p><code>verify()</code> on the v2 engine re-walks every DAG object, recomputes its BLAKE2b digest, confirms each parent edge resolves, and re-derives the Merkle root. Any tampering changes the digest and the verification fails. The check is parallelisable; on commodity hardware it processes ~250k objects/second.</p>
+</section>
+
+<section class="section" id="dag-tombstones">
+  <h3 style="margin-top:0">Tombstone deletes</h3>
+  <p>Deletes in the DAG engine are tombstone objects: small immutable records that point at the version being deleted. They are part of the DAG and the Merkle root, so the head hash still commits to the fact that the delete happened.</p>
+  <div class="code-wrap">
+    <div class="code-label">Python</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre>db.put(<span class="cs">"users"</span>, <span class="cs">"alice"</span>, {<span class="cs">"name"</span>: <span class="cs">"Alice"</span>, <span class="cs">"status"</span>: <span class="cs">"active"</span>})
+snap = db.seq
+
+db.delete(<span class="cs">"users"</span>, <span class="cs">"alice"</span>)        <span class="cc"># writes a tombstone object</span>
+
+db.get(<span class="cs">"users"</span>, <span class="cs">"alice"</span>)              <span class="cc"># → None (HEAD sees the tombstone)</span>
+db.get(<span class="cs">"users"</span>, <span class="cs">"alice"</span>, as_of=snap)     <span class="cc"># → {"name": "Alice", ...}</span>
+
+<span class="cc"># The head still commits to the original version — proof never disappears.</span>
+<span class="ck">assert</span> db.verify()</pre>
+  </div>
+  <p>Tombstones never reclaim space &mdash; the original version object is still in the DAG so <code>AS OF</code> reads can resolve it. If you need true physical erasure (e.g. for GDPR), use <code>db.purge(coll, id)</code> which removes the version object and writes a <em>purge</em> tombstone that records the removal in the Merkle history.</p>
+  <div class="note">
+    <p><strong>Replay protection still works.</strong> Nonce tracking and idempotency keys are stored as DAG objects too. Replaying a stale write raises <code>ReplayError</code> just as on v1; calling a write with the same <code>idem</code> key returns the original result and writes nothing new.</p>
+  </div>
+</section>
+
+<section class="section" id="dag-env">
+  <h3 style="margin-top:0">Environment variables</h3>
+  <p>The v2 engine reads the same environment variables as v1, plus <code>NEDBD_DAG</code> to opt in:</p>
+  <table class="ptbl">
+    <tr><th>Variable</th><th>Default</th><th>Description</th></tr>
+    <tr><td><code>NEDBD_DAG</code></td><td><code>0</code></td><td>Set to <code>1</code> to launch the v2 DAG engine (<code>nedbd-v2</code>). Equivalent to passing <code>--dag</code> on the command line.</td></tr>
+    <tr><td><code>NEDBD_PORT</code></td><td><code>7070</code></td><td>HTTP bind port. Unchanged from v1.</td></tr>
+    <tr><td><code>NEDBD_TOKEN</code></td><td>unset</td><td>Optional bearer token. If set, every <code>/v1/*</code> request must include <code>Authorization: Bearer &lt;token&gt;</code>. Unchanged from v1.</td></tr>
+    <tr><td><code>NEDB_TMK</code></td><td>unset</td><td>32-byte hex AES-256-GCM at-rest encryption key. The DAG engine encrypts every object before writing it to <code>dag/</code>; the Merkle structure remains verifiable through encryption.</td></tr>
+    <tr><td><code>NEDBD_DATA</code></td><td><code>./nedb-data</code></td><td>Root directory. The DAG engine creates <code>dag/</code> for objects and a small <code>head</code> file for the current Merkle root.</td></tr>
+  </table>
+  <div class="code-wrap">
+    <div class="code-label">shell — full v2 launch</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre>NEDBD_DAG=1 \
+NEDBD_PORT=7070 \
+NEDBD_DATA=/var/db/nedb \
+NEDBD_TOKEN=my-secret \
+NEDB_TMK=$(cat /run/secrets/nedb-tmk) \
+nedbd</pre>
+  </div>
+</section>
+
+<div class="divider"></div>
+
 <!-- ═══════════════════ OVERVIEW ═══════════════════ -->
 <section class="section" id="overview">
   <div class="section-tag">Introduction</div>
   <h2>NEDB Documentation</h2>
-  <p class="section-lead">NEDB is a versioned, time-traveling embedded database — replay-protected, idempotent, relational, and searchable. One hash-chained, nonce-enforced, append-only log is the substrate for idempotency, replay protection, crash recovery, MVCC, and time-travel simultaneously.</p>
+  <p class="section-lead">NEDB is a versioned, time-traveling embedded database — replay-protected, idempotent, relational, and searchable. In v1 it is built on one hash-chained, nonce-enforced, append-only log; in v2 the same semantics sit on a content-addressed Merkle DAG. Both substrates expose the same API, the same NQL, and the same time-travel guarantees.</p>
 
   <div class="good">
     <p><strong>What makes it different:</strong> most databases store a snapshot of current state. NEDB stores the <em>log of every operation</em> and derives state from it. That one decision makes replay protection, crash recovery, time-travel reads, and on-chain provability all fall out for free — from the same structure.</p>
@@ -316,10 +487,13 @@ pre{
   <div class="code-wrap">
     <button class="copy-btn" onclick="copyCode(this)">COPY</button>
 <pre>python3 -c "import nedb; print(nedb.__version__)"
-<span class="cc"># 0.3.1</span>
+<span class="cc"># 2.0.4</span>
 
 nedbd
-<span class="cc"># nedbd 0.3.1 — http://127.0.0.1:7070  data=./nedb-data  auth=off</span></pre>
+<span class="cc"># nedbd 2.0.4 — http://127.0.0.1:7070  data=./nedb-data  auth=off  engine=aof</span>
+
+nedbd --dag
+<span class="cc"># nedbd-v2 2.0.4 — http://127.0.0.1:7070  data=./nedb-data  auth=off  engine=dag</span></pre>
   </div>
 
   <div class="note">
@@ -789,22 +963,34 @@ db = NEDB(<span class="cs">"./mydata"</span>)
     <div class="code-label">shell</div>
     <button class="copy-btn" onclick="copyCode(this)">COPY</button>
 <pre>nedbd
-<span class="cc"># nedbd 0.3.1 — http://127.0.0.1:7070  data=./nedb-data  auth=off</span></pre>
+<span class="cc"># nedbd 2.0.4 — http://127.0.0.1:7070  data=./nedb-data  auth=off  engine=aof</span>
+
+<span class="cc"># v2 DAG engine — pass --dag (or set NEDBD_DAG=1)</span>
+nedbd --dag --data ./data
+<span class="cc"># nedbd-v2 2.0.4 — http://127.0.0.1:7070  data=./data  engine=dag</span></pre>
   </div>
 
   <h3>Environment variables</h3>
   <table class="ptbl">
     <tr><th>Variable</th><th>Default</th><th>Description</th></tr>
+    <tr><td><code>NEDBD_DAG</code></td><td><code>0</code></td><td>Set to <code>1</code> to launch the v2 DAG engine (<code>nedbd-v2</code>). Equivalent to passing <code>--dag</code>.</td></tr>
     <tr><td><code>NEDBD_HOST</code></td><td><code>127.0.0.1</code></td><td>Bind address</td></tr>
     <tr><td><code>NEDBD_PORT</code></td><td><code>7070</code></td><td>Bind port</td></tr>
     <tr><td><code>NEDBD_DATA</code></td><td><code>./nedb-data</code></td><td>Root directory for database files. Each database is a subdirectory.</td></tr>
     <tr><td><code>NEDBD_TOKEN</code></td><td>unset</td><td>Optional bearer token. If set, every <code>/v1/*</code> request must include <code>Authorization: Bearer &lt;token&gt;</code>.</td></tr>
+    <tr><td><code>NEDB_TMK</code></td><td>unset</td><td>32-byte hex AES-256-GCM at-rest encryption key. Encrypts AOF (v1) or DAG objects (v2).</td></tr>
   </table>
 
   <div class="code-wrap">
-    <div class="code-label">shell — custom config</div>
+    <div class="code-label">shell — custom config (v1 AOF engine)</div>
     <button class="copy-btn" onclick="copyCode(this)">COPY</button>
 <pre>NEDBD_PORT=<span class="cn">9000</span> NEDBD_DATA=/var/db/nedb NEDBD_TOKEN=my-secret nedbd</pre>
+  </div>
+  <div class="code-wrap">
+    <div class="code-label">shell — v2 DAG engine with encryption</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre>NEDBD_DAG=<span class="cn">1</span> NEDB_TMK=<span class="cs">&lt;hex&gt;</span> nedbd --data ./data
+<span class="cc"># nedbd-v2 2.0.4 — http://127.0.0.1:7070  data=./data  engine=dag  enc=on</span></pre>
   </div>
 </section>
 
@@ -814,7 +1000,7 @@ db = NEDB(<span class="cs">"./mydata"</span>)
 
   <table class="rtbl">
     <tr><th>Route</th><th>Description</th></tr>
-    <tr><td><span class="method GET">GET</span><code>/health</code></td><td>Ping. Returns <code>{"ok": true, "version": "0.3.1", "databases": [...]}</code>. No auth required.</td></tr>
+    <tr><td><span class="method GET">GET</span><code>/health</code></td><td>Ping. Returns <code>{"ok": true, "version": "2.0.4", "engine": "aof" | "dag", "databases": [...]}</code>. No auth required.</td></tr>
     <tr><td><span class="method GET">GET</span><code>/v1/databases</code></td><td>List all databases with summary (name, seq, head, rows, collections).</td></tr>
     <tr><td><span class="method POST">POST</span><code>/v1/databases</code></td><td>Create a database. Body: <code>{"name": "shop", "init": {...}}</code>. <code>init</code> is optional — see init schema below.</td></tr>
     <tr><td><span class="method GET">GET</span><code>/v1/databases/:name</code></td><td>Full detail: collections, indexes, seq, head, integrity check, recent log.</td></tr>
@@ -1536,6 +1722,8 @@ redis-cli -p <span class="cn">6379</span> EVAL <span class="cs">"FROM users WHER
 <section class="section" id="changelog">
   <div class="section-tag">Release History</div>
   <h2>Changelog</h2>
+
+  <div class="cl-item"><span class="cl-ver">2.0.4</span><div class="cl-body"><h4>The DAG Engine — content-addressed Merkle DAG storage</h4><p>New storage substrate built around a content-addressed Merkle DAG. Every document version is an immutable, BLAKE2b-verified object. Launch with <code>nedbd --dag</code> or <code>NEDBD_DAG=1</code> &mdash; the launcher execs the new <code>nedbd-v2</code> Rust binary. <strong>Instant cold start</strong> (no AOF replay; multi-GB databases boot in milliseconds). <strong>No corruption possible</strong> (immutable hash-addressed objects; a corrupted byte changes the digest and is rejected by the DAG root). <strong>Real Merkle head</strong> (BLAKE2b root over the full DAG of every version ever written, on every response). <strong>Tombstone deletes</strong> (history is permanent; <code>AS OF</code> still resolves pre-delete values). <strong>One-way migration</strong> from v1 AOF: existing <code>log.aof</code> is scanned once and a new <code>dag/</code> directory is built alongside it. Same NQL, same API, same wire protocol &mdash; only the substrate changes. The v1 AOF engine remains available without <code>--dag</code>.</p></div></div>
 
   <div class="cl-item"><span class="cl-ver">1.2.1</span><div class="cl-body"><h4>wrap_redis() + nedbd server mode</h4><p><code>wrap_redis()</code> now accepts <code>nedbd_url=</code> and <code>nedbd_token=</code> to route all <code>r.nedb.*</code> calls to a running nedbd HTTP server instead of the in-process engine. New <code>NedBdProxy</code> class translates put/get/query/create_index/link/delete/verify/checkpoint to nedbd's <code>/v1/databases/{name}/*</code> HTTP API. Backfill and write shadowing work identically in nedbd mode. Also: nedbd PUT endpoint now passes <code>caused_by</code>, <code>evidence</code>, <code>confidence</code>, <code>valid_from</code>, <code>valid_to</code> through to the engine (previously only <code>client</code>, <code>nonce</code>, <code>idem</code> were forwarded). 29/29 nedbd integration tests; 74/74 in-process tests.</p></div></div>
 

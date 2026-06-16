@@ -3,10 +3,10 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>NEDB — bi-temporal, causal, embedded database</title>
-<meta name="description" content="NEDB v1.0.5 — bi-temporal queries, causal write provenance, AES-256-GCM encryption, concurrent group-commit sequencer, SQL/Redis/MongoDB adapters, RESP2 wire protocol, Rust native core. pip install nedb-engine." />
-<meta property="og:title" content="NEDB" />
-<meta property="og:description" content="Bi-temporal, causal-provenance embedded database — answers 'what did the system know at seq 200 about what was true on 2024-06-15?' pip install nedb-engine." />
+<title>NEDB — content-addressed Merkle DAG, bi-temporal, causal, embedded database</title>
+<meta name="description" content="NEDB v2.0.4 — content-addressed Merkle DAG storage, BLAKE2b-verified immutable objects, instant cold start, Rust v2 engine via --dag, bi-temporal queries, causal write provenance, AES-256-GCM encryption, SQL/Redis/MongoDB adapters, RESP2 wire protocol. pip install nedb-engine." />
+<meta property="og:title" content="NEDB v2.0.4 — The DAG Engine" />
+<meta property="og:description" content="Content-addressed Merkle DAG embedded database. Every document version is an immutable, BLAKE2b-verified object. Instant cold start, no AOF corruption possible. pip install nedb-engine." />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
@@ -109,6 +109,7 @@
     <nav class="nav-links">
       <a class="hide" href="#install">Install</a>
       <a class="hide" href="#whatsnew">Releases</a>
+      <a class="hide" href="#dag">DAG Engine</a>
       <a class="hide" href="#server">Server</a>
       <a href="reference.html">Docs</a>
       <a href="https://github.com/Eth-Interchained/nedb/blob/master/docs/SPEC.md">Spec</a>
@@ -120,9 +121,9 @@
 <section class="hero">
   <div class="wrap grid2">
     <div>
-      <span class="relpill">&#9679; Latest <span class="v mono">v1.0.5</span> &middot; GPL-3.0-or-later</span>
+      <span class="relpill">&#9679; <span class="v mono">v2.0.4</span> &mdash; The DAG Engine</span>
       <h1>NEDB</h1>
-      <p class="tag">The embedded database that answers <b>&ldquo;what did the system know, and when?&rdquo;</b> Bi-temporal queries, causal write provenance, AES-256-GCM encryption, and a Rust core &mdash; all in one append-only hash chain.</p>
+      <p class="tag"><b>Content-addressed Merkle DAG</b> for embedded data. Every document version is an immutable, BLAKE2b-verified object &mdash; with bi-temporal queries, causal write provenance, and a Rust v2 engine. Instant cold start. No corruption possible.</p>
       <div class="cta">
         <a class="btn btn-primary" href="https://github.com/Eth-Interchained/nedb">View on GitHub</a>
         <a class="btn btn-ghost" href="https://studio.interchained.org">NEDB Studio &rarr;</a>
@@ -130,6 +131,7 @@
       <div class="install">
         <code class="mono"><span class="accent">$</span> pip install nedb-engine</code>
         <code class="mono"><span class="accent">$</span> npm install nedb-engine</code>
+        <code class="mono"><span class="accent">$</span> NEDBD_DAG=1 NEDB_TMK=&lt;hex&gt; nedbd --data ./data</code>
       </div>
       <div class="badges">
         <img alt="PyPI" src="https://img.shields.io/pypi/v/nedb-engine?color=34d399&label=pypi" />
@@ -139,34 +141,54 @@
       </div>
     </div>
     <div class="code">
-      <div class="bar"><span class="d r"></span><span class="d y"></span><span class="d g"></span><span class="fn mono">causal_bitemporal.py</span></div>
+      <div class="bar"><span class="d r"></span><span class="d y"></span><span class="d g"></span><span class="fn mono">dag_engine.py</span></div>
 <pre class="mono"><span class="k">from</span> nedb <span class="k">import</span> NEDB
 
-db = <span class="f">NEDB</span>(<span class="s">"./data"</span>)   <span class="c"># AES-256-GCM if NEDB_TMK set</span>
+<span class="c"># v2 DAG engine: content-addressed objects</span>
+db = <span class="f">NEDB</span>(<span class="s">"./data"</span>, dag=<span class="k">True</span>)   <span class="c"># or NEDBD_DAG=1</span>
 
-<span class="c"># Write with causal provenance</span>
+<span class="c"># Every put becomes an immutable, BLAKE2b-verified</span>
+<span class="c"># object in the Merkle DAG. No AOF, no replay.</span>
 db.<span class="f">put</span>(<span class="s">"claims"</span>, <span class="s">"c1"</span>, {
     <span class="s">"fact"</span>: <span class="s">"Earth orbits Sun"</span>,
     <span class="s">"valid_from"</span>: <span class="s">"1543-01-01"</span>,
     <span class="s">"caused_by"</span>: <span class="s">"obs:heliocentric-model"</span>,
-    <span class="s">"evidence"</span>: <span class="s">"Copernicus 1543"</span>,
     <span class="s">"confidence"</span>: <span class="n">0.9999</span>,
 })
 
-<span class="c"># Bi-temporal: what did the system know at</span>
-<span class="c"># seq 200 about what was true on 2024-06-15?</span>
+<span class="c"># The Merkle head is a real BLAKE2b root over the</span>
+<span class="c"># full DAG of all versions ever written.</span>
+db.<span class="f">head</span>()                  <span class="c"># "b2:7af3..." (DAG root)</span>
+
+<span class="c"># Bi-temporal queries unchanged</span>
 db.<span class="f">query</span>(
     <span class="s">'FROM claims AS OF 200'</span>
     <span class="s">' VALID AS OF "2024-06-15"'</span>
     <span class="s">' WHERE confidence > 0.9'</span>
 )
 
-<span class="c"># Causal trace: why does the agent believe X?</span>
-db.<span class="f">query</span>(<span class="s">'FROM claims TRACE caused_by'</span>)
-<span class="c"># Forward: what did this observation cause?</span>
-db.<span class="f">query</span>(<span class="s">'FROM claims TRACE caused_by REVERSE'</span>)
+<span class="c"># Cold start is instant — no log replay</span>
+<span class="k">assert</span> db.<span class="f">verify</span>()     <span class="c"># DAG integrity check</span></pre>
+    </div>
+  </div>
+</section>
 
-<span class="k">assert</span> db.<span class="f">verify</span>()     <span class="c"># hash chain intact</span></pre>
+<section id="dag">
+  <div class="wrap">
+    <div class="kick">v2.0.4 &middot; The DAG Engine</div>
+    <h2>Content-addressed Merkle DAG &mdash; instant cold start, zero corruption</h2>
+    <p class="lede">NEDB v2.0.4 introduces a new storage substrate built around an immutable, content-addressed Merkle DAG. Every document version is hashed with BLAKE2b and stored as an addressable object. There is no AOF to replay, no log to corrupt, and no rebuild step on open. Boot is constant-time; the head hash is a real Merkle root over the entire DAG.</p>
+    <div class="cards">
+      <div class="card"><div class="ic">&#127760;</div><h3>Content-addressed objects</h3><p>Every <span class="mono">put</span> writes an immutable object keyed by its BLAKE2b digest. Identical values dedup automatically. Document history is a real DAG of versions, not a sequential log.</p></div>
+      <div class="card"><div class="ic">&#9889;</div><h3>Instant cold start</h3><p>No AOF replay. Open a multi-GB database in milliseconds &mdash; the engine reads the head, verifies the root, and is ready. Restart time is independent of dataset size.</p></div>
+      <div class="card"><div class="ic">&#128737;</div><h3>No corruption possible</h3><p>Objects are immutable and hash-addressed; a corrupted byte changes its hash and the DAG simply ignores it. There is no partially-written AOF tail to recover.</p></div>
+      <div class="card"><div class="ic">&#129518;</div><h3>Rust v2 engine</h3><p>Run with <span class="mono">nedbd --dag</span> or <span class="mono">NEDBD_DAG=1</span> to launch the new <span class="mono">nedbd-v2</span> binary &mdash; a pure Rust core built around the DAG, with the v1 wire protocol preserved.</p></div>
+      <div class="card"><div class="ic">&#128279;</div><h3>Real Merkle head</h3><p>Every response includes the current BLAKE2b Merkle head over the full DAG &mdash; anchorable on-chain, comparable across replicas, sufficient to prove the full history at a point in time.</p></div>
+      <div class="card"><div class="ic">&#128465;</div><h3>Tombstone deletes</h3><p>Deletes are tombstone objects in the DAG. History never disappears; <span class="mono">AS OF</span> still sees the pre-delete value, and the head hash still commits to every version ever written.</p></div>
+    </div>
+    <div class="install" style="margin-top:22px">
+      <code class="mono"><span class="accent">$</span> nedbd --dag --data ./data                <span class="c"># launch v2 engine</span></code>
+      <code class="mono"><span class="accent">$</span> NEDBD_DAG=<span class="n">1</span> NEDB_TMK=<span class="s">&lt;hex&gt;</span> nedbd --data ./data <span class="c"># env-driven, encrypted</span></code>
     </div>
   </div>
 </section>
@@ -175,14 +197,14 @@ db.<span class="f">query</span>(<span class="s">'FROM claims TRACE caused_by REV
   <div class="wrap">
     <div class="kick">Why NEDB</div>
     <h2>The first embedded database that answers &ldquo;why does the agent believe X?&rdquo;</h2>
-    <p class="lede">NEDB seals <span class="mono">caused_by</span>, <span class="mono">evidence</span>, and <span class="mono">confidence</span> directly into its hash chain &mdash; so every fact carries a cryptographically-linked audit trail. Combine that with bi-temporal queries and a concurrent Rust core and you get something no other embedded database offers: <b>four-dimensional auditability at embedded-database speed.</b></p>
+    <p class="lede">NEDB seals <span class="mono">caused_by</span>, <span class="mono">evidence</span>, and <span class="mono">confidence</span> directly into its Merkle DAG &mdash; so every fact carries a cryptographically-linked audit trail. Combine that with bi-temporal queries and a concurrent Rust core and you get something no other embedded database offers: <b>four-dimensional auditability at embedded-database speed.</b></p>
     <div class="cards">
       <div class="card"><div class="ic">&#128344;</div><h3>Bi-temporal Queries</h3><p><span class="mono">VALID AS OF "date"</span> for business time + <span class="mono">AS OF seq</span> for transaction time. Ask the four-dimensional question: &ldquo;what did the system know at seq 200 about what was true on 2024-06-15?&rdquo;</p></div>
-      <div class="card"><div class="ic">&#128279;</div><h3>Causal Write Provenance</h3><p><span class="mono">caused_by</span>, <span class="mono">evidence</span>, <span class="mono">confidence</span> sealed in the hash chain. <span class="mono">TRACE caused_by</span> walks backward (why?) and <span class="mono">TRACE caused_by REVERSE</span> walks forward (what did this cause?).</p></div>
+      <div class="card"><div class="ic">&#128279;</div><h3>Causal Write Provenance</h3><p><span class="mono">caused_by</span>, <span class="mono">evidence</span>, <span class="mono">confidence</span> sealed in the DAG. <span class="mono">TRACE caused_by</span> walks backward (why?) and <span class="mono">TRACE caused_by REVERSE</span> walks forward (what did this cause?).</p></div>
       <div class="card"><div class="ic">&#9889;</div><h3>Concurrent Group-Commit</h3><p>nedbd handles parallel reads and batched writes safely via a lock-free sequencer. ~15&thinsp;K writes/s under load &mdash; without sacrificing durability or chain integrity.</p></div>
       <div class="card"><div class="ic">&#128260;</div><h3>SQL + Redis + MongoDB Adapters</h3><p>All three wire protocols speak the same Rust engine. Migrate from any stack without changing your queries &mdash; and add RESP2 for <span class="mono">redis-cli</span> compatibility via <span class="mono">NEDBD_RESP2_PORT=6380</span>.</p></div>
-      <div class="card"><div class="ic">&#128274;</div><h3>AES-256-GCM Encryption</h3><p>Set <span class="mono">NEDB_TMK=&lt;32-byte-hex&gt;</span> and every record is encrypted at rest. The hash chain remains verifiable; keys never touch the log.</p></div>
-      <div class="card"><div class="ic">&#128295;</div><h3>Self-Healing Chains</h3><p>Structural gaps are detected and auto-repaired on open. Combined with the Rust native core (napi-rs for Node, PyO3 for Python), the same compiled engine powers both runtimes.</p></div>
+      <div class="card"><div class="ic">&#128274;</div><h3>AES-256-GCM Encryption</h3><p>Set <span class="mono">NEDB_TMK=&lt;32-byte-hex&gt;</span> and every object is encrypted at rest. The DAG remains verifiable; keys never touch storage.</p></div>
+      <div class="card"><div class="ic">&#128295;</div><h3>Self-Healing DAG</h3><p>Structural gaps are detected and auto-repaired on open. Combined with the Rust native core (napi-rs for Node, PyO3 for Python), the same compiled engine powers both runtimes.</p></div>
     </div>
   </div>
 </section>
@@ -191,7 +213,7 @@ db.<span class="f">query</span>(<span class="s">'FROM claims TRACE caused_by REV
   <div class="wrap">
     <div class="kick">NQL Grammar</div>
     <h2>One query language for all four dimensions</h2>
-    <p class="lede">NQL composes cleanly &mdash; any clause is optional, order is consistent, and the same syntax works across the Python, Node, SQL, Redis, and MongoDB adapters.</p>
+    <p class="lede">NQL composes cleanly &mdash; any clause is optional, order is consistent, and the same syntax works across the Python, Node, SQL, Redis, and MongoDB adapters. Identical grammar in the v1 AOF engine and the v2 DAG engine.</p>
     <div class="gram">
       <table>
         <thead><tr><th>Clause</th><th>Description</th></tr></thead>
@@ -216,8 +238,9 @@ db.<span class="f">query</span>(<span class="s">'FROM claims TRACE caused_by REV
 <section id="whatsnew">
   <div class="wrap">
     <div class="kick">Release highlights</div>
-    <h2>The 1.0 line</h2>
+    <h2>What's new</h2>
     <div class="rel">
+      <div class="relrow"><div class="ver">v2.0.4</div><div><h3>The DAG Engine</h3><p>Content-addressed Merkle DAG storage. Every document version is an immutable, BLAKE2b-verified object. <span class="mono">nedbd --dag</span> (or <span class="mono">NEDBD_DAG=1</span>) runs the Rust v2 engine. Instant cold start, no corruption possible, real Merkle head on every response.</p></div></div>
       <div class="relrow"><div class="ver">v1.0.5</div><div><h3>Bi-temporal stability &amp; Studio GA</h3><p>Production-hardened <span class="mono">VALID AS OF</span> indexing, improved self-healing on corrupt segments, and NEDB Studio goes generally available at <span class="mono">studio.interchained.org</span> &mdash; prompt-to-database GUI with live chain inspection.</p></div></div>
       <div class="relrow"><div class="ver">v1.0.x</div><div><h3>Rust native core (napi-rs + PyO3)</h3><p>Same compiled Rust core surfaces to Node via napi-rs and to Python via maturin/PyO3. Both <span class="mono">npm install nedb-engine</span> and <span class="mono">pip install nedb-engine</span> ship native binaries with a pure fallback.</p></div></div>
       <div class="relrow"><div class="ver">v0.9.x</div><div><h3>RESP2 wire protocol + adapters</h3><p>nedbd now speaks RESP2 &mdash; set <span class="mono">NEDBD_RESP2_PORT=6380</span> and connect any <span class="mono">redis-cli</span> client. SQL and MongoDB adapters landed alongside, all sharing the same engine.</p></div></div>
@@ -233,21 +256,25 @@ db.<span class="f">query</span>(<span class="s">'FROM claims TRACE caused_by REV
     <div>
       <div class="kick">Run it as a server</div>
       <h2>nedbd</h2>
-      <p class="lede"><span class="mono">pip install nedb-engine</span> or <span class="mono">npm install nedb-engine</span> ships the daemon. Run the Rust engine as its own process and connect clients over HTTP, RESP2, SQL, or MongoDB wire &mdash; whichever fits your stack. The group-commit sequencer handles concurrent access safely.</p>
+      <p class="lede"><span class="mono">pip install nedb-engine</span> or <span class="mono">npm install nedb-engine</span> ships the daemon. Pass <span class="mono">--dag</span> (or set <span class="mono">NEDBD_DAG=1</span>) to launch the v2 Rust engine binary <span class="mono">nedbd-v2</span> with the content-addressed Merkle DAG. Connect clients over HTTP, RESP2, SQL, or MongoDB wire &mdash; whichever fits your stack. The group-commit sequencer handles concurrent access safely.</p>
     </div>
     <div class="code">
       <div class="bar"><span class="d r"></span><span class="d y"></span><span class="d g"></span><span class="fn mono">shell</span></div>
-<pre class="mono"><span class="accent">$</span> nedbd                      <span class="c"># http://127.0.0.1:7070</span>
-<span class="accent">$</span> NEDBD_RESP2_PORT=6380 nedbd <span class="c"># also speaks redis-cli</span>
+<pre class="mono"><span class="accent">$</span> nedbd                              <span class="c"># v1 AOF engine</span>
+<span class="accent">$</span> nedbd --dag                        <span class="c"># v2 DAG engine (nedbd-v2)</span>
+<span class="accent">$</span> NEDBD_DAG=<span class="n">1</span> nedbd                  <span class="c"># env-driven equivalent</span>
+<span class="accent">$</span> NEDBD_DAG=<span class="n">1</span> NEDB_TMK=<span class="s">&lt;hex&gt;</span> \
+    nedbd --data ./data               <span class="c"># DAG + AES-256-GCM</span>
+<span class="accent">$</span> NEDBD_RESP2_PORT=<span class="n">6380</span> nedbd       <span class="c"># also speaks redis-cli</span>
 
-<span class="c"># Create a database and write with provenance</span>
+<span class="c"># Create a database and query — same API on v1 and v2</span>
 <span class="accent">$</span> curl -X POST localhost:7070/v1/databases \
     -d <span class="s">'{"name":"agents"}'</span>
 
 <span class="accent">$</span> curl -X POST localhost:7070/v1/databases/agents/query \
     -d <span class="s">'{"nql":"FROM beliefs AS OF 200 VALID AS OF \"2024-06-15\" WHERE confidence > 0.8 TRACE caused_by"}'</span>
 
-<span class="c"># env: NEDBD_HOST · NEDBD_PORT · NEDBD_DATA</span>
+<span class="c"># env: NEDBD_DAG · NEDBD_PORT · NEDBD_DATA</span>
 <span class="c">#      NEDBD_TOKEN · NEDB_TMK (AES-256-GCM key)</span></pre>
     </div>
   </div>
@@ -260,8 +287,9 @@ db.<span class="f">query</span>(<span class="s">'FROM claims TRACE caused_by REV
     <div class="cta" style="margin-top:18px; flex-direction: column; align-items: flex-start;">
       <code class="mono" style="background:var(--bg2);border:1px solid var(--line);border-radius:9px;padding:11px 16px"><span class="accent">$</span> pip install nedb-engine</code>
       <code class="mono" style="background:var(--bg2);border:1px solid var(--line);border-radius:9px;padding:11px 16px"><span class="accent">$</span> npm install nedb-engine</code>
+      <code class="mono" style="background:var(--bg2);border:1px solid var(--line);border-radius:9px;padding:11px 16px"><span class="accent">$</span> NEDBD_DAG=1 NEDB_TMK=&lt;hex&gt; nedbd --data ./data</code>
     </div>
-    <p class="lede" style="margin-top:18px"><span class="mono">NEDB()</span> is in-memory; <span class="mono">NEDB("./path")</span> is durable. <span class="mono">nedbd</span> runs it as a server. The Rust core ships as a native binary with a pure fallback. Set <span class="mono">NEDB_TMK</span> for AES-256-GCM at-rest encryption. Read the <a class="accent" href="https://github.com/Eth-Interchained/nedb/blob/master/docs/SPEC.md">format spec</a> or explore your data visually in <a class="accent" href="https://studio.interchained.org">NEDB Studio</a>.</p>
+    <p class="lede" style="margin-top:18px"><span class="mono">NEDB()</span> is in-memory; <span class="mono">NEDB("./path")</span> is durable. <span class="mono">nedbd</span> runs it as a server; <span class="mono">nedbd --dag</span> launches the v2 DAG engine. The Rust core ships as a native binary with a pure fallback. Set <span class="mono">NEDB_TMK</span> for AES-256-GCM at-rest encryption. Read the <a class="accent" href="https://github.com/Eth-Interchained/nedb/blob/master/docs/SPEC.md">format spec</a> or explore your data visually in <a class="accent" href="https://studio.interchained.org">NEDB Studio</a>.</p>
     <div class="badges" style="margin-top: 20px;">
       <a href="https://github.com/Eth-Interchained/nedb" target="_blank" rel="noopener noreferrer"><img alt="GitHub (source)" src="https://img.shields.io/badge/github-Eth--Interchained%2Fnedb-34d399?logo=github" /></a>
       <a href="https://github.com/aiassistsecure/nedb" target="_blank" rel="noopener noreferrer"><img alt="GitHub (mirror)" src="https://img.shields.io/badge/github-aiassistsecure%2Fnedb-22d3ee?logo=github" /></a>
@@ -274,7 +302,7 @@ db.<span class="f">query</span>(<span class="s">'FROM claims TRACE caused_by REV
   <div class="wrap row">
     <div>
       <div class="brand" style="margin-bottom:7px"><span class="dot"></span> NEDB</div>
-      <div>GPL-3.0-or-later &middot; &copy; <a href="https://interchained.org">INTERCHAINED, LLC</a> &middot; built with <a href="https://aiassist.net">AiAssist</a></div>
+      <div>v2.0.4 &middot; GPL-3.0-or-later &middot; &copy; <a href="https://interchained.org">INTERCHAINED, LLC</a> &middot; built with <a href="https://aiassist.net">AiAssist</a></div>
     </div>
     <nav class="nav-links">
       <a href="https://github.com/Eth-Interchained/nedb">GitHub</a>
