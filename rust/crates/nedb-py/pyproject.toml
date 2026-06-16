@@ -9,7 +9,7 @@ build-backend = "maturin"
 
 [project]
 name = "nedb-engine"
-version = "1.3.0"
+version = "2.0.0a1"
 description = "NEDB — versioned, self-compressing, time-traveling embedded database with Rust native core"
 requires-python = ">=3.8"
 license = { text = "GPL-3.0-or-later" }
