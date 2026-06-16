@@ -231,7 +231,8 @@ async def bench_verify(client: httpx.AsyncClient) -> None:
     if r.status_code == 200:
         body = r.json()
         print(f"\n  Tamper-evidence verify")
-        print(f"    objects checked: {body.get('objects_checked', '?'):>6,}")
+        checked = body.get('objects_checked', '?')
+        print(f"    objects checked: {checked!s:>6}")
         print(f"    tampered:        {len(body.get('tampered', [])):>6}")
         print(f"    ok:              {body.get('ok', '?')}")
         print(f"    elapsed:         {elapsed:>10.1f} ms")
