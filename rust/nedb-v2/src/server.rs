@@ -30,7 +30,7 @@ use crate::store::Node;
 #[derive(Clone)]
 pub struct Manager {
     inner: Arc<RwLock<ManagerInner>>,
-    token: Option<String>,
+    pub token: Option<String>,
 }
 
 struct ManagerInner {
@@ -483,36 +483,34 @@ pub fn router(mgr: Manager) -> Router {
 }
 
 /// Start the nedbd v2 server.
-pub async fn run(port: u16, data_dir: &str, tmk: Option<[u8; 32]>, token: Option<String>) -> anyhow::Result<()> {
+pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, token: Option<String>) -> anyhow::Result<()> {
     let mgr = Manager::new(Path::new(data_dir), tmk, token);
     mgr.open_all().await?;
 
     let app = router(mgr);
-    let addr = format!("0.0.0.0:{}", port).parse::<std::net::SocketAddr>()?;
+    let addr = format!("{}:{}", host, port).parse::<std::net::SocketAddr>()?;
     let banner = format!(r#"
-  ███╗   ██╗███████╗██████╗ ██████╗
-  ████╗  ██║██╔════╝██╔══██╗██╔══██╗
-  ██╔██╗ ██║█████╗  ██║  ██║██████╔╝
-  ██║╚██╗██║██╔══╝  ██║  ██║██╔══██╗
-  ██║ ╚████║███████╗██████╔╝██████╔╝
-  ╚═╝  ╚═══╝╚══════╝╚═════╝ ╚═════╝
+  ╔═╗ ╔═╗ ╔═╗ ╔═╗
+  ║ ╠═╣ ╠═╣ ╠═╣ ║   N E D B  ·  DAG ENGINE  {}
+  ╠═╝ ╚═╬═╝ ╚═╬═╝   ─────────────────────────────────────────────
+  ╚═══○══╩════╩═╝   content-addressed · tamper-evident · causal
+         │          bi-temporal · replay-protected · encrypted
+     ○───┴───○
+     │       │      © INTERCHAINED, LLC  ×  Vex (Claude Sonnet 4.6)
+     ○───────○      interchained.org   ·   hyperagent.com/refer/J2G6TCD7
 
-  a versioned, time-traveling, encrypted database
-  content-addressed Merkle DAG · tamper-evident · causal
-  ────────────────────────────────────────────────────────
-  INTERCHAINED, LLC    ×    Claude Sonnet 4.6
-  interchained.org       hyperagent.com/refer/J2G6TCD7
-
-  nedbd {} [DAG]
-  ────────────────────────────────────────────────────────
-  listen  http://{}
-  data    {}
-  enc     {}
+  ─────────────────────────────────────────────────────────────
+  listen   http://{}
+  data     {}
+  enc      {}
+  token    {}
+  ─────────────────────────────────────────────────────────────
 "#,
         env!("CARGO_PKG_VERSION"),
         addr,
         data_dir,
-        if tmk.is_some() { "AES-256-GCM" } else { "off" }
+        if tmk.is_some() { "AES-256-GCM" } else { "off" },
+        if mgr.token.is_some() { "on" } else { "off (set NEDBD_TOKEN to require auth)" }
     );
     print!("{}", banner);
 
