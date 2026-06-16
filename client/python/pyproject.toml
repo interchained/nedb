@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "nedb-client"
+version = "1.0.0"
+description = "Async Python client for the nedbd HTTP API (nedb-engine)"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "Eth-Interchained" }]
+requires-python = ">=3.8"
+dependencies = ["httpx>=0.24"]
+keywords = ["database", "nedb", "client", "async", "dag", "bi-temporal", "causal"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Framework :: AsyncIO",
+]
+
+[project.urls]
+Homepage = "https://github.com/Eth-Interchained/nedb"
+Repository = "https://github.com/Eth-Interchained/nedb"
+Documentation = "https://github.com/Eth-Interchained/nedb/blob/master/client/python/README.md"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nedb_client*"]
