@@ -35,8 +35,8 @@ except ImportError:
 BASE_URL = os.getenv("NEDB_URL", "http://127.0.0.1:7070")
 DB_NAME  = os.getenv("NEDB_PERF_DB", "bench")
 TOKEN    = os.getenv("NEDBD_TOKEN", "")
-WRITE_TIMEOUT = httpx.Timeout(connect=2.0, read=30.0, write=30.0, pool=2.0)
-READ_TIMEOUT  = httpx.Timeout(connect=2.0, read=5.0,  write=5.0,  pool=2.0)
+WRITE_TIMEOUT = httpx.Timeout(connect=2.0, read=60.0, write=60.0, pool=5.0)
+READ_TIMEOUT  = httpx.Timeout(connect=2.0, read=10.0, write=10.0, pool=5.0)
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -117,10 +117,15 @@ async def bench_sequential_writes(client: httpx.AsyncClient, n: int) -> tuple[fl
             }
         }
         t0 = time.perf_counter()
-        r = await client.post(f"{BASE_URL}/v1/databases/{DB_NAME}/put", json=payload)
-        latencies.append((time.perf_counter() - t0) * 1000)
-        if r.status_code != 200:
-            print(f"  WARN: PUT {i} returned {r.status_code}")
+        try:
+            r = await client.post(f"{BASE_URL}/v1/databases/{DB_NAME}/put", json=payload)
+            latencies.append((time.perf_counter() - t0) * 1000)
+            if r.status_code != 200:
+                print(f"  WARN: PUT {i} returned {r.status_code}")
+        except httpx.ReadTimeout:
+            latencies.append(60_000.0)  # record as 60s — shows up in p99
+            if i % 100 == 0:
+                print(f"  TIMEOUT at i={i}")
 
     return time.perf_counter() - t_total, latencies
 
@@ -260,14 +265,28 @@ async def run(args: argparse.Namespace) -> int:
         print(f"{'=' * 56}")
         print(f"  server:      {BASE_URL}")
         print(f"  version:     {info.get('version', '?')}")
-        print(f"  engine:      {'DAG' if info.get('version', '').startswith('2') else 'AOF'}")
         print(f"  encrypted:   {info.get('encrypted', False)}")
+        print(f"  databases:   {info.get('databases', [])}")
         print(f"  db:          {DB_NAME}")
         print(f"  N writes:    {args.n:,}")
         print(f"  N reads:     {args.reads:,}")
         print(f"  concurrency: {args.concurrency}")
         print(f"  batch size:  {args.batch_size}")
         print(f"{'=' * 56}")
+
+        # Warmup — one PUT to wake up any lazy connection / first-write init
+        print("\n  Warming up (1 write)...", end="", flush=True)
+        try:
+            wr = await client.post(f"{BASE_URL}/v1/databases/{DB_NAME}/put",
+                                   json={"coll": "bench", "id": "_warmup", "doc": {"warmup": True}})
+            print(f" {wr.status_code} OK" if wr.status_code == 200 else f" {wr.status_code} WARN")
+        except httpx.ReadTimeout:
+            print(" TIMEOUT — nedbd is very slow on first write")
+            print("  This usually means:")
+            print("    1. Python v1 server is loading a large AOF (wait and retry)")
+            print("    2. Use --dag mode: NEDBD_DAG=1 nedbd --data /tmp/fresh-perf-dir")
+            print("    3. Or point to a fresh empty data dir with no existing AOF")
+            return 1
 
         await setup(client)
 
