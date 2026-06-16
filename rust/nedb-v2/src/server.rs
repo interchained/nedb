@@ -137,29 +137,12 @@ fn ok(body: Value) -> Response {
     (StatusCode::OK, Json(body)).into_response()
 }
 
+/// Return (seq, head) — both O(1) reads from in-memory atomics/cache.
+/// The head is maintained incrementally by Db::put() and Db::delete()
+/// so we never recompute it from scratch on every response.
 fn db_seq_head(db: &Db) -> (u64, String) {
-    use blake2::{Blake2b512, Digest};
-    let seq = db.seq.load(std::sync::atomic::Ordering::SeqCst);
-    // BLAKE2b Merkle head: hash of all current id-index hashes sorted, chained with seq.
-    // This gives a deterministic, tamper-evident root that changes on every write.
-    let mut entries: Vec<String> = db.id_index
-        .collections()
-        .into_iter()
-        .flat_map(|coll| {
-            let mut ids = db.id_index.list_ids(&coll);
-            ids.sort();
-            ids.into_iter()
-                .filter_map(|id| db.id_index.get(&coll, &id))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    entries.sort();
-    let mut h = Blake2b512::new();
-    h.update(seq.to_le_bytes());
-    for entry in &entries {
-        h.update(entry.as_bytes());
-    }
-    let head = hex::encode(&h.finalize()[..32]);
+    let seq  = db.seq.load(std::sync::atomic::Ordering::SeqCst);
+    let head = db.head();
     (seq, head)
 }
 

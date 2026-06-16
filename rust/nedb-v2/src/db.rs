@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Result;
 use serde_json::Value;
+use parking_lot::RwLock;
 
 use crate::store::{Dek, Node, ObjectStore};
 use crate::index::{IdIndex, OrderedValue, SortedIndexes};
@@ -17,6 +18,10 @@ pub struct Db {
     pub graph:          GraphStore,
     pub root:           PathBuf,
     pub seq:            AtomicU64,
+    /// Cached Merkle head — updated incrementally on every write (O(1)).
+    /// BLAKE2b(prev_head || new_object_hash). Eliminates the O(n) full
+    /// recompute that was blocking every server response.
+    head:               RwLock<String>,
 }
 
 impl Db {
@@ -36,6 +41,7 @@ impl Db {
             graph,
             root: db_root.to_path_buf(),
             seq:  AtomicU64::new(0),
+            head: RwLock::new(String::new()),
         };
 
         // Auto-migrate v1 → v2 if needed (pass DEK so encrypted AOFs convert correctly)
@@ -54,10 +60,11 @@ impl Db {
         Ok(db)
     }
 
-    /// Rebuild in-memory sorted indexes and max seq from the object store.
-    /// This is O(n_objects) but fully parallel via Rayon.
+    /// Rebuild in-memory sorted indexes, max seq, and Merkle head from the object store.
+    /// This is O(n_objects) but fully parallel via Rayon. Runs once on cold start.
     fn rebuild_from_objects(&mut self) -> Result<()> {
         use rayon::prelude::*;
+        use blake2::{Blake2b512, Digest};
 
         let hashes: Vec<String> = self.objects.all_hashes().collect();
         let nodes: Vec<Node> = hashes.par_iter()
@@ -76,6 +83,17 @@ impl Db {
                 }
             }
         }
+
+        // Bootstrap the running Merkle head: sort all hashes (deterministic),
+        // then chain them with BLAKE2b. This is done ONCE on startup.
+        let mut sorted_hashes = hashes;
+        sorted_hashes.sort();
+        let mut h = Blake2b512::new();
+        h.update(max_seq.to_le_bytes());
+        for hash in &sorted_hashes {
+            h.update(hash.as_bytes());
+        }
+        *self.head.write() = hex::encode(&h.finalize()[..32]);
 
         Ok(())
     }
@@ -138,7 +156,27 @@ impl Db {
             self.graph.add_edge(cause, "caused_by_rev", &hash)?;
         }
 
+        // Update running Merkle head: O(1) chain, no full recompute.
+        // new_head = BLAKE2b(prev_head || seq_bytes || new_object_hash)
+        self.update_head(seq, &hash);
+
         Ok(node)
+    }
+
+    /// Update the running Merkle head with a new write. O(1).
+    fn update_head(&self, seq: u64, new_hash: &str) {
+        use blake2::{Blake2b512, Digest};
+        let prev = self.head.read().clone();
+        let mut h = Blake2b512::new();
+        h.update(prev.as_bytes());
+        h.update(seq.to_le_bytes());
+        h.update(new_hash.as_bytes());
+        *self.head.write() = hex::encode(&h.finalize()[..32]);
+    }
+
+    /// Return the current Merkle head string. O(1) — read from cache.
+    pub fn head(&self) -> String {
+        self.head.read().clone()
     }
 
     /// Delete a document — writes a tombstone node and removes the id from the index.
@@ -161,7 +199,8 @@ impl Db {
             valid_to:   None,
             hash:       String::new(),
         };
-        self.objects.write(&mut tombstone)?;
+        let hash = self.objects.write(&mut tombstone)?;
+        self.update_head(seq, &hash);
         // Remove the live id pointer — doc is now invisible to queries and list()
         self.id_index.remove(coll, id)?;
         Ok(true)
