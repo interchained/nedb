@@ -2,7 +2,7 @@
 
 # NEDB
 
-**Hash-chained · time-traveling · bi-temporal · causally-provable embedded database.**
+**Content-addressed Merkle DAG · Hash-chained · Time-traveling · Bi-temporal · Causally-provable embedded database.**
 
 Replay-protected · idempotent · relational · filterable · sortable · searchable · concurrent.
 One Rust core → ships to **PyPI** and **npm** from a single source.
@@ -10,10 +10,40 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 [![PyPI](https://img.shields.io/pypi/v/nedb-engine?label=PyPI&color=6366f1)](https://pypi.org/project/nedb-engine/)
 [![npm](https://img.shields.io/npm/v/nedb-engine?label=npm&color=00d4ff)](https://www.npmjs.com/package/nedb-engine)
 [![Tests](https://img.shields.io/badge/tests-266%20passing-34d399)](https://github.com/Eth-Interchained/nedb/actions)
+[![nedb-engine-client PyPI](https://img.shields.io/pypi/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://pypi.org/project/nedb-engine-client/)
+[![nedb-engine-client npm](https://img.shields.io/npm/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://www.npmjs.com/package/nedb-engine-client)
 
 **[Studio → studio.interchained.org](https://studio.interchained.org)**  ·  **[nedb.aiassist.net](https://nedb.aiassist.net)**
 
 </div>
+
+---
+
+## v2 — The DAG Engine (new in 2.0.5)
+
+NEDB v2 replaces the append-only log (AOF) with a **content-addressed Merkle DAG**. Every document version is an immutable, BLAKE2b-verified object. Nothing is ever overwritten.
+
+```bash
+# Run the v2 DAG engine — ships inside pip install nedb-engine
+nedbd --dag --data ./data
+# or
+NEDBD_DAG=1 NEDB_TMK=<32-byte-hex> nedbd --data ./data
+
+curl http://127.0.0.1:7070/health
+# {"ok":true,"version":"2.0.5","service":"nedbd","encrypted":true}
+```
+
+| Property | v2 DAG | v1 AOF |
+|---|:---:|:---:|
+| Uncorruptable (atomic writes, hash-verified reads) | ✅ | ⚠️ |
+| Instant cold start (no AOF replay) | ✅ | ❌ |
+| Parallel writes (no global lock) | ✅ | ❌ |
+| BLAKE2b Merkle head on every response | ✅ | ❌ |
+| Tombstone deletes (history preserved) | ✅ | ✅ |
+| Auto-migrates v1 AOF → v2 DAG on startup | ✅ | — |
+| Same HTTP API — Vision, Studio, all clients unchanged | ✅ | ✅ |
+
+**v1 AOF engine is still shipped and unchanged** — `nedbd` (no flag) runs v1.
 
 ---
 
@@ -233,15 +263,28 @@ db.query('FROM policy AS OF 200 VALID AS OF "2024-02-15"')
 
 ---
 
-## Performance (v1.0.x · Rust native · Linux x86_64 VPS)
+## Performance
 
-| Operation | Throughput | Notes |
+**v1 Python server (baseline — single-threaded AOF):**
+
+| Operation | Throughput | p99 latency |
 |---|---|---|
-| PUT (Rust napi, per-op FFI) | ~70K/s | FFI-bound; batch path: ~15K writes/s group-commit |
-| GET (Rust napi, per-op FFI) | ~330K/s | FFI-bound |
-| NQL query (Rust engine) | ~23 µs | 5× faster than pure-Python (~120 µs) |
-| Python PUT (AOF + fsync) | ~7K/s | Durable, per-op |
-| Python GET (in-process) | ~1.3M/s | Zero socket hop |
+| Sequential PUT | ~23/s | 44 ms |
+| Concurrent PUT (16 workers) | ~92/s | 48 ms |
+| Batch PUT (500 ops/request) | ~520 ops/s | 1.9 ms/op |
+| Point-lookup read (NQL) | ~23/s | 44 ms |
+| Rust napi PUT (FFI) | ~70K/s | — |
+| Rust napi GET (FFI) | ~330K/s | — |
+
+**v2 DAG Rust server — tokio/axum, no GIL, lock-free per-doc writes:**
+> Benchmarks in progress — target 5,000–50,000 ops/s. Run `python3 tests/test_dag_perf.py` against your own instance.
+
+Reproduce with the included benchmark:
+
+```bash
+NEDBD_DAG=1 nedbd --data /tmp/perf &
+python3 tests/test_dag_perf.py --n 10000 --reads 100000
+```
 
 ---
 
@@ -271,16 +314,49 @@ Encryption:              AES-256-GCM at-rest (TMK/DEK double-envelope)
 
 ---
 
+## nedb-client — lightweight HTTP client
+
+Connect to any running nedbd instance from Python or TypeScript without embedding the engine:
+
+```bash
+pip install nedb-engine-client          # async Python
+npm install nedb-engine-client   # TypeScript / Node.js 18+
+```
+
+```python
+from nedb_client import NedbClient
+
+async with NedbClient("http://127.0.0.1:7070", db="mydb") as db:
+    await db.put("blocks", "618000", {"height": 618000})
+    rows = await db.query("FROM blocks ORDER BY height DESC LIMIT 10")
+    head = await db.head()    # BLAKE2b Merkle root — changes on every write
+    ok   = await db.verify()  # tamper-evidence check across all objects
+```
+
+```typescript
+import { NedbClient } from "nedb-engine-client";
+const db = new NedbClient({ url: "http://127.0.0.1:7070", db: "mydb" });
+await db.put("blocks", "618000", { height: 618000 });
+const rows = await db.query("FROM blocks LIMIT 10");
+```
+
+---
+
 ## Repo layout
 
 ```
 python/nedb/        reference engine (pure Python — always-works baseline)
 rust/
-  nedb-core/        production Rust engine (shared by both runtimes)
+  nedb-core/        v1 production Rust engine (shared by both runtimes)
   nedb-py/          maturin PyO3 binding → PyPI native wheels
   nedb-node/        napi-rs binding → npm native addons
-tests/              engine + concurrent + causal + bitemporal + deploy tests
+  nedb-v2/          v2 DAG engine (tokio + axum + BLAKE2b DAG)
+client/
+  python/           nedb-client — async Python HTTP client (pip install nedb-engine-client)
+  node/             nedb-client — TypeScript HTTP client  (npm install nedb-client)
+tests/              engine + concurrent + causal + bitemporal + deploy + perf benchmarks
 examples/           resp2_python.py  resp2_demo.sh
+docs/               index.html  reference.html  SPEC.md
 ```
 
 ---
@@ -297,7 +373,17 @@ examples/           resp2_python.py  resp2_demo.sh
 - [x] SQL / Redis / MongoDB compatibility adapters
 - [x] RESP2 wire protocol (redis-cli / redis-benchmark compatible)
 - [x] Rust native core — napi-rs (npm) + maturin PyO3 (PyPI)
-- [x] Self-healing chains (auto-repair structural gaps, detect real tampering)
+- [x] Self-healing AOF — auto-truncates corrupt tail on startup, never hangs
+- [x] **v2 DAG engine** — content-addressed Merkle DAG, atomic writes, instant cold start
+- [x] **`nedbd --dag`** — one flag switches to v2 Rust engine; v1 untouched
+- [x] **BLAKE2b Merkle head** — tamper-evident root on every response
+- [x] **Tombstone deletes** — history preserved in DAG, live id removed from index
+- [x] **Auto-migration** — v1 AOF → v2 DAG on first `--dag` startup
+- [x] **nedb-client** — async Python + TypeScript HTTP client (`pip/npm install nedb-client`)
+- [x] **Intel Mac support** — native wheels for `aarch64` + `x86_64` Apple Darwin
+- [ ] In-memory DAG mode — `Db::in_memory()` for zero-disk ephemeral sessions
+- [ ] PyO3 + napi-rs bindings updated to v2 DAG API
+- [ ] NEDB Studio DAG mode toggle
 - [ ] Merkle inclusion proofs — prove a document existed at a specific time to a third party
 - [ ] Git-style branching — fork database state, experiment, merge or discard
 - [ ] Agent Memory SDK — `Memory.remember()` / `Memory.recall()` / `Memory.trace()`

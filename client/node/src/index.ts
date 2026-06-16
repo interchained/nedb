@@ -5,7 +5,7 @@
  *
  * @example
  * ```ts
- * import { NedbClient } from "nedb-client";
+ * import { NedbClient } from "nedb-engine-client";
  *
  * const db = new NedbClient({ url: "http://127.0.0.1:7070", db: "mydb" });
  *

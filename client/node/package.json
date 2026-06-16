@@ -1,6 +1,6 @@
 {
-  "name": "nedb-client",
-  "version": "1.0.0",
+  "name": "nedb-engine-client",
+  "version": "1.0.3",
   "description": "TypeScript/JavaScript client for the nedbd HTTP API (nedb-engine)",
   "main": "dist/index.js",
   "module": "dist/index.esm.js",
@@ -12,12 +12,13 @@
       "types": "./dist/index.d.ts"
     }
   },
+  "readme": "README.md",
   "files": ["dist", "README.md", "LICENSE"],
   "scripts": {
     "build": "tsc && node scripts/esm-shim.mjs",
     "test": "node --experimental-vm-modules node_modules/.bin/jest"
   },
-  "keywords": ["nedb", "client", "database", "dag", "bi-temporal", "causal", "nedbd"],
+  "keywords": ["nedb", "nedb-engine", "client", "database", "dag", "bi-temporal", "causal", "nedbd"],
   "author": "Eth-Interchained",
   "license": "GPL-3.0-or-later",
   "repository": {

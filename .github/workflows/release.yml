@@ -182,3 +182,65 @@ jobs:
             echo "Publishing stable release as latest"
             npm publish --access public
           fi
+
+  # ---------------------------------------------------------- nedb-engine-client -----
+  # Publishes the lightweight HTTP client alongside the engine.
+  # Same v* tag ships everything — one workflow, one source of truth.
+
+  client-pypi:
+    name: Publish nedb-engine-client to PyPI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Smoke test
+        run: |
+          pip install httpx
+          python3 -c "
+          import sys; sys.path.insert(0, 'client/python')
+          from nedb_client import NedbClient, NedbError
+          print('nedb_client import OK:', NedbClient(url='http://127.0.0.1:7070', db='test'))
+          "
+      - name: Build
+        run: |
+          pip install --upgrade build twine
+          cd client/python
+          python -m build
+      - name: Publish to PyPI
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          cd client/python
+          twine upload --skip-existing --verbose dist/*
+
+  client-npm:
+    name: Publish nedb-engine-client to npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+      - name: Build TypeScript
+        run: |
+          cd client/node
+          npm install
+          npx tsc
+          mkdir -p dist
+          cp dist/index.js dist/index.esm.js
+          sed -i 's/^"use strict";//' dist/index.esm.js
+          echo "Build complete:"; ls -lh dist/
+      - name: Publish to npm
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd client/node
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          echo "Publishing nedb-engine-client@$VERSION"
+          npm publish --access public
