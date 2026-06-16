@@ -511,6 +511,10 @@ pub async fn run(port: u16, data_dir: &str, tmk: Option<[u8; 32]>, token: Option
              if tmk.is_some() { "AES-256-GCM" } else { "off" });
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    // TCP_NODELAY disables Nagle's algorithm — eliminates 40-200ms artificial
+    // latency on macOS loopback for small request/response payloads.
+    axum::serve(listener, app)
+        .tcp_nodelay(true)
+        .await?;
     Ok(())
 }
