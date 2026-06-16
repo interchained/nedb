@@ -40,15 +40,16 @@ jobs:
   # These platform wheels are uploaded to PyPI alongside the universal pure-Python
   # wheel so `pip install nedb-engine` gets the Rust-accelerated core automatically.
   wheels:
-    name: Python native wheel (${{ matrix.os }})
+    name: Python native wheel (${{ matrix.label }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
-          - { os: macos-latest,   target: aarch64-apple-darwin      }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc   }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, label: linux-x86_64   }
+          - { os: macos-latest,   target: aarch64-apple-darwin,      label: macos-arm64   }
+          - { os: macos-13,       target: x86_64-apple-darwin,       label: macos-x86_64  }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   label: windows-x86_64}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -60,44 +61,36 @@ jobs:
       - name: Build nedbd-v2 (DAG engine binary)
         shell: bash
         run: |
-          # Build from the workspace root so cargo uses the workspace Cargo.lock.
-          # Output lands in rust/target/<triple>/release/nedbd (workspace target dir).
           cd rust
           cargo build --release --bin nedbd --package nedb-core-v2 --target ${{ matrix.target }}
           cd ..
           EXT=""
           [[ "${{ matrix.os }}" == "windows-latest" ]] && EXT=".exe"
           BIN="rust/target/${{ matrix.target }}/release/nedbd${EXT}"
-          # Make executable and stage alongside the Python package
-          chmod +x "$BIN" || true
-          cp "$BIN" "python/nedb/nedbd-v2${EXT}"
-          echo "nedbd-v2 binary: $(ls -lh python/nedb/nedbd-v2${EXT})"
-      - name: Stage Python source into crate (maturin mixed layout)
-        # maturin only bundles a python-source that lives inside the project root.
-        # Copy python/nedb -> rust/crates/nedb-py/python/nedb so the native wheel
-        # ships the full package (all .py modules + nedbd + nedbd-v2 binary) next
-        # to _native.so. Runs on the host; the repo is mounted into the manylinux
-        # container, so the staged dir is visible to maturin.
+          DEST="python/nedb/nedbd-v2${EXT}"
+          cp "$BIN" "$DEST"
+          chmod +x "$DEST" || true
+          echo "nedbd-v2 staged: $(ls -lh $DEST)"
+      - name: Stage Python source + binary into maturin layout
         shell: bash
         run: |
           rm -rf rust/crates/nedb-py/python
           mkdir -p rust/crates/nedb-py/python
           cp -r python/nedb rust/crates/nedb-py/python/nedb
-          echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) python files"
-          ls -lh rust/crates/nedb-py/python/nedb/nedbd-v2* 2>/dev/null || echo "(nedbd-v2 not present in staged dir — ok if binary build was skipped)"
+          find rust/crates/nedb-py/python/nedb -name "nedbd-v2*" -exec chmod +x {} \; || true
+          echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) .py files"
+          ls -lh rust/crates/nedb-py/python/nedb/nedbd-v2* 2>/dev/null || echo "(no nedbd-v2 staged)"
       - name: Build wheel (maturin)
         uses: PyO3/maturin-action@v1
         with:
           command: build
-          # Run from inside the crate so maturin finds pyproject.toml +
-          # ./python/nedb (with nedbd-v2 binary) and bundles everything.
           working-directory: rust/crates/nedb-py
           args: --release --out ../../../dist
           manylinux: auto
           target: ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}
+          name: wheels-${{ matrix.label }}
           path: dist
 
   publish-native:
@@ -108,7 +101,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: wheels-*
+          pattern: wheels-*   # matches wheels-linux-x86_64, wheels-macos-arm64, wheels-macos-x86_64, wheels-windows-x86_64
           merge-multiple: true
           path: dist
       - uses: actions/setup-python@v5
@@ -132,9 +125,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
-          - { os: macos-latest,   target: aarch64-apple-darwin      }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc   }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu  }
+          - { os: macos-latest,   target: aarch64-apple-darwin       }
+          - { os: macos-13,       target: x86_64-apple-darwin        }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc    }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
