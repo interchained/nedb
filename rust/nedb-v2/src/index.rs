@@ -74,7 +74,20 @@ impl From<&Value> for OrderedValue {
     }
 }
 
-/// Per-document ID index — atomic file-per-doc.
+/// Compute a 2-char hex shard prefix from a document id.
+/// Distributes files across 256 subdirectories to avoid flat-directory
+/// slowdown on ext4/xfs when a collection has >50k documents.
+fn id_shard(id: &str) -> String {
+    // FNV-1a 32-bit — fast, no crypto needed, deterministic
+    let mut hash: u32 = 2166136261;
+    for b in id.bytes() {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    format!("{:02x}", hash & 0xff)
+}
+
+/// Per-document ID index — atomic file-per-doc, sharded across 256 subdirs.
 pub struct IdIndex {
     root: PathBuf,
 }
@@ -87,7 +100,12 @@ impl IdIndex {
     }
 
     fn path(&self, coll: &str, id: &str) -> PathBuf {
-        self.root.join(coll).join("id").join(id)
+        // Shard across 256 subdirectories using first 2 hex chars of a simple
+        // hash of the id. Prevents flat-directory slowdown (ext4 htree degrades
+        // past ~50k files per directory) for large collections like kv.
+        // Format: indexes/{coll}/id/{shard}/{id}
+        let shard = id_shard(id);
+        self.root.join(coll).join("id").join(&shard).join(id)
     }
 
     /// Get the current object hash for a document.
@@ -107,17 +125,26 @@ impl IdIndex {
         Ok(())
     }
 
-    /// List all doc IDs in a collection.
+    /// List all doc IDs in a collection (walks shard subdirectories).
     pub fn list_ids(&self, coll: &str) -> Vec<String> {
-        let dir = self.root.join(coll).join("id");
-        fs::read_dir(&dir)
+        let id_root = self.root.join(coll).join("id");
+        // Each entry in id_root is a 2-char hex shard dir
+        fs::read_dir(&id_root)
             .into_iter()
             .flatten()
             .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                if name.ends_with(".tmp") { return None; }
-                Some(name)
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .flat_map(|shard_dir| {
+                fs::read_dir(shard_dir.path())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if name.ends_with(".tmp") { return None; }
+                        Some(name)
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect()
     }

@@ -489,9 +489,32 @@ pub async fn run(port: u16, data_dir: &str, tmk: Option<[u8; 32]>, token: Option
 
     let app = router(mgr);
     let addr = format!("0.0.0.0:{}", port).parse::<std::net::SocketAddr>()?;
-    println!("  nedbd {} [DAG] — http://{}  data={}  enc={}",
-             env!("CARGO_PKG_VERSION"), addr, data_dir,
-             if tmk.is_some() { "AES-256-GCM" } else { "off" });
+    let banner = format!(r#"
+  ███╗   ██╗███████╗██████╗ ██████╗
+  ████╗  ██║██╔════╝██╔══██╗██╔══██╗
+  ██╔██╗ ██║█████╗  ██║  ██║██████╔╝
+  ██║╚██╗██║██╔══╝  ██║  ██║██╔══██╗
+  ██║ ╚████║███████╗██████╔╝██████╔╝
+  ╚═╝  ╚═══╝╚══════╝╚═════╝ ╚═════╝
+
+  a versioned, time-traveling, encrypted database
+  content-addressed Merkle DAG · tamper-evident · causal
+  ────────────────────────────────────────────────────────
+  INTERCHAINED, LLC    ×    Claude Sonnet 4.6
+  interchained.org       hyperagent.com/refer/J2G6TCD7
+
+  nedbd {} [DAG]
+  ────────────────────────────────────────────────────────
+  listen  http://{}
+  data    {}
+  enc     {}
+"#,
+        env!("CARGO_PKG_VERSION"),
+        addr,
+        data_dir,
+        if tmk.is_some() { "AES-256-GCM" } else { "off" }
+    );
+    print!("{}", banner);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // TCP_NODELAY disables Nagle's algorithm — eliminates 40-200ms artificial
