@@ -380,7 +380,22 @@ pub fn execute(db: &Db, nql: &str) -> Result<Vec<Value>> {
 
     // ── Candidate generation ──────────────────────────────────────────────────
 
-    let candidates: Vec<Node> = if let Some(seq_target) = q.as_of {
+    // Fast path: single equality filter on _id with no AS OF.
+    // Skip the O(n) collection scan — go straight to the id index (O(1) file read).
+    // This turns `FROM coll WHERE _id = "x" LIMIT 1` from a full-table-scan into
+    // a single file read, giving orders-of-magnitude speedup for point lookups.
+    let id_eq_fast_path: Option<String> = if q.as_of.is_none() && q.trace.is_none() {
+        q.wheres.iter().find_map(|w| {
+            if w.field == "_id" && w.op == "=" {
+                if let Value::String(ref id) = w.value { Some(id.clone()) } else { None }
+            } else { None }
+        })
+    } else { None };
+
+    let candidates: Vec<Node> = if let Some(ref target_id) = id_eq_fast_path {
+        // O(1) direct id-index lookup — skip full collection scan entirely
+        db.get(&q.coll, target_id).into_iter().collect()
+    } else if let Some(seq_target) = q.as_of {
         // AS OF: return each doc's version at or before target seq
         db.id_index.list_ids(&q.coll).into_iter()
             .filter_map(|id| db.get_as_of(&q.coll, &id, seq_target))

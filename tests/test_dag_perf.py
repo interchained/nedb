@@ -100,6 +100,14 @@ async def teardown(client: httpx.AsyncClient) -> None:
 
 # ── benchmarks ────────────────────────────────────────────────────────────────
 
+def _progress(i: int, n: int, label: str = "") -> None:
+    """Print a live progress line every 5% or 1000 ops."""
+    step = max(n // 20, 100)
+    if i > 0 and i % step == 0:
+        pct = i / n * 100
+        print(f"\r    {label} {i:>8,}/{n:,}  ({pct:.0f}%)   ", end="", flush=True)
+
+
 async def bench_sequential_writes(client: httpx.AsyncClient, n: int) -> tuple[float, List[float]]:
     """n sequential PUT requests — isolates single-writer latency."""
     latencies: List[float] = []
@@ -119,19 +127,21 @@ async def bench_sequential_writes(client: httpx.AsyncClient, n: int) -> tuple[fl
         t0 = time.perf_counter()
         try:
             r = await client.post(f"{BASE_URL}/v1/databases/{DB_NAME}/put", json=payload)
-            latencies.append((time.perf_counter() - t0) * 1000)
+            lat = (time.perf_counter() - t0) * 1000
+            latencies.append(lat)
             if r.status_code != 200:
-                print(f"  WARN: PUT {i} returned {r.status_code}")
+                print(f"\n  WARN: PUT {i} returned {r.status_code}")
         except httpx.ReadTimeout:
-            latencies.append(60_000.0)  # record as 60s — shows up in p99
-            if i % 100 == 0:
-                print(f"  TIMEOUT at i={i}")
+            latencies.append(60_000.0)
+            print(f"\n  TIMEOUT at i={i}")
+        _progress(i, n, "seq-write")
 
+    print(f"\r    done {n:,} sequential writes" + " " * 20)
     return time.perf_counter() - t_total, latencies
 
 
 async def bench_concurrent_writes(
-    client: httpx.AsyncClient, n: int, concurrency: int
+    client: httpx.AsyncClient, n: int, concurrency: int,
 ) -> tuple[float, List[float]]:
     """n concurrent PUTs using asyncio semaphore — measures parallel write throughput."""
     sem = asyncio.Semaphore(concurrency)
@@ -154,11 +164,13 @@ async def bench_concurrent_writes(
             lat = (time.perf_counter() - t0) * 1000
         async with lock:
             latencies.append(lat)
+            _progress(len(latencies), n, "conc-write")
         if r.status_code != 200:
-            print(f"  WARN: concurrent PUT {i} returned {r.status_code}")
+            print(f"\n  WARN: concurrent PUT {i} returned {r.status_code}")
 
     t_total = time.perf_counter()
     await asyncio.gather(*(_put(i) for i in range(n)))
+    print(f"\r    done {n:,} concurrent writes" + " " * 20)
     return time.perf_counter() - t_total, latencies
 
 
@@ -174,8 +186,10 @@ async def bench_sequential_reads(client: httpx.AsyncClient, n: int, max_id: int)
         r = await client.post(f"{BASE_URL}/v1/databases/{DB_NAME}/query", json=payload)
         latencies.append((time.perf_counter() - t0) * 1000)
         if r.status_code != 200:
-            print(f"  WARN: query {i} returned {r.status_code}")
+            print(f"\n  WARN: query {i} returned {r.status_code}")
+        _progress(i, n, "seq-read ")
 
+    print(f"\r    done {n:,} reads" + " " * 30)
     return time.perf_counter() - t_total, latencies
 
 
@@ -293,33 +307,38 @@ async def run(args: argparse.Namespace) -> int:
 
         results = {}
 
+        def phase(num: str, label: str) -> None:
+            print(f"\n{'─'*56}")
+            print(f"  {num}  {label}")
+            print(f"{'─'*56}")
+
         # 1 — Sequential writes
-        print(f"\n[1/5] Sequential writes ({args.n:,} ops)...")
+        phase("[1/5]", f"Sequential writes — {args.n:,} ops, one at a time")
         elapsed, lats = await bench_sequential_writes(client, args.n)
         results["seq_writes"] = (args.n, elapsed, lats)
         print_result("Sequential writes", args.n, elapsed, lats)
 
         # 2 — Concurrent writes
-        print(f"\n[2/5] Concurrent writes ({args.n:,} ops, concurrency={args.concurrency})...")
+        phase("[2/5]", f"Concurrent writes — {args.n:,} ops, {args.concurrency} workers")
         elapsed, lats = await bench_concurrent_writes(client, args.n, args.concurrency)
         results["conc_writes"] = (args.n, elapsed, lats)
         print_result("Concurrent writes", args.n, elapsed, lats)
 
         # 3 — Batch writes
-        print(f"\n[3/5] Batch writes ({args.n:,} ops, batch={args.batch_size})...")
+        phase("[3/5]", f"Batch writes — {args.n:,} ops, {args.batch_size} per request")
         elapsed, lats = await bench_batch_writes(client, args.n, args.batch_size)
         results["batch_writes"] = (args.n, elapsed, lats)
         print_result(f"Batch writes (per-op, batch={args.batch_size})", args.n, elapsed, lats)
 
         # 4 — Sequential reads
-        print(f"\n[4/5] Sequential reads ({args.reads:,} point lookups)...")
+        phase("[4/5]", f"Sequential reads — {args.reads:,} point lookups")
         elapsed, lats = await bench_sequential_reads(client, args.reads, args.n)
         results["seq_reads"] = (args.reads, elapsed, lats)
         print_result("Sequential reads (NQL WHERE _id)", args.reads, elapsed, lats)
 
         # 5 — Ordered queries
         n_ordered = min(args.reads // 10, 1000)
-        print(f"\n[5/5] ORDER BY queries ({n_ordered:,} ops)...")
+        phase("[5/5]", f"ORDER BY queries — {n_ordered:,} ops")
         elapsed, lats = await bench_ordered_queries(client, n_ordered)
         results["ordered_queries"] = (n_ordered, elapsed, lats)
         print_result("ORDER BY height DESC LIMIT 10", n_ordered, elapsed, lats)
