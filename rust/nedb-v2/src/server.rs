@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use axum::{
     extract::{Path as AxPath, State, Query as AxQuery},
@@ -17,6 +18,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, RwLock};
@@ -30,6 +32,15 @@ use crate::store::Node;
 // ── Log channel — broadcast to all /events SSE subscribers ────────────────────
 
 const LOG_CHANNEL_CAP: usize = 512;
+const SUB_CHANNEL_CAP: usize = 256;
+
+// ── Subscription registry ─────────────────────────────────────────────────────
+// Maps (db_name, sub_id) → (nql_query, result_hash, event_sender)
+// After every write, all registered queries for that db are re-evaluated.
+// Diffs (added/removed/changed rows) are emitted as SSE events.
+
+type SubKey = (String, u64);  // (db_name, sub_id)
+type SubVal = (String, String, broadcast::Sender<String>);  // (nql, last_hash, tx)
 
 /// Send a timestamped log line to both stdout and all /events subscribers.
 macro_rules! nlog {
@@ -48,6 +59,9 @@ pub struct Manager {
     pub token: Option<String>,
     /// Broadcast channel — every log line goes here; /events streams them.
     pub log_tx: broadcast::Sender<String>,
+    /// Live query subscriptions: (db_name, sub_id) → (nql, last_hash, event_tx)
+    subs:    Arc<DashMap<SubKey, SubVal>>,
+    sub_ctr: Arc<AtomicU64>,
 }
 
 struct ManagerInner {
@@ -67,6 +81,55 @@ impl Manager {
             })),
             token,
             log_tx,
+            subs:    Arc::new(DashMap::new()),
+            sub_ctr: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Register a live query subscription. Returns (sub_id, receiver).
+    fn subscribe(&self, db: &str, nql: String) -> (u64, broadcast::Receiver<String>) {
+        use std::sync::atomic::Ordering;
+        let id = self.sub_ctr.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = broadcast::channel(SUB_CHANNEL_CAP);
+        self.subs.insert((db.to_string(), id), (nql, String::new(), tx));
+        (id, rx)
+    }
+
+    /// Unregister a subscription.
+    fn unsubscribe(&self, db: &str, sub_id: u64) {
+        self.subs.remove(&(db.to_string(), sub_id));
+    }
+
+    /// After a write: re-evaluate all subscriptions for `db`, emit diffs.
+    fn notify_subscribers(&self, db: &str, db_arc: &Arc<crate::db::Db>) {
+        use std::collections::HashSet;
+        let keys: Vec<SubKey> = self.subs.iter()
+            .filter(|e| e.key().0 == db)
+            .map(|e| e.key().clone())
+            .collect();
+
+        for key in keys {
+            if let Some(mut entry) = self.subs.get_mut(&key) {
+                let (nql, last_hash, tx) = entry.value_mut();
+                // Re-run the query
+                let rows = match crate::nql::query(db_arc, nql) {
+                    Ok((rows, _)) => rows,
+                    Err(_) => continue,
+                };
+                // Hash the result set
+                let new_hash = format!("{:?}", rows.iter().map(|r| r.to_string()).collect::<Vec<_>>());
+                if new_hash == *last_hash { continue; }
+                *last_hash = new_hash;
+                // Send the full current result as a diff event
+                let event = json!({
+                    "sub_id": key.1,
+                    "db":     &key.0,
+                    "nql":    nql.as_str(),
+                    "rows":   rows,
+                    "count":  rows.len(),
+                });
+                let _ = tx.send(event.to_string());
+            }
         }
     }
 
@@ -333,6 +396,8 @@ async fn put_document(
     match db.put(&body.coll, &body.id, body.doc, caused_by, body.valid_from, body.valid_to) {
         Ok(node) => {
             let (seq, head) = db_seq_head(&db);
+            // Notify live query subscribers of the write
+            mgr.notify_subscribers(&name, &db);
             ok(json!({"ok": true, "doc": node_to_response(&node), "seq": seq, "head": head}))
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -461,6 +526,8 @@ async fn batch_operations(
         results.push(r);
     }
     let (seq, head) = db_seq_head(&db);
+    // Notify live query subscribers after batch completes
+    mgr.notify_subscribers(&name, &db);
     ok(json!({"results": results, "count": results.len(), "seq": seq, "head": head}))
 }
 
@@ -557,6 +624,69 @@ async fn get_log(
     ok(json!({"log": log_entries, "seq": seq, "head": head}))
 }
 
+// ── Live query subscriptions — POST /v1/databases/:name/subscribe ─────────────
+
+#[derive(Deserialize)]
+struct SubscribeBody { nql: String }
+
+async fn subscribe_query(
+    State(mgr): State<Manager>,
+    headers: HeaderMap,
+    AxPath(name): AxPath<String>,
+    Json(body): Json<SubscribeBody>,
+) -> Response {
+    if !mgr.check_auth(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    let db = match mgr.get_db(&name).await {
+        None => return err(StatusCode::NOT_FOUND, &format!("database not found: {}", name)),
+        Some(db) => db,
+    };
+
+    let (sub_id, rx) = mgr.subscribe(&name, body.nql.clone());
+
+    // Send the initial query result immediately as the first SSE event
+    if let Ok((rows, _)) = crate::nql::query(&db, &body.nql) {
+        let init = json!({
+            "sub_id": sub_id,
+            "db":     &name,
+            "nql":    &body.nql,
+            "rows":   rows,
+            "count":  rows.len(),
+            "event":  "initial",
+        });
+        // Update last_hash so we don't re-send this on the next write if unchanged
+        if let Some(mut entry) = mgr.subs.get_mut(&(name.clone(), sub_id)) {
+            let hash = format!("{:?}", rows);
+            entry.value_mut().1 = hash;
+        }
+        // Send the initial result through the channel
+        if let Some(entry) = mgr.subs.get(&(name.clone(), sub_id)) {
+            let _ = entry.value().2.send(init.to_string());
+        }
+    }
+
+    let stream = BroadcastStream::new(rx).filter_map(|msg| {
+        match msg {
+            Ok(line) => Some(Ok(Event::default().data(line))),
+            Err(_)   => None,
+        }
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+async fn unsubscribe_query(
+    State(mgr): State<Manager>,
+    headers: HeaderMap,
+    AxPath((name, sub_id)): AxPath<(String, u64)>,
+) -> Response {
+    if !mgr.check_auth(&headers) { return err(StatusCode::UNAUTHORIZED, "unauthorized"); }
+    mgr.unsubscribe(&name, sub_id);
+    ok(json!({"ok": true, "sub_id": sub_id}))
+}
+
 // ── SSE log stream — GET /events ──────────────────────────────────────────────
 
 async fn log_events(State(mgr): State<Manager>) -> Sse<impl futures_core::Stream<Item = Result<Event, std::convert::Infallible>>> {
@@ -574,18 +704,20 @@ async fn log_events(State(mgr): State<Manager>) -> Sse<impl futures_core::Stream
 
 pub fn router(mgr: Manager) -> Router {
     Router::new()
-        .route("/health",                                  get(health))
-        .route("/events",                                  get(log_events))
-        .route("/v1/databases",                            get(list_databases).post(create_database))
-        .route("/v1/databases/:name",                      get(get_database).delete(drop_database))
-        .route("/v1/databases/:name/query",                post(query_database))
-        .route("/v1/databases/:name/put",                  post(put_document))
-        .route("/v1/databases/:name/rows/:coll/:id",       delete(delete_document))
-        .route("/v1/databases/:name/batch",                post(batch_operations))
-        .route("/v1/databases/:name/index",                post(create_index))
-        .route("/v1/databases/:name/verify",               get(verify_database))
-        .route("/v1/databases/:name/checkpoint",           post(checkpoint))
-        .route("/v1/databases/:name/log",                  get(get_log))
+        .route("/health",                                        get(health))
+        .route("/events",                                        get(log_events))
+        .route("/v1/databases",                                  get(list_databases).post(create_database))
+        .route("/v1/databases/:name",                            get(get_database).delete(drop_database))
+        .route("/v1/databases/:name/query",                      post(query_database))
+        .route("/v1/databases/:name/put",                        post(put_document))
+        .route("/v1/databases/:name/rows/:coll/:id",             delete(delete_document))
+        .route("/v1/databases/:name/batch",                      post(batch_operations))
+        .route("/v1/databases/:name/index",                      post(create_index))
+        .route("/v1/databases/:name/verify",                     get(verify_database))
+        .route("/v1/databases/:name/checkpoint",                 post(checkpoint))
+        .route("/v1/databases/:name/log",                        get(get_log))
+        .route("/v1/databases/:name/subscribe",                  post(subscribe_query))
+        .route("/v1/databases/:name/subscribe/:sub_id",          delete(unsubscribe_query))
         .with_state(mgr)
 }
 
