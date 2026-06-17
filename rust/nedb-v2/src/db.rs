@@ -391,14 +391,14 @@ fn cold_scan_background(
                 let elapsed = t0.elapsed().as_secs_f32();
                 let rate    = i as f32 / elapsed;
                 let eta     = (total - i) as f32 / rate;
-                eprint!("\r  [nedbd]   {:>3}%  {:>8,} / {:>8,}  ({:>8,.0}/s  eta {:.0}s)   ",
+                eprint!("\r  [nedbd]   {:>3}%  {:>8} / {:>8}  ({:>8.0}/s  eta {:.0}s)   ",
                     pct, i, total, rate, eta);
             }
             objects.read(h).ok()
         })
         .collect();
 
-    eprintln!("\r  [nedbd]   100%  {:>8,} / {:>8,}  ({:.1}s)                        ",
+    eprintln!("\r  [nedbd]   100%  {:>8} / {:>8}  ({:.1}s)                        ",
         total, total, t0.elapsed().as_secs_f32());
 
     let max_seq = nodes.iter().map(|n| n.seq).max().unwrap_or(0);
