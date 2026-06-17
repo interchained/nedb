@@ -144,8 +144,13 @@ impl ObjectStore {
             Some(dek) => decrypt(&content, dek)?,
             None      => content,
         };
-        let node: Node = serde_json::from_slice(&raw)
+        let mut node: Node = serde_json::from_slice(&raw)
             .context("deserialize node")?;
+        // hash is skip_serializing_if = "is_empty" so it's not in the file.
+        // Restore it from the path we used to look up this object.
+        if node.hash.is_empty() {
+            node.hash = hash.to_string();
+        }
         Ok(node)
     }
 
