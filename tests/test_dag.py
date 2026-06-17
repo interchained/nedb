@@ -378,7 +378,9 @@ class TestDagTimeline(_DagBase):
 
     def test_as_of_seq_time_travel(self):
         r1 = _put(self.c, "docs", "x", {"v": 1})
-        seq_v1 = r1["seq"]
+        # r1["seq"] is the counter AFTER write (next seq).
+        # r1["doc"]["_seq"] is the actual sequence number assigned to this node.
+        seq_v1 = r1["doc"]["_seq"]
         _put(self.c, "docs", "x", {"v": 2})
         # Current version should be v=2
         current = _query(self.c, 'FROM docs WHERE _id = "x" LIMIT 1')["rows"]
