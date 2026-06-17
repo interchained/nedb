@@ -99,27 +99,29 @@ impl Db {
             eprintln!("  [nedbd] MANIFEST corrupt, falling back to cold scan");
         }
 
-        // Cold path: spawn background thread, server starts immediately
+        // Cold path: spawn background thread, server starts immediately.
         // Writes are gated on startup_ready until scan completes.
-        let ready_flag  = Arc::clone(&self.startup_ready);
-        let root        = self.root.clone();
-        let objects_ref = unsafe {
-            // SAFETY: Db outlives the background thread because Arc<Db> keeps it alive.
-            // We pass a raw pointer to avoid cloning the ObjectStore.
-            &self.objects as *const ObjectStore
-        };
-        let head_ref = unsafe { &self.head as *const RwLock<String> };
-        let seq_ref  = unsafe { &self.seq  as *const AtomicU64 };
-        let si_ref   = unsafe { &self.sorted_indexes as *const SortedIndexes };
+        //
+        // Raw pointers aren't Send, so we wrap them in SendPtr which asserts
+        // the safety invariant: Db is kept alive by Arc<Db> in Manager for
+        // the entire server lifetime, so these pointers are always valid.
+        struct SendPtr<T>(*const T);
+        unsafe impl<T> Send for SendPtr<T> {}
+
+        let ready_flag = Arc::clone(&self.startup_ready);
+        let root       = self.root.clone();
+        let objects_p  = SendPtr(&self.objects        as *const ObjectStore);
+        let head_p     = SendPtr(&self.head           as *const RwLock<String>);
+        let seq_p      = SendPtr(&self.seq            as *const AtomicU64);
+        let si_p       = SendPtr(&self.sorted_indexes as *const SortedIndexes);
 
         println!("  [nedbd] cold start — background scan starting, server accepting reads now");
 
         std::thread::spawn(move || {
-            // SAFETY: Db is kept alive by Arc<Db> in Manager for the server's lifetime.
-            let objects        = unsafe { &*objects_ref };
-            let head           = unsafe { &*head_ref };
-            let seq_atomic     = unsafe { &*seq_ref };
-            let sorted_indexes = unsafe { &*si_ref };
+            let objects        = unsafe { &*objects_p.0 };
+            let head           = unsafe { &*head_p.0 };
+            let seq_atomic     = unsafe { &*seq_p.0 };
+            let sorted_indexes = unsafe { &*si_p.0 };
             cold_scan_background(root, objects, head, seq_atomic, sorted_indexes, ready_flag);
         });
 
