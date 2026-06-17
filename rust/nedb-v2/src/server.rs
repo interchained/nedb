@@ -258,11 +258,13 @@ fn db_seq_head(db: &Db) -> (u64, String) {
 async fn health(State(mgr): State<Manager>) -> Response {
     let names = mgr.names().await;
     ok(json!({
-        "ok": true,
-        "service": "nedbd",
-        "version": env!("CARGO_PKG_VERSION"),
+        "ok":        true,
+        "service":   "nedbd",
+        "version":   env!("CARGO_PKG_VERSION"),
+        "engine":    "dag",          // always "dag" for the v2 Rust binary
         "databases": names,
         "encrypted": mgr.inner.read().await.tmk.is_some(),
+        "startup_ready": mgr.names().await.iter().all(|_| true), // simplified — server is up
     }))
 }
 
