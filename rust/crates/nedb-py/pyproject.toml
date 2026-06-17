@@ -9,7 +9,7 @@ build-backend = "maturin"
 
 [project]
 name = "nedb-engine"
-version = "2.0.29"
+version = "2.0.36"
 description = "NEDB — versioned, self-compressing, time-traveling embedded database with Rust native core"
 requires-python = ">=3.8"
 license = { text = "GPL-3.0-or-later" }
@@ -34,12 +34,14 @@ Repository = "https://github.com/Eth-Interchained/nedb"
 
 [tool.maturin]
 # Bundle Python source alongside the Rust extension (mixed Rust/Python layout).
-# maturin only honors a python-source that lives INSIDE the project root — a
-# "../" path that escapes the crate dir is silently ignored (produces an .so-only
-# wheel). So CI stages the package at ./python/nedb before building; see the
-# "Stage Python source" step in .github/workflows/release.yml.
-# nedbd-v2 (DAG engine binary) is staged into python/nedb/ by CI before the
-# "Stage Python source" step copies it into the maturin source tree, so it
-# lands inside the wheel alongside the Python package automatically.
+# maturin only honors a python-source that lives INSIDE the project root.
+# nedbd-v2 binary is staged into python/nedb/ by CI before maturin runs.
+# It is explicitly included via the include list below because maturin's
+# python-source only auto-packages .py files and the compiled extension —
+# non-.py binaries are silently dropped without an explicit include.
 python-source = "python"
 module-name = "nedb._native"
+include = [
+  { path = "python/nedb/nedbd-v2",     format = "wheel" },
+  { path = "python/nedb/nedbd-v2.exe", format = "wheel" },
+]

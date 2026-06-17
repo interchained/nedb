@@ -9,7 +9,16 @@
 #
 # Secrets required (set in Codemagic App Settings → Environment variables):
 #   PYPI_API_TOKEN  — PyPI token with upload access to nedb-engine
-#   NPM_TOKEN       — npm token (optional, for napi npm publish)
+#   GITHUB_TOKEN    — GitHub personal access token with 'repo' + 'write:packages' scope
+#                     Used to upload Mac .node binaries to the GitHub release so
+#                     GitHub's publish-npm job can assemble the complete npm bundle.
+#
+# How npm publishing works (split-build assembly):
+#   1. GitHub CI builds Linux + Windows .node → uploads to GitHub release
+#   2. Codemagic builds Mac arm64 + x86_64 .node → uploads to SAME GitHub release
+#   3. GitHub's publish-npm polls the release until all 4 binaries are present
+#   4. publish-npm downloads all, runs ONE npm publish with the complete bundle
+#   PyPI wheels: each platform uploads independently (--skip-existing, no conflict)
 
 workflows:
 
@@ -29,7 +38,7 @@ workflows:
         RUST_TARGET: aarch64-apple-darwin
         WHEEL_LABEL: macos-arm64
       groups:
-        - nedb_secrets          # contains PYPI_API_TOKEN
+        - nedb_secrets          # contains PYPI_API_TOKEN + GITHUB_TOKEN
     scripts:
       - name: Install Rust
         script: |
@@ -43,20 +52,28 @@ workflows:
 
       - name: Build nedbd-v2 binary
         script: |
+          set -euo pipefail
           source "$HOME/.cargo/env"
-          cd rust/nedb-v2
-          cargo build --release --target $RUST_TARGET
-          BIN="target/$RUST_TARGET/release/nedbd"
-          cp "$BIN" ../../python/nedb/nedbd-v2
-          chmod +x ../../python/nedb/nedbd-v2
-          echo "Binary: $(ls -lh ../../python/nedb/nedbd-v2)"
+          # Build from the workspace root (rust/) so cargo uses the workspace Cargo.lock.
+          # Output lands in rust/target/<triple>/release/nedbd (workspace target dir).
+          cd rust
+          cargo build --release --bin nedbd --package nedb-core-v2 --target $RUST_TARGET
+          cd ..
+          BIN="rust/target/$RUST_TARGET/release/nedbd"
+          echo "Binary built: $(ls -lh $BIN)"
+          cp "$BIN" python/nedb/nedbd-v2
+          chmod +x python/nedb/nedbd-v2
+          echo "Binary staged: $(ls -lh python/nedb/nedbd-v2)"
 
-      - name: Stage Python source for maturin
+      - name: Stage Python source + verify binary
         script: |
           rm -rf rust/crates/nedb-py/python
           mkdir -p rust/crates/nedb-py/python
           cp -r python/nedb rust/crates/nedb-py/python/nedb
           find rust/crates/nedb-py/python/nedb -name "nedbd-v2*" -exec chmod +x {} \;
+          echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) .py files"
+          # Fail loudly if binary is missing — maturin include= needs it present
+          ls -lh rust/crates/nedb-py/python/nedb/nedbd-v2 || { echo "ERROR: nedbd-v2 missing!"; exit 1; }
           echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) py files"
 
       - name: Build wheel (maturin)
@@ -73,8 +90,30 @@ workflows:
           TWINE_PASSWORD=$PYPI_API_TOKEN \
           twine upload --skip-existing --verbose dist/*.whl
 
+      - name: Build napi addon (arm64)
+        script: |
+          source "$HOME/.cargo/env"
+          npm install
+          npx napi build --platform --release --target $RUST_TARGET \
+            --cargo-cwd rust/crates/nedb-node
+          echo "napi .node files: $(ls *.node 2>/dev/null)"
+
+      - name: Upload Mac arm64 .node to GitHub release
+        script: |
+          # Install gh CLI if not present
+          which gh || brew install gh
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          TAG="v$VERSION"
+          echo "Uploading Mac arm64 .node to GitHub release $TAG"
+          for f in *.node; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" \
+              --repo Eth-Interchained/nedb --clobber || true
+          done
+          echo "Uploaded: $(ls *.node 2>/dev/null)"
+
     artifacts:
       - dist/*.whl
+      - "*.node"
 
   # ── Intel Mac wheel (x86_64) ──────────────────────────────────────────
   macos-intel-wheel:
@@ -106,20 +145,31 @@ workflows:
 
       - name: Build nedbd-v2 binary (cross-compile x86_64)
         script: |
+          set -euo pipefail
           source "$HOME/.cargo/env"
-          cd rust/nedb-v2
-          cargo build --release --target $RUST_TARGET
-          BIN="target/$RUST_TARGET/release/nedbd"
-          cp "$BIN" ../../python/nedb/nedbd-v2
-          chmod +x ../../python/nedb/nedbd-v2
-          echo "Binary: $(ls -lh ../../python/nedb/nedbd-v2)"
+          # Cross-compile x86_64 from M2: configure the Xcode clang linker explicitly
+          export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="$(xcrun --find clang)"
+          export CC_x86_64_apple_darwin="$(xcrun --find clang)"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          rustup target add $RUST_TARGET
+          cd rust
+          cargo build --release --bin nedbd --package nedb-core-v2 --target $RUST_TARGET
+          cd ..
+          BIN="rust/target/$RUST_TARGET/release/nedbd"
+          echo "Binary built: $(ls -lh $BIN)"
+          cp "$BIN" python/nedb/nedbd-v2
+          chmod +x python/nedb/nedbd-v2
+          echo "Binary staged: $(ls -lh python/nedb/nedbd-v2)"
 
-      - name: Stage Python source for maturin
+      - name: Stage Python source + verify binary
         script: |
           rm -rf rust/crates/nedb-py/python
           mkdir -p rust/crates/nedb-py/python
           cp -r python/nedb rust/crates/nedb-py/python/nedb
           find rust/crates/nedb-py/python/nedb -name "nedbd-v2*" -exec chmod +x {} \;
+          echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) .py files"
+          # Fail loudly if binary is missing — maturin include= needs it present
+          ls -lh rust/crates/nedb-py/python/nedb/nedbd-v2 || { echo "ERROR: nedbd-v2 missing!"; exit 1; }
 
       - name: Build wheel (maturin)
         script: |
@@ -135,5 +185,26 @@ workflows:
           TWINE_PASSWORD=$PYPI_API_TOKEN \
           twine upload --skip-existing --verbose dist/*.whl
 
+      - name: Build napi addon (x86_64)
+        script: |
+          source "$HOME/.cargo/env"
+          npm install
+          npx napi build --platform --release --target $RUST_TARGET \
+            --cargo-cwd rust/crates/nedb-node
+          echo "napi .node files: $(ls *.node 2>/dev/null)"
+
+      - name: Upload Mac x86_64 .node to GitHub release
+        script: |
+          which gh || brew install gh
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          TAG="v$VERSION"
+          echo "Uploading Mac x86_64 .node to GitHub release $TAG"
+          for f in *.node; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" \
+              --repo Eth-Interchained/nedb --clobber || true
+          done
+          echo "Uploaded: $(ls *.node 2>/dev/null)"
+
     artifacts:
       - dist/*.whl
+      - "*.node"

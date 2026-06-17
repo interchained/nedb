@@ -9,7 +9,7 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 
 [![PyPI](https://img.shields.io/pypi/v/nedb-engine?label=PyPI&color=6366f1)](https://pypi.org/project/nedb-engine/)
 [![npm](https://img.shields.io/npm/v/nedb-engine?label=npm&color=00d4ff)](https://www.npmjs.com/package/nedb-engine)
-[![Tests](https://img.shields.io/badge/tests-266%20passing-34d399)](https://github.com/Eth-Interchained/nedb/actions)
+[![Tests](https://img.shields.io/badge/tests-266%20passing-34d399)](https://github.com/aiassistsecure/nedb/actions)
 [![nedb-engine-client PyPI](https://img.shields.io/pypi/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://pypi.org/project/nedb-engine-client/)
 [![nedb-engine-client npm](https://img.shields.io/npm/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://www.npmjs.com/package/nedb-engine-client)
 
@@ -437,7 +437,7 @@ docs/               index.html  reference.html  SPEC.md
 
 Prompt-to-database scaffolding GUI with schema graph, NQL console, time-travel slider, causal provenance panel, and MongoDB/SQL/Redis tabs. Deploy from a description, query live data, edit inline.
 
-**[studio.interchained.org](https://studio.interchained.org)** · **[github.com/Eth-Interchained/nedb-studio](https://github.com/Eth-Interchained/nedb-studio)** (GPLv3)
+**[studio.interchained.org](https://studio.interchained.org)** · **[github.com/aiassistsecure/nedb-studio](https://github.com/aiassistsecure/nedb-studio)** (GPLv3)
 
 ---
 
@@ -445,10 +445,8 @@ Prompt-to-database scaffolding GUI with schema graph, NQL console, time-travel s
 
 | Repo | Description |
 |---|---|
-| [Eth-Interchained/nedb](https://github.com/Eth-Interchained/nedb) | Canonical source — engine, Rust core, CI |
-| [Eth-Interchained/nedb-studio](https://github.com/Eth-Interchained/nedb-studio) | Studio UI (GPLv3) |
-| [aiassistsecure/nedb](https://github.com/aiassistsecure/nedb) | Production mirror |
-| [aiassistsecure/nedb-studio](https://github.com/aiassistsecure/nedb-studio) | Production mirror — studio |
+| [aiassistsecure/nedb](https://github.com/aiassistsecure/nedb) | Source — engine, Rust core, CI |
+| [aiassistsecure/nedb-studio](https://github.com/aiassistsecure/nedb-studio) | Studio UI (GPLv3) |
 
 **Packages:** [PyPI nedb-engine](https://pypi.org/project/nedb-engine/) · [npm nedb-engine](https://www.npmjs.com/package/nedb-engine)
 

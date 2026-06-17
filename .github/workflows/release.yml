@@ -49,9 +49,9 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, label: linux-x86_64   }
-          - { os: macos-latest,   target: aarch64-apple-darwin,      label: macos-arm64   }
-          - { os: macos-13,       target: x86_64-apple-darwin,       label: macos-x86_64  }
           - { os: windows-latest, target: x86_64-pc-windows-msvc,   label: windows-x86_64}
+          # macOS wheels (arm64 + x86_64) are built by Codemagic on M2 Mac Minis.
+          # Removing them here eliminates the shared-runner queue wait entirely.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -81,7 +81,13 @@ jobs:
           cp -r python/nedb rust/crates/nedb-py/python/nedb
           find rust/crates/nedb-py/python/nedb -name "nedbd-v2*" -exec chmod +x {} \; || true
           echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) .py files"
-          ls -lh rust/crates/nedb-py/python/nedb/nedbd-v2* 2>/dev/null || echo "(no nedbd-v2 staged)"
+          # Verify binary made it — fail loudly if missing (maturin include= requires it)
+          if ls rust/crates/nedb-py/python/nedb/nedbd-v2* 2>/dev/null; then
+            echo "nedbd-v2 binary confirmed in staging area"
+          else
+            echo "ERROR: nedbd-v2 binary missing from staging area — wheel would lack the binary"
+            exit 1
+          fi
       - name: Build wheel (maturin)
         uses: PyO3/maturin-action@v1
         with:
@@ -122,19 +128,38 @@ jobs:
   # Builds the napi-rs native addon for each platform via @napi-rs/cli.
   # Produces platform-specific .node binaries + the JS/TS shims.
   # Root package.json drives the build; nedb-node/Cargo.toml is the Rust crate.
+  # Create the GitHub release on tag push so Codemagic has a release to upload Mac binaries to.
+  create-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create release (if not exists)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ github.ref_name }}"
+          gh release create "$VERSION" --title "$VERSION" --notes "Release $VERSION" \
+            --draft=false 2>/dev/null || echo "Release already exists"
+
   node-binaries:
     name: napi (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40        # fail fast if runner unavailable — continue-on-error handles it
-    continue-on-error: true    # slow Mac runners don't block Linux/Windows napi builds
+    needs: [create-release]
+    timeout-minutes: 40
+    continue-on-error: true
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu  }
-          - { os: macos-latest,   target: aarch64-apple-darwin       }
-          - { os: macos-13,       target: x86_64-apple-darwin        }
           - { os: windows-latest, target: x86_64-pc-windows-msvc    }
+          # macOS napi builds handled by Codemagic — uploaded directly to the GitHub release.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -147,10 +172,15 @@ jobs:
       - name: Install @napi-rs/cli
         run: npm install
       - name: Build native addon
-        # @napi-rs/cli v2 resolves config from package.json (napi.name, triples).
-        # --cargo-cwd points to the crate; output (.node, index.js, index.d.ts)
-        # lands in the repo root where package.json expects it.
         run: npx napi build --platform --release --target ${{ matrix.target }} --cargo-cwd rust/crates/nedb-node
+      - name: Upload .node binary to GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for f in *.node; do
+            [ -f "$f" ] && gh release upload "${{ github.ref_name }}" "$f" --clobber || true
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: node-${{ matrix.target }}
@@ -163,29 +193,52 @@ jobs:
     needs: [node-binaries]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/') && !cancelled()
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
-      - uses: actions/download-artifact@v4
+      - name: Download Linux + Windows napi artifacts
+        uses: actions/download-artifact@v4
         with:
           pattern: node-*
           merge-multiple: true
           path: .
-      - name: Publish to npm (all platform binaries bundled)
+      - name: Wait for Mac binaries from Codemagic (max 35 min)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          VERSION="${{ github.ref_name }}"
+          echo "Polling GitHub release for Mac .node binaries..."
+          for i in $(seq 1 35); do
+            ASSETS=$(gh release view "$VERSION" --json assets --jq '[.assets[].name]' 2>/dev/null || echo "[]")
+            ARM=$(echo "$ASSETS" | grep -c "darwin-arm64" || true)
+            X86=$(echo "$ASSETS" | grep -c "darwin-x64" || true)
+            echo "  Attempt $i/35 — arm64=$ARM x86_64=$X86"
+            if [ "$ARM" -gt 0 ] && [ "$X86" -gt 0 ]; then
+              echo "Mac binaries found — downloading"
+              gh release download "$VERSION" --pattern "*.node" --dir . --clobber
+              break
+            fi
+            if [ "$i" -eq 35 ]; then
+              echo "Timeout — publishing without Mac binaries (Codemagic may still upload later)"
+            fi
+            sleep 60
+          done
+          echo "Final .node files: $(ls *.node 2>/dev/null || echo 'none')"
+      - name: Publish to npm (all available platform binaries)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          # Determine npm dist-tag from version string
           VERSION=$(node -e "console.log(require('./package.json').version)")
           if echo "$VERSION" | grep -qE '(alpha|beta|rc|pre)'; then
             TAG=$(echo "$VERSION" | grep -oE '(alpha|beta|rc|pre)[.0-9]*' | head -1 | sed 's/[.].*$//')
-            echo "Publishing pre-release with --tag $TAG"
             npm publish --access public --tag "$TAG"
           else
-            echo "Publishing stable release as latest"
             npm publish --access public
           fi
 
