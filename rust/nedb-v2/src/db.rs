@@ -192,6 +192,70 @@ impl Db {
         Ok(node)
     }
 
+    /// Batch put: write N documents in parallel, preserving monotonic seq ordering.
+    /// Pre-allocates N seq numbers atomically, then parallelises object writes and
+    /// id-index updates via Rayon. Each op is independent — safe to parallelise.
+    /// Returns nodes in input order with assigned seq numbers.
+    pub fn put_batch(
+        &self,
+        ops: Vec<(String, String, Value, Vec<String>, Option<String>, Option<String>)>,
+        // (coll, id, data, caused_by, valid_from, valid_to)
+    ) -> Result<Vec<Node>> {
+        use rayon::prelude::*;
+
+        if ops.is_empty() { return Ok(vec![]); }
+        let n = ops.len() as u64;
+
+        // Pre-allocate N consecutive seq numbers — preserves ordering under concurrency
+        let base_seq = self.seq.fetch_add(n, Ordering::SeqCst);
+        let ts = now();
+
+        // Build nodes with assigned seq numbers
+        let mut nodes: Vec<Node> = ops.into_iter().enumerate().map(|(i, (coll, id, data, caused_by, valid_from, valid_to))| {
+            let prev = self.id_index.get(&coll, &id);
+            Node {
+                id, coll, seq: base_seq + i as u64,
+                data, prev, caused_by,
+                ts, valid_from, valid_to,
+                hash: String::new(),
+            }
+        }).collect();
+
+        // Parallel object writes (content-addressed, idempotent, safe to parallelise)
+        let write_errors: Vec<anyhow::Error> = nodes.par_iter_mut()
+            .filter_map(|node| self.objects.write(node).err())
+            .collect();
+        if let Some(e) = write_errors.into_iter().next() { return Err(e); }
+
+        // Parallel id-index updates
+        let index_errors: Vec<anyhow::Error> = nodes.par_iter()
+            .filter_map(|node| self.id_index.set(&node.coll, &node.id, &node.hash).err())
+            .collect();
+        if let Some(e) = index_errors.into_iter().next() { return Err(e); }
+
+        // Sorted indexes + causal graph (sequential — small overhead, usually no indexes)
+        for node in &nodes {
+            if let Value::Object(ref obj) = node.data {
+                for (field, value) in obj {
+                    if self.sorted_indexes.has(&node.coll, field) {
+                        self.sorted_indexes.insert(&node.coll, field, value, &node.hash);
+                    }
+                }
+            }
+            for cause in &node.caused_by {
+                self.graph.add_edge(&node.hash, "caused_by", cause).ok();
+                self.graph.add_edge(cause, "caused_by_rev", &node.hash).ok();
+            }
+        }
+
+        // Single Merkle head update for the whole batch (chain all hashes)
+        for node in &nodes {
+            self.update_head(node.seq, &node.hash);
+        }
+
+        Ok(nodes)
+    }
+
     /// Update the running Merkle head with a new write. O(1), lock-free on the flush path.
     /// Sets dirty flag — the background ticker calls flush_manifest periodically.
     /// This removes 2× file I/O ops from the hot write path, unblocking concurrent writes.

@@ -427,7 +427,7 @@ pub fn execute(db: &Db, nql: &str) -> Result<Vec<Value>> {
 
     // ── TRACE ─────────────────────────────────────────────────────────────────
 
-    if let Some(ref edge_type) = q.trace {
+    if let Some(ref _edge_type) = q.trace {
         let limit = q.limit.unwrap_or(1000);
         let mut traced: Vec<Node> = vec![];
         for root in &rows {
