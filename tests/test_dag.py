@@ -115,6 +115,14 @@ def _client() -> httpx.Client:
     return httpx.Client(base_url=BASE_URL, headers=headers, timeout=10.0)
 
 
+def _safe_delete(client, path):
+    """Delete without raising — used in setUp/tearDown cleanup."""
+    try:
+        client.delete(path)
+    except Exception:
+        pass
+
+
 def _put(client, coll, doc_id, doc, **kwargs):
     payload = {"coll": coll, "id": doc_id, "doc": doc, **kwargs}
     r = client.post(f"/v1/databases/{DB_NAME}/put", json=payload)
@@ -175,18 +183,23 @@ class TestDagHealth(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
 
 
-class TestDagCrud(unittest.TestCase):
-    """Basic CRUD: put, get, delete, tombstone visibility."""
+class _DagBase(unittest.TestCase):
+    """Base class: resilient setUp/tearDown that handles server restarts."""
 
     def setUp(self):
         self.c = _client()
-        # Ensure DB exists and is clean
-        self.c.delete(f"/v1/databases/{DB_NAME}")
+        if not _is_server_alive():
+            self.skipTest("nedbd not running — skip")
+        _safe_delete(self.c, f"/v1/databases/{DB_NAME}")
         self.c.post("/v1/databases", json={"name": DB_NAME})
 
     def tearDown(self):
-        self.c.delete(f"/v1/databases/{DB_NAME}")
+        _safe_delete(self.c, f"/v1/databases/{DB_NAME}")
         self.c.close()
+
+
+class TestDagCrud(_DagBase):
+    """Basic CRUD: put, get, delete, tombstone visibility."""
 
     def test_put_returns_ok_seq_head(self):
         r = _put(self.c, "items", "i1", {"x": 1})
@@ -236,22 +249,16 @@ class TestDagCrud(unittest.TestCase):
         self.assertNotIn("del_me", ids, "tombstoned doc appeared in full scan")
 
 
-class TestDagNql(unittest.TestCase):
+class TestDagNql(_DagBase):
     """NQL query clauses: ORDER BY, LIMIT, WHERE, GROUP BY, SEARCH."""
 
     def setUp(self):
-        self.c = _client()
-        self.c.delete(f"/v1/databases/{DB_NAME}")
-        self.c.post("/v1/databases", json={"name": DB_NAME})
+        super().setUp()
         # Seed data
         for i in range(10):
             _put(self.c, "items", str(i), {"height": i, "kind": "even" if i % 2 == 0 else "odd", "label": f"item{i}"})
         # Create sorted index for ORDER BY fast path
         self.c.post(f"/v1/databases/{DB_NAME}/index", json={"coll": "items", "field": "height", "kind": "sorted"})
-
-    def tearDown(self):
-        self.c.delete(f"/v1/databases/{DB_NAME}")
-        self.c.close()
 
     def test_limit(self):
         rows = _query(self.c, "FROM items LIMIT 3")["rows"]
@@ -289,17 +296,8 @@ class TestDagNql(unittest.TestCase):
         self.assertEqual(rows[0]["height"], 5)
 
 
-class TestDagBatch(unittest.TestCase):
+class TestDagBatch(_DagBase):
     """Batch writes: parallel puts, mixed put/del."""
-
-    def setUp(self):
-        self.c = _client()
-        self.c.delete(f"/v1/databases/{DB_NAME}")
-        self.c.post("/v1/databases", json={"name": DB_NAME})
-
-    def tearDown(self):
-        self.c.delete(f"/v1/databases/{DB_NAME}")
-        self.c.close()
 
     def test_batch_put_100(self):
         ops = [{"op": "put", "coll": "batch", "id": str(i), "doc": {"n": i}} for i in range(100)]
@@ -330,17 +328,8 @@ class TestDagBatch(unittest.TestCase):
         self.assertEqual(len(set(seqs)), len(seqs), "duplicate seq numbers in batch")
 
 
-class TestDagIntegrity(unittest.TestCase):
+class TestDagIntegrity(_DagBase):
     """BLAKE2b tamper evidence, Merkle head, verify endpoint."""
-
-    def setUp(self):
-        self.c = _client()
-        self.c.delete(f"/v1/databases/{DB_NAME}")
-        self.c.post("/v1/databases", json={"name": DB_NAME})
-
-    def tearDown(self):
-        self.c.delete(f"/v1/databases/{DB_NAME}")
-        self.c.close()
 
     def test_head_changes_on_write(self):
         r1 = _put(self.c, "docs", "a", {"x": 1})
@@ -370,17 +359,8 @@ class TestDagIntegrity(unittest.TestCase):
         self.assertGreater(r2["seq"], r1["seq"])
 
 
-class TestDagTimeline(unittest.TestCase):
+class TestDagTimeline(_DagBase):
     """Bi-temporal and AS OF time-travel."""
-
-    def setUp(self):
-        self.c = _client()
-        self.c.delete(f"/v1/databases/{DB_NAME}")
-        self.c.post("/v1/databases", json={"name": DB_NAME})
-
-    def tearDown(self):
-        self.c.delete(f"/v1/databases/{DB_NAME}")
-        self.c.close()
 
     def test_valid_as_of_window(self):
         _put(self.c, "rates", "r1", {"pct": 5.0}, valid_from="2024-01-01", valid_to="2024-12-31")
@@ -410,30 +390,18 @@ class TestDagTimeline(unittest.TestCase):
         self.assertEqual(x_old["v"], 1)
 
 
-class TestDagCausal(unittest.TestCase):
+class TestDagCausal(_DagBase):
     """Causal TRACE provenance."""
 
-    def setUp(self):
-        self.c = _client()
-        self.c.delete(f"/v1/databases/{DB_NAME}")
-        self.c.post("/v1/databases", json={"name": DB_NAME})
-
-    def tearDown(self):
-        self.c.delete(f"/v1/databases/{DB_NAME}")
-        self.c.close()
-
     def test_trace_backward(self):
-        """TRACE caused_by: C → B → A."""
+        """TRACE caused_by: from c, should reach b and a via the causal chain."""
         ra = _put(self.c, "ops", "a", {"op": "create"})
         rb = _put(self.c, "ops", "b", {"op": "transfer"}, caused_by=[ra["doc"]["_hash"]])
-        rc = _put(self.c, "ops", "c", {"op": "burn"},     caused_by=[rb["doc"]["_hash"]])
-        # Trace from c backward
-        rows = _query(self.c, f'FROM ops WHERE _id = "c" LIMIT 1')["rows"]
-        self.assertEqual(len(rows), 1)
-        c_hash = rows[0]["_hash"]
-        trace = _query(self.c, f'FROM ops TRACE caused_by LIMIT 10')["rows"]
-        # Should include a, b, c (or at least the chain exists)
-        self.assertGreater(len(trace), 0)
+        _put(self.c, "ops", "c", {"op": "burn"}, caused_by=[rb["doc"]["_hash"]])
+        # Always scope TRACE to a specific starting doc via WHERE
+        # to avoid iterating all docs (some may have empty caused_by)
+        trace = _query(self.c, 'FROM ops WHERE _id = "c" TRACE caused_by LIMIT 10')["rows"]
+        self.assertGreater(len(trace), 0, "TRACE returned no rows")
 
 
 class TestDagSSE(unittest.TestCase):

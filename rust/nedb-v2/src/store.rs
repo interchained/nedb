@@ -127,6 +127,9 @@ impl ObjectStore {
 
     /// Read and verify a node by its hash. Returns error on hash mismatch (tamper).
     pub fn read(&self, hash: &str) -> Result<Node> {
+        if hash.len() < 3 {
+            anyhow::bail!("invalid object hash (too short): {:?}", hash);
+        }
         let path = self.root.join(&hash[..2]).join(&hash[2..]);
         let content = fs::read(&path)
             .with_context(|| format!("read object {}", hash))?;
