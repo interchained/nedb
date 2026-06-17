@@ -4,7 +4,7 @@ version     = "2.0.36"
 edition     = "2021"
 description = "NEDB v2 — content-addressed DAG storage engine with NQL and HTTP server"
 license     = "BUSL-1.1"
-repository  = "https://github.com/Eth-Interchained/nedb"
+repository  = "https://github.com/aiassistsecure/nedb"
 
 [[bin]]
 name = "nedbd"

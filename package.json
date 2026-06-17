@@ -12,10 +12,10 @@
     "LICENSE"
   ],
   "license": "GPL-3.0-or-later",
-  "homepage": "https://github.com/Eth-Interchained/nedb#readme",
+  "homepage": "https://github.com/aiassistsecure/nedb#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Eth-Interchained/nedb.git"
+    "url": "git+https://github.com/aiassistsecure/nedb.git"
   },
   "keywords": [
     "database",

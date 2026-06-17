@@ -34,8 +34,8 @@ dependencies = [
 nedbd = "nedb.server:main"
 
 [project.urls]
-Homepage = "https://github.com/Eth-Interchained/nedb"
-Repository = "https://github.com/Eth-Interchained/nedb"
+Homepage = "https://github.com/aiassistsecure/nedb"
+Repository = "https://github.com/aiassistsecure/nedb"
 
 [tool.hatch.build.targets.wheel]
 packages = ["python/nedb"]

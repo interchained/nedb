@@ -29,8 +29,8 @@ dependencies = ["cryptography>=41"]
 nedbd = "nedb.server:main"
 
 [project.urls]
-Homepage = "https://github.com/Eth-Interchained/nedb"
-Repository = "https://github.com/Eth-Interchained/nedb"
+Homepage = "https://github.com/aiassistsecure/nedb"
+Repository = "https://github.com/aiassistsecure/nedb"
 
 [tool.maturin]
 # Bundle Python source alongside the Rust extension (mixed Rust/Python layout).
