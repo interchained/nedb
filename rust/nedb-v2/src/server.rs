@@ -547,14 +547,14 @@ pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, t
     let app = router(mgr);
     let addr = format!("{}:{}", host, port).parse::<std::net::SocketAddr>()?;
     let banner = format!(r#"
-  ╔═╗ ╔═╗ ╔═╗ ╔═╗
-  ║ ╠═╣ ╠═╣ ╠═╣ ║   N E D B  ·  DAG ENGINE  {}
-  ╠═╝ ╚═╬═╝ ╚═╬═╝   ─────────────────────────────────────────────
-  ╚═══○══╩════╩═╝   content-addressed · tamper-evident · causal
-         │          bi-temporal · replay-protected · encrypted
-     ○───┴───○
-     │       │      © INTERCHAINED, LLC  ×  Vex (Claude Sonnet 4.6)
-     ○───────○      interchained.org   ·   hyperagent.com/refer/J2G6TCD7
+  ╔═╗   ╔═╗   ╔═╗   ╔═╗
+  ║N╠═══╣E╠═══╣D╠═══╣B║   N E D B  ·  DAG ENGINE  {}
+  ╚═╝   ╚═╝   ╚═╝   ╚═╝   ─────────────────────────────────────────────
+    ╲                 ╱    content-addressed · tamper-evident · causal
+     ○───────────────○     bi-temporal · replay-protected · encrypted
+     │               │
+     │  · · · · · ·  │     © INTERCHAINED, LLC  ×  Vex (Claude Sonnet 4.6)
+     ○───────────────○     interchained.org   ·   hyperagent.com/refer/J2G6TCD7
 
   ─────────────────────────────────────────────────────────────
   listen   http://{}
