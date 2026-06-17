@@ -99,30 +99,27 @@ impl Db {
             eprintln!("  [nedbd] MANIFEST corrupt, falling back to cold scan");
         }
 
-        // Cold path: spawn background thread, server starts immediately.
-        // Writes are gated on startup_ready until scan completes.
-        //
-        // Raw pointers aren't Send. Cast to usize (which is Send) to move
-        // into the closure, then cast back. Safety: Arc<Db> in Manager keeps
-        // Db alive for the server's full lifetime, so these addresses are valid.
-        let ready_flag   = Arc::clone(&self.startup_ready);
-        let root         = self.root.clone();
-        let objects_addr = &self.objects        as *const ObjectStore   as usize;
-        let head_addr    = &self.head           as *const RwLock<String> as usize;
-        let seq_addr     = &self.seq            as *const AtomicU64      as usize;
-        let si_addr      = &self.sorted_indexes as *const SortedIndexes  as usize;
-
-        println!("  [nedbd] cold start — background scan starting, server accepting reads now");
-
-        std::thread::spawn(move || {
-            let objects        = unsafe { &*(objects_addr as *const ObjectStore)   };
-            let head           = unsafe { &*(head_addr    as *const RwLock<String>) };
-            let seq_atomic     = unsafe { &*(seq_addr     as *const AtomicU64)      };
-            let sorted_indexes = unsafe { &*(si_addr      as *const SortedIndexes)  };
-            cold_scan_background(root, objects, head, seq_atomic, sorted_indexes, ready_flag);
-        });
-
+        // Cold path: mark as not ready, return immediately.
+        // The actual background scan is started by Db::start_cold_scan(arc)
+        // which is called from Manager::open_all() AFTER Arc::new(db) — when
+        // the Db is heap-allocated and its field addresses are permanently stable.
+        // Capturing field addresses here would cause UB: Db moves on return.
+        println!("  [nedbd] cold start — background scan will start after heap allocation");
         Ok(())
+    }
+
+    /// Call this from Manager::open_all() after Arc::new(db).
+    /// Spawns the cold scan background thread with stable heap addresses.
+    /// No-op if startup is already complete (warm start).
+    pub fn start_cold_scan(self_arc: Arc<Self>) {
+        if self_arc.startup_ready.load(Ordering::SeqCst) {
+            return; // warm start — already ready
+        }
+        println!("  [nedbd] cold start — background scan starting, server accepting reads now");
+        std::thread::spawn(move || {
+            let db = self_arc;
+            cold_scan_background_arc(db);
+        });
     }
 
     /// Write a document. Returns the new node with its content hash set.
@@ -352,24 +349,17 @@ impl Db {
     }
 }
 
-/// Background cold-scan worker. Called from a std::thread spawned by startup_rebuild().
-/// Reads all objects, rebuilds seq/head/sorted-indexes, writes MANIFEST, sets ready flag.
-fn cold_scan_background(
-    root:           PathBuf,
-    objects:        *const ObjectStore,
-    head:           *const RwLock<String>,
-    seq_atomic:     *const AtomicU64,
-    sorted_indexes: *const SortedIndexes,
-    ready_flag:     Arc<AtomicBool>,
-) {
+/// Background cold-scan worker. Takes Arc<Db> — safe, Db is on the heap.
+fn cold_scan_background_arc(db: Arc<Db>) {
     use rayon::prelude::*;
     use blake2::{Blake2b512, Digest};
 
-    // SAFETY: caller guarantees Db outlives this thread (Arc<Db> in Manager).
-    let objects        = unsafe { &*objects };
-    let head           = unsafe { &*head };
-    let seq_atomic     = unsafe { &*seq_atomic };
-    let sorted_indexes = unsafe { &*sorted_indexes };
+    let objects        = &db.objects;
+    let head           = &db.head;
+    let seq_atomic     = &db.seq;
+    let sorted_indexes = &db.sorted_indexes;
+    let root           = db.root.clone();
+    let ready_flag     = Arc::clone(&db.startup_ready);
 
     let hashes: Vec<String> = objects.all_hashes().collect();
     let total = hashes.len();

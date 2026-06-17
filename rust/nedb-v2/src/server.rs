@@ -95,7 +95,11 @@ impl Manager {
             match Db::open(&db_path, dek) {
                 Ok(db) => {
                     nlog!(log_tx, "  [nedbd] opened database {:?}", name);
-                    inner.dbs.insert(name, Arc::new(db));
+                    // Arc::new BEFORE start_cold_scan — Db must be heap-allocated
+                    // for field addresses to be stable across the thread boundary.
+                    let db_arc = Arc::new(db);
+                    Db::start_cold_scan(Arc::clone(&db_arc));
+                    inner.dbs.insert(name, db_arc);
                 }
                 Err(e) => nlog!(log_tx, "  [nedbd] ERROR opening {:?}: {}", name, e),
             }
@@ -115,6 +119,7 @@ impl Manager {
         let db_path = data_dir.join(name);
         let dek = tmk.map(|k| crate::store::Dek::from_tmk(&k, name.as_bytes()));
         let db = Arc::new(Db::open(&db_path, dek)?);
+        Db::start_cold_scan(Arc::clone(&db));
         self.inner.write().await.dbs.insert(name.to_string(), db.clone());
         Ok(db)
     }
