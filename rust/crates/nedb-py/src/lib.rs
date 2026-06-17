@@ -4,10 +4,12 @@
 //! API surface is identical to the v1 bindings so existing Python code works unchanged.
 //! Under the hood, all operations go through nedb_core_v2::Db (content-addressed DAG).
 
+// pyo3::prelude::* must come first — it exports the proc-macro attributes
+// (#[pyclass], #[pymethods], #[pyo3(signature=...)]) that maturin needs.
+use pyo3::prelude::*;
+use pyo3::exceptions::PyRuntimeError;
 use std::sync::Arc;
 use nedb_core_v2::{Db, nql};
-use pyo3::exceptions::PyRuntimeError;
-use pyo3::prelude::*;
 use serde_json::Value;
 
 fn jerr(e: impl std::fmt::Display) -> PyErr {
