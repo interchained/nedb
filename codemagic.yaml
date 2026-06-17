@@ -53,12 +53,16 @@ workflows:
       - name: Build nedbd-v2 binary
         script: |
           source "$HOME/.cargo/env"
-          cd rust/nedb-v2
-          cargo build --release --target $RUST_TARGET
-          BIN="target/$RUST_TARGET/release/nedbd"
-          cp "$BIN" ../../python/nedb/nedbd-v2
-          chmod +x ../../python/nedb/nedbd-v2
-          echo "Binary: $(ls -lh ../../python/nedb/nedbd-v2)"
+          # Build from the workspace root (rust/) so cargo uses the workspace Cargo.lock.
+          # Output lands in rust/target/<triple>/release/nedbd (workspace target dir).
+          cd rust
+          cargo build --release --bin nedbd --package nedb-core-v2 --target $RUST_TARGET
+          cd ..
+          BIN="rust/target/$RUST_TARGET/release/nedbd"
+          echo "Binary built: $(ls -lh $BIN)"
+          cp "$BIN" python/nedb/nedbd-v2
+          chmod +x python/nedb/nedbd-v2
+          echo "Binary staged: $(ls -lh python/nedb/nedbd-v2)"
 
       - name: Stage Python source + verify binary
         script: |
