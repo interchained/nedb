@@ -126,8 +126,6 @@ impl Db {
         Ok(())
     }
 
-}
-
     /// Write a document. Returns the new node with its content hash set.
     pub fn put(
         &self,
