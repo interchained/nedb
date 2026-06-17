@@ -179,7 +179,7 @@ pre{
       <div class="mark"></div>
       <div>
         <span>NEDB</span>
-        <small>v2.0.4</small>
+        <small>v2.0.27</small>
       </div>
     </a>
   </div>
@@ -190,10 +190,12 @@ pre{
       <a href="#dag-engine">Overview</a>
       <a href="#dag-flag">--dag / NEDBD_DAG=1</a>
       <a href="#dag-binary">nedbd-v2 binary</a>
+      <a href="#dag-startup">Startup modes (warm / cold)</a>
       <a href="#dag-migration">Migration from v1 AOF</a>
       <a href="#dag-merkle">BLAKE2b Merkle head</a>
       <a href="#dag-tombstones">Tombstone deletes</a>
       <a href="#dag-env">Environment variables</a>
+      <a href="#dag-perf">Benchmarks</a>
     </div>
     <div class="sb-group">
       <div class="sb-group-label">Getting Started</div>
@@ -289,20 +291,27 @@ pre{
 
 <!-- ═══════════════════ v2 DAG ENGINE ═══════════════════ -->
 <section class="section" id="dag-engine">
-  <div class="section-tag">v2.0.4 — The DAG Engine</div>
+  <div class="section-tag">v2.0.27 — The DAG Engine</div>
   <h2>v2 DAG Engine</h2>
-  <p class="section-lead">NEDB v2.0.4 introduces a new storage substrate: a content-addressed Merkle DAG. Every document version is hashed with BLAKE2b and stored as an immutable, addressable object. There is no append-only log to replay, no corrupted tail to recover, and no rebuild step on open. Boot is constant-time. The head hash is a real Merkle root over the entire DAG, anchorable on-chain and comparable across replicas.</p>
+  <p class="section-lead">NEDB v2.0.27 ships the production DAG substrate: every document version is hashed with BLAKE2b and stored as an immutable, addressable object. There is no append-only log to replay and no corrupted tail to recover. After the first open, <code>MANIFEST</code> restores <code>seq</code> and the Merkle head in O(1); the deferred background cold scan lets the daemon accept connections immediately on first open. The head hash is a real Merkle root over the entire DAG, anchorable on-chain and comparable across replicas, updated incrementally on every write.</p>
 
   <div class="good">
     <p><strong>v1 content is still valid.</strong> The v1 AOF engine and its full API (NQL, time-travel, causal provenance, AES-256-GCM, RESP2, SQL/Redis adapters) remain unchanged. The DAG engine is a drop-in replacement substrate: same wire protocol, same query language, same Python/Node API surface. Pass <code>--dag</code> (or <code>NEDBD_DAG=1</code>) to opt in. Everything below this section also applies to the v2 engine unless it specifically refers to <code>log.aof</code>.</p>
   </div>
 
+  <div class="good">
+    <p><strong>Production status:</strong> NEDB v2.0.27 is serving <code>vision.interchained.org</code> from the DAG engine &mdash; <strong>1,310,703 sequences</strong> indexed, AES-256-GCM encrypted at rest, live at block height <strong>620,989</strong>.</p>
+  </div>
+
   <h3>What changed at the substrate</h3>
   <ul>
     <li><strong>Storage is a Merkle DAG, not a log.</strong> Every <code>put</code> produces an immutable, BLAKE2b-keyed object. Document history is a real DAG of version objects, not a sequential AOF.</li>
-    <li><strong>Cold start is instant.</strong> No replay. The engine reads the head, verifies the DAG root, and is ready — independent of dataset size.</li>
+    <li><strong>Warm start is O(1).</strong> A small <code>MANIFEST</code> file records <code>seq</code> and the current Merkle head. After the first open, the daemon restores both in constant time &mdash; independent of dataset size.</li>
+    <li><strong>Cold scan is deferred.</strong> On the first open of an existing dataset, the daemon accepts connections immediately; the integrity scan runs in a background thread with a live progress bar. Reads serve instantly; writes return <code>503 startup in progress</code> until the <code>startup_ready</code> gate flips.</li>
     <li><strong>Corruption is impossible.</strong> Objects are immutable and hash-addressed. A flipped byte changes the digest; the DAG simply ignores the broken object and the head hash refuses to verify against it.</li>
-    <li><strong>The head is a real Merkle root.</strong> Every response carries a BLAKE2b commitment over the full DAG of every version ever written.</li>
+    <li><strong>The head is a real Merkle root, updated in O(1).</strong> BLAKE2b commitment over the full DAG of every version ever written, advanced incrementally on every write, never recomputed.</li>
+    <li><strong>IdIndex sharded across 256 subdirectories.</strong> Prevents directory slowdown at 1M+ documents.</li>
+    <li><strong>TCP_NODELAY on the axum listener.</strong> Eliminates the 40&ndash;200 ms Nagle delay on macOS loopback.</li>
     <li><strong>Deletes are tombstones.</strong> History never disappears; <code>AS OF</code> still resolves the pre-delete value, and the head hash still commits to every version ever written.</li>
   </ul>
 </section>
@@ -314,13 +323,13 @@ pre{
     <div class="code-label">shell — flag form</div>
     <button class="copy-btn" onclick="copyCode(this)">COPY</button>
 <pre>nedbd --dag --data ./data
-<span class="cc"># nedbd-v2 2.0.4 — http://127.0.0.1:7070  data=./data  engine=dag  auth=off</span></pre>
+<span class="cc"># nedbd-v2 2.0.27 — http://127.0.0.1:7070  data=./data  engine=dag  auth=off</span></pre>
   </div>
   <div class="code-wrap">
     <div class="code-label">shell — env form (recommended for systemd / containers)</div>
     <button class="copy-btn" onclick="copyCode(this)">COPY</button>
 <pre>NEDBD_DAG=1 NEDB_TMK=&lt;hex&gt; nedbd --data ./data
-<span class="cc"># nedbd-v2 2.0.4 — http://127.0.0.1:7070  data=./data  engine=dag  enc=on</span></pre>
+<span class="cc"># nedbd-v2 2.0.27 — http://127.0.0.1:7070  data=./data  engine=dag  enc=on</span></pre>
   </div>
   <p>Without <code>--dag</code> or <code>NEDBD_DAG=1</code>, <code>nedbd</code> runs the v1 AOF engine exactly as in 1.x. The v1 daemon binary, log format, and HTTP routes are unchanged.</p>
   <div class="note">
@@ -344,9 +353,57 @@ pip show -f nedb-engine | grep nedbd
 
 <span class="cc"># You can also invoke nedbd-v2 directly, skipping the launcher.</span>
 nedbd-v2 --data ./data
-<span class="cc"># nedbd-v2 2.0.4 — http://127.0.0.1:7070  data=./data  engine=dag</span></pre>
+<span class="cc"># nedbd-v2 2.0.27 — http://127.0.0.1:7070  data=./data  engine=dag</span></pre>
   </div>
   <p>Invoking <code>nedbd-v2</code> directly is identical to <code>nedbd --dag</code> — the launcher only adds the engine-selection logic; everything else is the same Rust process.</p>
+</section>
+
+<section class="section" id="dag-startup">
+  <h3 style="margin-top:0">Startup modes — warm vs. cold</h3>
+  <p>nedbd v2 has two distinct startup paths. Both keep the daemon responsive; the difference is whether an integrity scan is required.</p>
+
+  <h4>Warm start (every restart after the first open)</h4>
+  <p>On every restart after the database has been opened at least once, the daemon reads the <code>MANIFEST</code> file and restores <code>seq</code> and the current Merkle <code>head</code> in O(1). The full DAG is not scanned; objects are read on demand. Boot is constant-time and independent of dataset size.</p>
+  <div class="code-wrap">
+    <div class="code-label">shell — warm start (subsequent restart)</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre>NEDBD_DAG=1 nedbd --data ./data
+<span class="cc"># nedbd-v2 2.0.27 — http://127.0.0.1:7070  data=./data  engine=dag</span>
+<span class="cc">#   manifest: seq=1310703  head=b2:9c14e07a…  (warm start in 4 ms)</span>
+<span class="cc">#   ready</span></pre>
+  </div>
+
+  <h4>Cold start (first open of an existing dataset)</h4>
+  <p>If no <code>MANIFEST</code> exists yet, the daemon spawns the integrity scan in a background thread <strong>and starts accepting connections immediately</strong>. Reads serve from the DAG as the scan proceeds. Writes are blocked behind the <code>startup_ready</code> gate &mdash; any <code>PUT</code> or mutation returns <code>HTTP 503</code> with body <code>{"error":"startup in progress","scan":{"objects":X,"of":Y,"rate":Z,"eta_s":W}}</code> until the scan completes. The <code>MANIFEST</code> is written at the end of the scan; all subsequent restarts are warm.</p>
+  <div class="code-wrap">
+    <div class="code-label">shell — cold start (first open, deferred scan with progress bar)</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre>NEDBD_DAG=1 nedbd --data ./data
+<span class="cc"># nedbd-v2 2.0.27 — http://127.0.0.1:7070  data=./data  engine=dag</span>
+<span class="cc">#   listener ready    (writes blocked: 503 startup in progress)</span>
+<span class="cc">#   cold scan:  47312 / 1310703 objs   1.4s elapsed   ~21k/s   eta 60s</span>
+<span class="cc">#   cold scan:  cold scan: ████████░░░  730 K / 1.31 M  21k/s  eta 28s</span>
+<span class="cc">#   manifest written: seq=1310703  head=b2:9c14e07a…   startup_ready=true</span>
+<span class="cc">#   writes unblocked</span></pre>
+  </div>
+
+  <div class="note">
+    <p><strong>Reads work instantly during cold scan.</strong> The DAG is content-addressed, so any object that has been written is fetchable by digest before the scan reaches it. Only the write gate (<code>startup_ready</code>) waits for the full scan to finish — to guarantee replay protection counters and idempotency tables are fully rehydrated before accepting new writes.</p>
+  </div>
+
+  <h4>Watching startup live with SSE</h4>
+  <p>The new <code>GET /events</code> SSE endpoint streams the cold-scan progress along with every subsequent write &mdash; useful for ops dashboards and CI.</p>
+  <div class="code-wrap">
+    <div class="code-label">shell — tail the live event stream</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre>curl http://127.0.0.1:7070/events
+<span class="cc"># event: scan</span>
+<span class="cc"># data: {"objects":730000,"of":1310703,"rate":21043,"eta_s":28}</span>
+<span class="cc"># event: ready</span>
+<span class="cc"># data: {"seq":1310703,"head":"b2:9c14e07a…"}</span>
+<span class="cc"># event: write</span>
+<span class="cc"># data: {"seq":1310704,"coll":"beliefs","head":"b2:7af3c11e…"}</span></pre>
+  </div>
 </section>
 
 <section class="section" id="dag-migration">
@@ -359,14 +416,15 @@ nedbd-v2 --data ./data
 <span class="cc"># Stop v1 daemon, then start v2 on the same directory:</span>
 NEDBD_DAG=1 nedbd --data ./data
 
-<span class="cc"># Boot log on first open:</span>
-<span class="cc"># nedbd-v2 2.0.4 — http://127.0.0.1:7070  data=./data  engine=dag</span>
+<span class="cc"># Boot log on first open (cold scan runs deferred — socket open immediately):</span>
+<span class="cc"># nedbd-v2 2.0.27 — http://127.0.0.1:7070  data=./data  engine=dag</span>
+<span class="cc">#   listener ready    (writes blocked: 503 startup in progress)</span>
 <span class="cc">#   migrate: scanning log.aof (1.2M ops) …</span>
 <span class="cc">#   migrate: built DAG with 47312 unique object hashes</span>
 <span class="cc">#   migrate: head = b2:7af3c11e…  verified</span>
-<span class="cc">#   ready in 4.1s   (subsequent starts: <100ms)</span>
+<span class="cc">#   manifest written   startup_ready=true   (subsequent starts: O(1) warm)</span>
 
-<span class="cc"># After: ./data/log.aof (kept for rollback), ./data/dag/, ./data/head</span></pre>
+<span class="cc"># After: ./data/log.aof (kept for rollback), ./data/dag/, ./data/MANIFEST</span></pre>
   </div>
   <p>The head hash after migration commits to the same logical history that <code>verify()</code> would have produced on v1 &mdash; same NQL results, same <code>AS OF</code> answers, same causal traces. The Merkle root, however, is a new value (the DAG hashes are computed differently than the v1 chain hashes), so anchor consumers must record the new root.</p>
   <div class="warn">
@@ -397,7 +455,10 @@ db.head()
 <pre>curl http://localhost:7070/v1/databases/myapp/verify
 <span class="cc"># {"ok": true, "engine": "dag", "head": "b2:7af3c11e…", "objects": 47312}</span></pre>
   </div>
-  <p><code>verify()</code> on the v2 engine re-walks every DAG object, recomputes its BLAKE2b digest, confirms each parent edge resolves, and re-derives the Merkle root. Any tampering changes the digest and the verification fails. The check is parallelisable; on commodity hardware it processes ~250k objects/second.</p>
+  <p><code>verify()</code> on the v2 engine re-walks every DAG object, recomputes its BLAKE2b digest, confirms each parent edge resolves, and re-derives the Merkle root. Any tampering changes the digest and the verification fails. On the production benchmark hardware (Intel iMac), <code>verify()</code> processes 30,000 objects in 1.38 s &mdash; roughly 21,000 BLAKE2b/sec.</p>
+  <div class="note">
+    <p><strong>The Merkle head is incremental.</strong> Live updates advance the head in O(1) on every write &mdash; the previous root is combined with the new object's digest via a BLAKE2b update step. <code>verify()</code> only rewalks the full DAG on demand; normal operation never recomputes the root from scratch.</p>
+  </div>
 </section>
 
 <section class="section" id="dag-tombstones">
@@ -429,20 +490,44 @@ db.get(<span class="cs">"users"</span>, <span class="cs">"alice"</span>, as_of=s
   <table class="ptbl">
     <tr><th>Variable</th><th>Default</th><th>Description</th></tr>
     <tr><td><code>NEDBD_DAG</code></td><td><code>0</code></td><td>Set to <code>1</code> to launch the v2 DAG engine (<code>nedbd-v2</code>). Equivalent to passing <code>--dag</code> on the command line.</td></tr>
+    <tr><td><code>NEDBD_HOST</code></td><td><code>127.0.0.1</code></td><td>Bind address. Defaults to loopback in v2.0.27 (was <code>0.0.0.0</code> previously) &mdash; security hardening fix. Set explicitly to <code>0.0.0.0</code> to expose the daemon on all interfaces.</td></tr>
     <tr><td><code>NEDBD_PORT</code></td><td><code>7070</code></td><td>HTTP bind port. Unchanged from v1.</td></tr>
     <tr><td><code>NEDBD_TOKEN</code></td><td>unset</td><td>Optional bearer token. If set, every <code>/v1/*</code> request must include <code>Authorization: Bearer &lt;token&gt;</code>. Unchanged from v1.</td></tr>
     <tr><td><code>NEDB_TMK</code></td><td>unset</td><td>32-byte hex AES-256-GCM at-rest encryption key. The DAG engine encrypts every object before writing it to <code>dag/</code>; the Merkle structure remains verifiable through encryption.</td></tr>
-    <tr><td><code>NEDBD_DATA</code></td><td><code>./nedb-data</code></td><td>Root directory. The DAG engine creates <code>dag/</code> for objects and a small <code>head</code> file for the current Merkle root.</td></tr>
+    <tr><td><code>NEDBD_DATA</code></td><td><code>./nedb-data</code></td><td>Root directory. The DAG engine creates <code>dag/</code> for objects, the IdIndex sharded across 256 subdirectories, and a small <code>MANIFEST</code> file for the current <code>seq</code> + Merkle head.</td></tr>
   </table>
   <div class="code-wrap">
     <div class="code-label">shell — full v2 launch</div>
     <button class="copy-btn" onclick="copyCode(this)">COPY</button>
 <pre>NEDBD_DAG=1 \
+NEDBD_HOST=0.0.0.0 \
 NEDBD_PORT=7070 \
 NEDBD_DATA=/var/db/nedb \
 NEDBD_TOKEN=my-secret \
 NEDB_TMK=$(cat /run/secrets/nedb-tmk) \
 nedbd</pre>
+  </div>
+</section>
+
+<section class="section" id="dag-perf">
+  <h3 style="margin-top:0">Benchmarks (v2.0.27)</h3>
+  <p>Measured on an Intel iMac with 10,000 sequential writes, 100,000 reads, and a working set of ~30,000 unique DAG objects. nedbd-v2 was running with <code>NEDBD_DAG=1</code> and AES-256-GCM enabled.</p>
+  <table class="ptbl">
+    <tr><th>Operation</th><th>Throughput</th><th>p50</th><th>p99</th></tr>
+    <tr><td>Sequential writes</td><td>418 ops/s</td><td>2.3 ms</td><td>3.3 ms</td></tr>
+    <tr><td>Point-lookup reads</td><td>478 ops/s</td><td>2.0 ms</td><td>3.0 ms</td></tr>
+    <tr><td>ORDER BY queries</td><td>489 ops/s</td><td>1.8 ms</td><td>4.3 ms</td></tr>
+    <tr><td>Batch writes (500 ops/req)</td><td>1,104 ops/s</td><td>0.9 ms</td><td>1.2 ms</td></tr>
+    <tr><td>Tamper-verify (30k objects)</td><td>~21,000 BLAKE2b/s</td><td>—</td><td>1.38 s total</td></tr>
+  </table>
+  <div class="note">
+    <p><strong>TCP_NODELAY matters.</strong> The axum listener sets <code>TCP_NODELAY</code> on every socket; without it, macOS loopback adds the Nagle algorithm's 40&ndash;200 ms delay on small writes &mdash; enough to drag p99 from 3.3 ms to 250 ms+.</p>
+  </div>
+  <p>Reproduce with the included benchmark:</p>
+  <div class="code-wrap">
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre>NEDBD_DAG=1 nedbd --data /tmp/perf &amp;
+python3 tests/test_dag_perf.py --n 10000 --reads 100000</pre>
   </div>
 </section>
 
@@ -487,13 +572,13 @@ nedbd</pre>
   <div class="code-wrap">
     <button class="copy-btn" onclick="copyCode(this)">COPY</button>
 <pre>python3 -c "import nedb; print(nedb.__version__)"
-<span class="cc"># 2.0.4</span>
+<span class="cc"># 2.0.27</span>
 
 nedbd
-<span class="cc"># nedbd 2.0.4 — http://127.0.0.1:7070  data=./nedb-data  auth=off  engine=aof</span>
+<span class="cc"># nedbd 2.0.27 — http://127.0.0.1:7070  data=./nedb-data  auth=off  engine=aof</span>
 
 nedbd --dag
-<span class="cc"># nedbd-v2 2.0.4 — http://127.0.0.1:7070  data=./nedb-data  auth=off  engine=dag</span></pre>
+<span class="cc"># nedbd-v2 2.0.27 — http://127.0.0.1:7070  data=./nedb-data  auth=off  engine=dag</span></pre>
   </div>
 
   <div class="note">
@@ -963,19 +1048,19 @@ db = NEDB(<span class="cs">"./mydata"</span>)
     <div class="code-label">shell</div>
     <button class="copy-btn" onclick="copyCode(this)">COPY</button>
 <pre>nedbd
-<span class="cc"># nedbd 2.0.4 — http://127.0.0.1:7070  data=./nedb-data  auth=off  engine=aof</span>
+<span class="cc"># nedbd 2.0.27 — http://127.0.0.1:7070  data=./nedb-data  auth=off  engine=aof</span>
 
 <span class="cc"># v2 DAG engine — pass --dag (or set NEDBD_DAG=1)</span>
 nedbd --dag --data ./data
-<span class="cc"># nedbd-v2 2.0.4 — http://127.0.0.1:7070  data=./data  engine=dag</span></pre>
+<span class="cc"># nedbd-v2 2.0.27 — http://127.0.0.1:7070  data=./data  engine=dag</span></pre>
   </div>
 
   <h3>Environment variables</h3>
   <table class="ptbl">
     <tr><th>Variable</th><th>Default</th><th>Description</th></tr>
     <tr><td><code>NEDBD_DAG</code></td><td><code>0</code></td><td>Set to <code>1</code> to launch the v2 DAG engine (<code>nedbd-v2</code>). Equivalent to passing <code>--dag</code>.</td></tr>
-    <tr><td><code>NEDBD_HOST</code></td><td><code>127.0.0.1</code></td><td>Bind address</td></tr>
-    <tr><td><code>NEDBD_PORT</code></td><td><code>7070</code></td><td>Bind port</td></tr>
+    <tr><td><code>NEDBD_HOST</code></td><td><code>127.0.0.1</code></td><td>Bind address. As of v2.0.27 the default is loopback (was <code>0.0.0.0</code>) &mdash; a security-hardening fix. Set explicitly to <code>0.0.0.0</code> to expose on all interfaces.</td></tr>
+    <tr><td><code>NEDBD_PORT</code></td><td><code>7070</code></td><td>Bind port.</td></tr>
     <tr><td><code>NEDBD_DATA</code></td><td><code>./nedb-data</code></td><td>Root directory for database files. Each database is a subdirectory.</td></tr>
     <tr><td><code>NEDBD_TOKEN</code></td><td>unset</td><td>Optional bearer token. If set, every <code>/v1/*</code> request must include <code>Authorization: Bearer &lt;token&gt;</code>.</td></tr>
     <tr><td><code>NEDB_TMK</code></td><td>unset</td><td>32-byte hex AES-256-GCM at-rest encryption key. Encrypts AOF (v1) or DAG objects (v2).</td></tr>
@@ -990,7 +1075,7 @@ nedbd --dag --data ./data
     <div class="code-label">shell — v2 DAG engine with encryption</div>
     <button class="copy-btn" onclick="copyCode(this)">COPY</button>
 <pre>NEDBD_DAG=<span class="cn">1</span> NEDB_TMK=<span class="cs">&lt;hex&gt;</span> nedbd --data ./data
-<span class="cc"># nedbd-v2 2.0.4 — http://127.0.0.1:7070  data=./data  engine=dag  enc=on</span></pre>
+<span class="cc"># nedbd-v2 2.0.27 — http://127.0.0.1:7070  data=./data  engine=dag  enc=on</span></pre>
   </div>
 </section>
 
@@ -1000,7 +1085,8 @@ nedbd --dag --data ./data
 
   <table class="rtbl">
     <tr><th>Route</th><th>Description</th></tr>
-    <tr><td><span class="method GET">GET</span><code>/health</code></td><td>Ping. Returns <code>{"ok": true, "version": "2.0.4", "engine": "aof" | "dag", "databases": [...]}</code>. No auth required.</td></tr>
+    <tr><td><span class="method GET">GET</span><code>/health</code></td><td>Ping. Returns <code>{"ok": true, "version": "2.0.27", "engine": "aof" | "dag", "startup_ready": true|false, "databases": [...]}</code>. No auth required.</td></tr>
+    <tr><td><span class="method GET">GET</span><code>/events</code></td><td><strong>New in v2.0.27.</strong> Server-Sent Events stream. Emits cold-scan progress (<code>event: scan</code>), the <code>event: ready</code> transition when <code>startup_ready</code> flips, and one <code>event: write</code> per mutation thereafter (each carrying <code>seq</code>, <code>coll</code>, and the updated Merkle <code>head</code>). Auth-gated like <code>/v1/*</code>. <code>curl http://127.0.0.1:7070/events</code></td></tr>
     <tr><td><span class="method GET">GET</span><code>/v1/databases</code></td><td>List all databases with summary (name, seq, head, rows, collections).</td></tr>
     <tr><td><span class="method POST">POST</span><code>/v1/databases</code></td><td>Create a database. Body: <code>{"name": "shop", "init": {...}}</code>. <code>init</code> is optional — see init schema below.</td></tr>
     <tr><td><span class="method GET">GET</span><code>/v1/databases/:name</code></td><td>Full detail: collections, indexes, seq, head, integrity check, recent log.</td></tr>
@@ -1070,6 +1156,17 @@ nedbd --dag --data ./data
     <button class="copy-btn" onclick="copyCode(this)">COPY</button>
 <pre>curl http://localhost:7070/v1/databases \
   -H <span class="cs">'Authorization: Bearer my-secret'</span></pre>
+  </div>
+  <div class="code-wrap">
+    <div class="code-label">Tail the SSE event stream (new in v2.0.27)</div>
+    <button class="copy-btn" onclick="copyCode(this)">COPY</button>
+<pre>curl http://127.0.0.1:7070/events
+<span class="cc"># event: scan</span>
+<span class="cc"># data: {"objects":730000,"of":1310703,"rate":21043,"eta_s":28}</span>
+<span class="cc"># event: ready</span>
+<span class="cc"># data: {"seq":1310703,"head":"b2:9c14e07a…"}</span>
+<span class="cc"># event: write</span>
+<span class="cc"># data: {"seq":1310704,"coll":"beliefs","head":"b2:7af3c11e…"}</span></pre>
   </div>
 </section>
 
@@ -1722,6 +1819,8 @@ redis-cli -p <span class="cn">6379</span> EVAL <span class="cs">"FROM users WHER
 <section class="section" id="changelog">
   <div class="section-tag">Release History</div>
   <h2>Changelog</h2>
+
+  <div class="cl-item"><span class="cl-ver">2.0.27</span><div class="cl-body"><h4>Warm start, deferred cold scan, SSE log stream, production hardening</h4><p><strong>MANIFEST warm start:</strong> nedbd loads <code>seq</code> and the Merkle <code>head</code> in O(1) on every restart after the first open &mdash; no scan, no replay, independent of dataset size. <strong>Deferred background cold scan:</strong> the server accepts connections immediately on first open; the integrity scan runs in a background thread with a live progress bar (rate + ETA). Reads serve instantly from the DAG; writes return <code>HTTP 503 startup in progress</code> until the <code>startup_ready</code> gate flips. <strong>GET /events:</strong> new Server-Sent Events endpoint streams cold-scan progress, the ready transition, and per-write events with the updated Merkle head. <strong>NEDBD_HOST=127.0.0.1 by default</strong> (was <code>0.0.0.0</code>) &mdash; security-hardening fix; set explicitly to <code>0.0.0.0</code> to expose. <strong>O(1) Merkle head:</strong> the BLAKE2b root is advanced incrementally on every write, never recomputed. <strong>IdIndex sharded across 256 subdirectories</strong> to keep directory listing fast at 1M+ documents. <strong>TCP_NODELAY on the axum listener:</strong> eliminates the 40&ndash;200 ms Nagle delay on macOS loopback. Production: <code>vision.interchained.org</code> is live on v2.0.27 with 1,310,703 sequences indexed at block height 620,989. Benchmarks (Intel iMac, 10k writes / 100k reads / 30k objects): 418/s writes (p99 3.3 ms), 478/s point reads (p99 3.0 ms), 489/s ORDER BY (p99 4.3 ms), 1,104 ops/s batch writes, 30k-object tamper-verify in 1.38 s (~21k BLAKE2b/sec).</p></div></div>
 
   <div class="cl-item"><span class="cl-ver">2.0.4</span><div class="cl-body"><h4>The DAG Engine — content-addressed Merkle DAG storage</h4><p>New storage substrate built around a content-addressed Merkle DAG. Every document version is an immutable, BLAKE2b-verified object. Launch with <code>nedbd --dag</code> or <code>NEDBD_DAG=1</code> &mdash; the launcher execs the new <code>nedbd-v2</code> Rust binary. <strong>Instant cold start</strong> (no AOF replay; multi-GB databases boot in milliseconds). <strong>No corruption possible</strong> (immutable hash-addressed objects; a corrupted byte changes the digest and is rejected by the DAG root). <strong>Real Merkle head</strong> (BLAKE2b root over the full DAG of every version ever written, on every response). <strong>Tombstone deletes</strong> (history is permanent; <code>AS OF</code> still resolves pre-delete values). <strong>One-way migration</strong> from v1 AOF: existing <code>log.aof</code> is scanned once and a new <code>dag/</code> directory is built alongside it. Same NQL, same API, same wire protocol &mdash; only the substrate changes. The v1 AOF engine remains available without <code>--dag</code>.</p></div></div>
 

@@ -19,9 +19,9 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 
 ---
 
-## v2 — The DAG Engine (new in 2.0.5)
+## v2 — The DAG Engine (current stable: 2.0.27)
 
-NEDB v2 replaces the append-only log (AOF) with a **content-addressed Merkle DAG**. Every document version is an immutable, BLAKE2b-verified object. Nothing is ever overwritten.
+NEDB v2 replaces the append-only log (AOF) with a **content-addressed Merkle DAG**. Every document version is an immutable, BLAKE2b-verified object. Nothing is ever overwritten. As of **v2.0.27**, restarts after the first open are **O(1) warm starts** (driven by a `MANIFEST` of `seq` + Merkle head), the **cold scan is deferred** so the daemon accepts connections immediately, and a new **`GET /events` SSE endpoint** streams scan progress + per-write events live.
 
 ```bash
 # Run the v2 DAG engine — ships inside pip install nedb-engine
@@ -30,20 +30,33 @@ nedbd --dag --data ./data
 NEDBD_DAG=1 NEDB_TMK=<32-byte-hex> nedbd --data ./data
 
 curl http://127.0.0.1:7070/health
-# {"ok":true,"version":"2.0.5","service":"nedbd","encrypted":true}
+# {"ok":true,"version":"2.0.27","service":"nedbd","engine":"dag","startup_ready":true,"encrypted":true}
+
+# Tail the live event stream (new in v2.0.27)
+curl http://127.0.0.1:7070/events
+# event: scan   data: {"objects":730000,"of":1310703,"rate":21043,"eta_s":28}
+# event: ready  data: {"seq":1310703,"head":"b2:9c14e07a…"}
+# event: write  data: {"seq":1310704,"coll":"beliefs","head":"b2:7af3c11e…"}
 ```
 
 | Property | v2 DAG | v1 AOF |
 |---|:---:|:---:|
 | Uncorruptable (atomic writes, hash-verified reads) | ✅ | ⚠️ |
-| Instant cold start (no AOF replay) | ✅ | ❌ |
+| O(1) warm start via MANIFEST (no scan, no replay) | ✅ | ❌ |
+| Deferred cold scan (socket open immediately) | ✅ | ❌ |
+| O(1) incremental Merkle head (never recomputed) | ✅ | ❌ |
 | Parallel writes (no global lock) | ✅ | ❌ |
 | BLAKE2b Merkle head on every response | ✅ | ❌ |
+| IdIndex sharded across 256 subdirectories | ✅ | ❌ |
+| TCP_NODELAY (no 40–200 ms loopback Nagle delay) | ✅ | ❌ |
+| `GET /events` SSE log stream | ✅ | ❌ |
 | Tombstone deletes (history preserved) | ✅ | ✅ |
 | Auto-migrates v1 AOF → v2 DAG on startup | ✅ | — |
 | Same HTTP API — Vision, Studio, all clients unchanged | ✅ | ✅ |
 
 **v1 AOF engine is still shipped and unchanged** — `nedbd` (no flag) runs v1.
+
+**Production status:** [vision.interchained.org](https://vision.interchained.org) is live on v2.0.27 — **1,310,703 sequences** indexed in the Vision database, AES-256-GCM encrypted at rest, at block height **620,989**.
 
 ---
 
@@ -203,10 +216,30 @@ db.seq();      // → BigInt
 nedbd runs NEDB as a long-lived process with an HTTP/JSON API and an optional RESP2 wire protocol. Built on a **single-writer group-commit sequencer** — parallel reads, batched durable writes, one hash-chain per database, zero write-write races.
 
 ```bash
-nedbd                                     # :7070, data ./nedb-data
+nedbd                                     # :7070, data ./nedb-data (v1 AOF engine)
+nedbd --dag --data ./data                 # v2 DAG engine (or NEDBD_DAG=1)
 NEDBD_RESP2_PORT=6380 nedbd               # also speak RESP2 (redis-cli compatible)
 nedbd --log-level 2                       # 0=errors 1=requests 2=deploy 3=verbose
+
+# Live event stream (new in v2.0.27) — SSE: scan progress, ready, per-write head
+curl http://127.0.0.1:7070/events
 ```
+
+### Startup modes (v2.0.27)
+
+- **Warm start** — every restart after the first open reads the `MANIFEST` file and restores `seq` + Merkle `head` in **O(1)**. No scan, no replay, independent of dataset size. Boots in milliseconds.
+- **Cold start** — first open of an existing dataset spawns the integrity scan in a background thread *and accepts connections immediately*. Reads serve instantly from the content-addressed DAG; writes return `HTTP 503 startup in progress` until the `startup_ready` gate flips. Progress (objects, rate, ETA) streams over `GET /events`.
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `NEDBD_DAG` | `0` | Set `1` to launch the v2 DAG engine (`nedbd-v2`). Same as `--dag`. |
+| `NEDBD_HOST` | `127.0.0.1` | Bind address. **v2.0.27** defaults to loopback (was `0.0.0.0`) — security hardening fix. Set explicitly to `0.0.0.0` to expose. |
+| `NEDBD_PORT` | `7070` | HTTP bind port. |
+| `NEDBD_TOKEN` | unset | Optional bearer token; required on every `/v1/*` request when set. |
+| `NEDB_TMK` | unset | 32-byte hex AES-256-GCM at-rest encryption key. |
+| `NEDBD_DATA` | `./nedb-data` | Root directory. v2 creates `dag/`, IdIndex sharded across **256 subdirectories**, and a small `MANIFEST` file. |
 
 ```bash
 # Create a database with seed data and relations
@@ -265,6 +298,18 @@ db.query('FROM policy AS OF 200 VALID AS OF "2024-02-15"')
 
 ## Performance
 
+**v2 DAG Rust server (v2.0.27, Intel iMac — 10k writes / 100k reads / 30k objects, AES-256-GCM on):**
+
+| Operation | Throughput | p50 | p99 |
+|---|---|---|---|
+| Sequential writes | **418 ops/s** | 2.3 ms | 3.3 ms |
+| Point-lookup reads | **478 ops/s** | 2.0 ms | 3.0 ms |
+| ORDER BY queries | **489 ops/s** | 1.8 ms | 4.3 ms |
+| Batch writes (500 ops/req) | **1,104 ops/s** | 0.9 ms | 1.2 ms |
+| Tamper-verify (30k objects) | ~21,000 BLAKE2b/sec | — | 1.38 s total |
+
+p99 latencies hold because of `TCP_NODELAY` on the axum listener — without it macOS loopback adds the Nagle algorithm's 40–200 ms delay on small writes.
+
 **v1 Python server (baseline — single-threaded AOF):**
 
 | Operation | Throughput | p99 latency |
@@ -275,9 +320,6 @@ db.query('FROM policy AS OF 200 VALID AS OF "2024-02-15"')
 | Point-lookup read (NQL) | ~23/s | 44 ms |
 | Rust napi PUT (FFI) | ~70K/s | — |
 | Rust napi GET (FFI) | ~330K/s | — |
-
-**v2 DAG Rust server — tokio/axum, no GIL, lock-free per-doc writes:**
-> Benchmarks in progress — target 5,000–50,000 ops/s. Run `python3 tests/test_dag_perf.py` against your own instance.
 
 Reproduce with the included benchmark:
 

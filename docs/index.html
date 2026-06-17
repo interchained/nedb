@@ -4,9 +4,9 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>NEDB — content-addressed Merkle DAG, bi-temporal, causal, embedded database</title>
-<meta name="description" content="NEDB v2.0.4 — content-addressed Merkle DAG storage, BLAKE2b-verified immutable objects, instant cold start, Rust v2 engine via --dag, bi-temporal queries, causal write provenance, AES-256-GCM encryption, SQL/Redis/MongoDB adapters, RESP2 wire protocol. pip install nedb-engine." />
-<meta property="og:title" content="NEDB v2.0.4 — The DAG Engine" />
-<meta property="og:description" content="Content-addressed Merkle DAG embedded database. Every document version is an immutable, BLAKE2b-verified object. Instant cold start, no AOF corruption possible. pip install nedb-engine." />
+<meta name="description" content="NEDB v2.0.27 — content-addressed Merkle DAG storage, BLAKE2b-verified immutable objects, instant warm start via MANIFEST, deferred cold scan, SSE log stream, Rust v2 engine via --dag, bi-temporal queries, causal write provenance, AES-256-GCM encryption, SQL/Redis/MongoDB adapters, RESP2 wire protocol. pip install nedb-engine." />
+<meta property="og:title" content="NEDB v2.0.27 — The DAG Engine" />
+<meta property="og:description" content="Content-addressed Merkle DAG embedded database. Every document version is an immutable, BLAKE2b-verified object. Instant warm start, deferred cold scan, SSE log stream. pip install nedb-engine." />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
@@ -121,9 +121,9 @@
 <section class="hero">
   <div class="wrap grid2">
     <div>
-      <span class="relpill">&#9679; <span class="v mono">v2.0.4</span> &mdash; The DAG Engine</span>
+      <span class="relpill">&#9679; <span class="v mono">v2.0.27</span> &mdash; The DAG Engine</span>
       <h1>NEDB</h1>
-      <p class="tag"><b>Content-addressed Merkle DAG</b> for embedded data. Every document version is an immutable, BLAKE2b-verified object &mdash; with bi-temporal queries, causal write provenance, and a Rust v2 engine. Instant cold start. No corruption possible.</p>
+      <p class="tag"><b>Content-addressed Merkle DAG</b> for embedded data. Every document version is an immutable, BLAKE2b-verified object &mdash; with bi-temporal queries, causal write provenance, and a Rust v2 engine. Instant warm start via MANIFEST. No corruption possible.</p>
       <div class="cta">
         <a class="btn btn-primary" href="https://github.com/Eth-Interchained/nedb">View on GitHub</a>
         <a class="btn btn-ghost" href="https://studio.interchained.org">NEDB Studio &rarr;</a>
@@ -175,20 +175,42 @@ db.<span class="f">query</span>(
 
 <section id="dag">
   <div class="wrap">
-    <div class="kick">v2.0.4 &middot; The DAG Engine</div>
-    <h2>Content-addressed Merkle DAG &mdash; instant cold start, zero corruption</h2>
-    <p class="lede">NEDB v2.0.4 introduces a new storage substrate built around an immutable, content-addressed Merkle DAG. Every document version is hashed with BLAKE2b and stored as an addressable object. There is no AOF to replay, no log to corrupt, and no rebuild step on open. Boot is constant-time; the head hash is a real Merkle root over the entire DAG.</p>
+    <div class="kick">v2.0.27 &middot; The DAG Engine</div>
+    <h2>Content-addressed Merkle DAG &mdash; instant warm start, deferred cold scan, zero corruption</h2>
+    <p class="lede">NEDB v2.0.27 ships the production DAG substrate: every document version is hashed with BLAKE2b and stored as an immutable, addressable object. On restart, <b>MANIFEST</b> restores <span class="mono">seq</span> and the Merkle head in O(1). On the first open of an existing dataset, the daemon accepts connections immediately and runs a <b>deferred background cold scan</b> with a live progress bar; reads work instantly while writes return <span class="mono">503 startup in progress</span> until the scan completes. The Merkle head is updated incrementally on every write &mdash; never recomputed.</p>
     <div class="cards">
       <div class="card"><div class="ic">&#127760;</div><h3>Content-addressed objects</h3><p>Every <span class="mono">put</span> writes an immutable object keyed by its BLAKE2b digest. Identical values dedup automatically. Document history is a real DAG of versions, not a sequential log.</p></div>
-      <div class="card"><div class="ic">&#9889;</div><h3>Instant cold start</h3><p>No AOF replay. Open a multi-GB database in milliseconds &mdash; the engine reads the head, verifies the root, and is ready. Restart time is independent of dataset size.</p></div>
+      <div class="card"><div class="ic">&#9889;</div><h3>MANIFEST warm start</h3><p><span class="mono">nedbd</span> loads <span class="mono">seq</span> and the current Merkle <span class="mono">head</span> in O(1) from a small <span class="mono">MANIFEST</span> file. Subsequent restarts after the first open are instant &mdash; no scan, no replay, independent of dataset size.</p></div>
+      <div class="card"><div class="ic">&#9203;</div><h3>Deferred cold scan</h3><p>First open of an existing dataset accepts connections immediately. A background thread runs the integrity scan with a live progress bar (rate + ETA); reads serve instantly, writes return <span class="mono">503 startup in progress</span> until the <span class="mono">startup_ready</span> gate flips.</p></div>
       <div class="card"><div class="ic">&#128737;</div><h3>No corruption possible</h3><p>Objects are immutable and hash-addressed; a corrupted byte changes its hash and the DAG simply ignores it. There is no partially-written AOF tail to recover.</p></div>
-      <div class="card"><div class="ic">&#129518;</div><h3>Rust v2 engine</h3><p>Run with <span class="mono">nedbd --dag</span> or <span class="mono">NEDBD_DAG=1</span> to launch the new <span class="mono">nedbd-v2</span> binary &mdash; a pure Rust core built around the DAG, with the v1 wire protocol preserved.</p></div>
-      <div class="card"><div class="ic">&#128279;</div><h3>Real Merkle head</h3><p>Every response includes the current BLAKE2b Merkle head over the full DAG &mdash; anchorable on-chain, comparable across replicas, sufficient to prove the full history at a point in time.</p></div>
+      <div class="card"><div class="ic">&#129518;</div><h3>Rust v2 engine</h3><p>Run with <span class="mono">nedbd --dag</span> or <span class="mono">NEDBD_DAG=1</span> to launch the <span class="mono">nedbd-v2</span> binary &mdash; tokio + axum with <span class="mono">TCP_NODELAY</span>, IdIndex sharded across 256 subdirectories for million-doc scale, and O(1) incremental Merkle head updates.</p></div>
+      <div class="card"><div class="ic">&#128279;</div><h3>O(1) Merkle head</h3><p>The BLAKE2b Merkle head is updated incrementally on every write &mdash; never recomputed. Every response carries the current root over the full DAG of every version ever written, anchorable on-chain, comparable across replicas.</p></div>
       <div class="card"><div class="ic">&#128465;</div><h3>Tombstone deletes</h3><p>Deletes are tombstone objects in the DAG. History never disappears; <span class="mono">AS OF</span> still sees the pre-delete value, and the head hash still commits to every version ever written.</p></div>
     </div>
     <div class="install" style="margin-top:22px">
       <code class="mono"><span class="accent">$</span> nedbd --dag --data ./data                <span class="c"># launch v2 engine</span></code>
       <code class="mono"><span class="accent">$</span> NEDBD_DAG=<span class="n">1</span> NEDB_TMK=<span class="s">&lt;hex&gt;</span> nedbd --data ./data <span class="c"># env-driven, encrypted</span></code>
+      <code class="mono"><span class="accent">$</span> curl http://127.0.0.1:7070/events          <span class="c"># SSE — real-time log stream</span></code>
+    </div>
+  </div>
+</section>
+
+<section id="production">
+  <div class="wrap">
+    <div class="kick">Production</div>
+    <h2>In production at vision.interchained.org</h2>
+    <p class="lede">NEDB v2.0.27 is serving the Vision DAG engine at <span class="mono">vision.interchained.org</span>: <b>1,310,703</b> sequences indexed, AES-256-GCM encrypted at rest, live at block height <b>620,989</b>. Warm starts return in O(1); cold scans run deferred behind the live socket.</p>
+    <div class="gram" style="margin-top:18px">
+      <table>
+        <thead><tr><th>Operation (10k writes / 100k reads / 30k objects, Intel iMac)</th><th>Throughput</th><th>p50 / p99</th></tr></thead>
+        <tbody>
+          <tr><td>Sequential writes</td><td>418/s</td><td>2.3 ms / 3.3 ms</td></tr>
+          <tr><td>Point-lookup reads</td><td>478/s</td><td>2.0 ms / 3.0 ms</td></tr>
+          <tr><td>ORDER BY queries</td><td>489/s</td><td>1.8 ms / 4.3 ms</td></tr>
+          <tr><td>Batch writes (500 ops/req)</td><td>1,104 ops/s</td><td>0.9 ms / 1.2 ms</td></tr>
+          <tr><td>Tamper-verify (30k objects)</td><td>~21k BLAKE2b/sec</td><td>1.38 s total</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 </section>
@@ -240,6 +262,7 @@ db.<span class="f">query</span>(
     <div class="kick">Release highlights</div>
     <h2>What's new</h2>
     <div class="rel">
+      <div class="relrow"><div class="ver">v2.0.27</div><div><h3>Warm start + deferred cold scan + SSE log stream</h3><p>MANIFEST loads <span class="mono">seq</span> and the Merkle head in O(1) on every restart after the first open. Deferred background cold scan accepts connections immediately while reads serve instantly; writes return <span class="mono">503 startup in progress</span> until the <span class="mono">startup_ready</span> gate flips. New <span class="mono">GET /events</span> SSE endpoint for real-time log streaming. <span class="mono">NEDBD_HOST</span> now defaults to <span class="mono">127.0.0.1</span> (security fix). <span class="mono">TCP_NODELAY</span> on the axum listener eliminates the macOS loopback Nagle delay. IdIndex sharded into 256 subdirectories for 1M+ doc scale. Production: 1,310,703 sequences indexed in <span class="mono">vision.interchained.org</span>.</p></div></div>
       <div class="relrow"><div class="ver">v2.0.4</div><div><h3>The DAG Engine</h3><p>Content-addressed Merkle DAG storage. Every document version is an immutable, BLAKE2b-verified object. <span class="mono">nedbd --dag</span> (or <span class="mono">NEDBD_DAG=1</span>) runs the Rust v2 engine. Instant cold start, no corruption possible, real Merkle head on every response.</p></div></div>
       <div class="relrow"><div class="ver">v1.0.5</div><div><h3>Bi-temporal stability &amp; Studio GA</h3><p>Production-hardened <span class="mono">VALID AS OF</span> indexing, improved self-healing on corrupt segments, and NEDB Studio goes generally available at <span class="mono">studio.interchained.org</span> &mdash; prompt-to-database GUI with live chain inspection.</p></div></div>
       <div class="relrow"><div class="ver">v1.0.x</div><div><h3>Rust native core (napi-rs + PyO3)</h3><p>Same compiled Rust core surfaces to Node via napi-rs and to Python via maturin/PyO3. Both <span class="mono">npm install nedb-engine</span> and <span class="mono">pip install nedb-engine</span> ship native binaries with a pure fallback.</p></div></div>
@@ -256,7 +279,7 @@ db.<span class="f">query</span>(
     <div>
       <div class="kick">Run it as a server</div>
       <h2>nedbd</h2>
-      <p class="lede"><span class="mono">pip install nedb-engine</span> or <span class="mono">npm install nedb-engine</span> ships the daemon. Pass <span class="mono">--dag</span> (or set <span class="mono">NEDBD_DAG=1</span>) to launch the v2 Rust engine binary <span class="mono">nedbd-v2</span> with the content-addressed Merkle DAG. Connect clients over HTTP, RESP2, SQL, or MongoDB wire &mdash; whichever fits your stack. The group-commit sequencer handles concurrent access safely.</p>
+      <p class="lede"><span class="mono">pip install nedb-engine</span> or <span class="mono">npm install nedb-engine</span> ships the daemon. Pass <span class="mono">--dag</span> (or set <span class="mono">NEDBD_DAG=1</span>) to launch the v2 Rust engine binary <span class="mono">nedbd-v2</span> with the content-addressed Merkle DAG. Connect clients over HTTP, RESP2, SQL, or MongoDB wire &mdash; whichever fits your stack. Watch writes happen live via the <span class="mono">/events</span> SSE stream. MANIFEST gives O(1) warm starts; the deferred cold scan keeps the socket open immediately.</p>
     </div>
     <div class="code">
       <div class="bar"><span class="d r"></span><span class="d y"></span><span class="d g"></span><span class="fn mono">shell</span></div>
@@ -274,8 +297,13 @@ db.<span class="f">query</span>(
 <span class="accent">$</span> curl -X POST localhost:7070/v1/databases/agents/query \
     -d <span class="s">'{"nql":"FROM beliefs AS OF 200 VALID AS OF \"2024-06-15\" WHERE confidence > 0.8 TRACE caused_by"}'</span>
 
-<span class="c"># env: NEDBD_DAG · NEDBD_PORT · NEDBD_DATA</span>
-<span class="c">#      NEDBD_TOKEN · NEDB_TMK (AES-256-GCM key)</span></pre>
+<span class="c"># Real-time log stream (SSE) — new in v2.0.27</span>
+<span class="accent">$</span> curl http://127.0.0.1:7070/events
+<span class="c"># event: write</span>
+<span class="c"># data: {"seq":42,"coll":"beliefs","head":"b2:7af3…"}</span>
+
+<span class="c"># env: NEDBD_DAG · NEDBD_HOST (127.0.0.1) · NEDBD_PORT</span>
+<span class="c">#      NEDBD_DATA · NEDBD_TOKEN · NEDB_TMK (AES-256-GCM key)</span></pre>
     </div>
   </div>
 </section>
@@ -302,7 +330,7 @@ db.<span class="f">query</span>(
   <div class="wrap row">
     <div>
       <div class="brand" style="margin-bottom:7px"><span class="dot"></span> NEDB</div>
-      <div>v2.0.4 &middot; GPL-3.0-or-later &middot; &copy; <a href="https://interchained.org">INTERCHAINED, LLC</a> &middot; built with <a href="https://aiassist.net">AiAssist</a></div>
+      <div>v2.0.27 &middot; GPL-3.0-or-later &middot; &copy; <a href="https://interchained.org">INTERCHAINED, LLC</a> &middot; built with <a href="https://aiassist.net">AiAssist</a></div>
     </div>
     <nav class="nav-links">
       <a href="https://github.com/Eth-Interchained/nedb">GitHub</a>
