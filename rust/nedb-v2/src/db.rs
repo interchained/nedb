@@ -1,7 +1,9 @@
 //! Main DAG database — coordinates ObjectStore, IdIndex, SortedIndexes, GraphStore.
 
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use anyhow::Result;
 use serde_json::Value;
 use parking_lot::RwLock;
@@ -11,6 +13,15 @@ use crate::index::{IdIndex, OrderedValue, SortedIndexes};
 use crate::graph::GraphStore;
 use crate::migrate;
 
+/// MANIFEST: cached {seq, head} written atomically after every write.
+/// On startup, if MANIFEST exists and no sorted indexes need rebuilding,
+/// startup is O(1) — just read this one file instead of scanning all objects.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Manifest {
+    seq:  u64,
+    head: String,
+}
+
 pub struct Db {
     pub objects:        ObjectStore,
     pub id_index:       IdIndex,
@@ -19,9 +30,12 @@ pub struct Db {
     pub root:           PathBuf,
     pub seq:            AtomicU64,
     /// Cached Merkle head — updated incrementally on every write (O(1)).
-    /// BLAKE2b(prev_head || new_object_hash). Eliminates the O(n) full
-    /// recompute that was blocking every server response.
     head:               RwLock<String>,
+    /// True once startup is fully ready (MANIFEST loaded or cold scan complete).
+    /// Warm starts set this true before returning from open().
+    /// Cold starts set this true in the background thread when scan completes.
+    /// Writes are held with 503 until this is true; reads always proceed.
+    pub startup_ready:  Arc<AtomicBool>,
 }
 
 impl Db {
@@ -42,6 +56,7 @@ impl Db {
             root: db_root.to_path_buf(),
             seq:  AtomicU64::new(0),
             head: RwLock::new(String::new()),
+            startup_ready: Arc::new(AtomicBool::new(false)),
         };
 
         // Auto-migrate v1 → v2 if needed (pass DEK so encrypted AOFs convert correctly)
@@ -54,49 +69,64 @@ impl Db {
             dek.as_ref(),
         )?;
 
-        // Rebuild sorted indexes + find max seq from existing objects
-        db.rebuild_from_objects()?;
+        // Fast startup: load seq+head from MANIFEST if no sorted indexes need rebuilding.
+        // Falls back to full object scan only when necessary (first open, or post-migration).
+        db.startup_rebuild()?;
 
         Ok(db)
     }
 
-    /// Rebuild in-memory sorted indexes, max seq, and Merkle head from the object store.
-    /// This is O(n_objects) but fully parallel via Rayon. Runs once on cold start.
-    fn rebuild_from_objects(&mut self) -> Result<()> {
-        use rayon::prelude::*;
-        use blake2::{Blake2b512, Digest};
+    /// Smart startup:
+    /// - Warm (MANIFEST exists): O(1) load → startup_ready = true immediately.
+    /// - Cold (no MANIFEST): start server immediately, run scan in background thread.
+    ///   Writes return 503 until scan completes; reads always proceed.
+    fn startup_rebuild(&mut self) -> Result<()> {
+        let manifest_path = self.root.join("MANIFEST");
+        let needs_index_rebuild = !self.sorted_indexes.is_empty();
 
-        let hashes: Vec<String> = self.objects.all_hashes().collect();
-        let nodes: Vec<Node> = hashes.par_iter()
-            .filter_map(|h| self.objects.read(h).ok())
-            .collect();
-
-        let max_seq = nodes.iter().map(|n| n.seq).max().unwrap_or(0);
-        self.seq.store(max_seq + 1, Ordering::SeqCst);
-
-        for node in &nodes {
-            if let Value::Object(ref obj) = node.data {
-                for (field, value) in obj {
-                    if self.sorted_indexes.has(&node.coll, field) {
-                        self.sorted_indexes.insert(&node.coll, field, value, &node.hash);
-                    }
-                }
+        // Warm path: MANIFEST + no sorted indexes to rebuild → instant start
+        if manifest_path.exists() && !needs_index_rebuild {
+            if let Some(m) = fs::read_to_string(&manifest_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Manifest>(&s).ok())
+            {
+                self.seq.store(m.seq + 1, Ordering::SeqCst);
+                *self.head.write() = m.head.clone();
+                self.startup_ready.store(true, Ordering::SeqCst);
+                println!("  [nedbd] warm start — seq={} head={}...", m.seq, &m.head[..8]);
+                return Ok(());
             }
+            eprintln!("  [nedbd] MANIFEST corrupt, falling back to cold scan");
         }
 
-        // Bootstrap the running Merkle head: sort all hashes (deterministic),
-        // then chain them with BLAKE2b. This is done ONCE on startup.
-        let mut sorted_hashes = hashes;
-        sorted_hashes.sort();
-        let mut h = Blake2b512::new();
-        h.update(max_seq.to_le_bytes());
-        for hash in &sorted_hashes {
-            h.update(hash.as_bytes());
-        }
-        *self.head.write() = hex::encode(&h.finalize()[..32]);
+        // Cold path: spawn background thread, server starts immediately
+        // Writes are gated on startup_ready until scan completes.
+        let ready_flag  = Arc::clone(&self.startup_ready);
+        let root        = self.root.clone();
+        let objects_ref = unsafe {
+            // SAFETY: Db outlives the background thread because Arc<Db> keeps it alive.
+            // We pass a raw pointer to avoid cloning the ObjectStore.
+            &self.objects as *const ObjectStore
+        };
+        let head_ref = unsafe { &self.head as *const RwLock<String> };
+        let seq_ref  = unsafe { &self.seq  as *const AtomicU64 };
+        let si_ref   = unsafe { &self.sorted_indexes as *const SortedIndexes };
+
+        println!("  [nedbd] cold start — background scan starting, server accepting reads now");
+
+        std::thread::spawn(move || {
+            // SAFETY: Db is kept alive by Arc<Db> in Manager for the server's lifetime.
+            let objects        = unsafe { &*objects_ref };
+            let head           = unsafe { &*head_ref };
+            let seq_atomic     = unsafe { &*seq_ref };
+            let sorted_indexes = unsafe { &*si_ref };
+            cold_scan_background(root, objects, head, seq_atomic, sorted_indexes, ready_flag);
+        });
 
         Ok(())
     }
+
+}
 
     /// Write a document. Returns the new node with its content hash set.
     pub fn put(
@@ -172,6 +202,21 @@ impl Db {
         h.update(seq.to_le_bytes());
         h.update(new_hash.as_bytes());
         *self.head.write() = hex::encode(&h.finalize()[..32]);
+        // Persist MANIFEST so next startup is instant
+        self.flush_manifest();
+    }
+
+    /// Atomically persist current seq+head to MANIFEST.
+    fn flush_manifest(&self) {
+        let seq  = self.seq.load(Ordering::SeqCst);
+        let head = self.head.read().clone();
+        let m = Manifest { seq, head };
+        if let Ok(json) = serde_json::to_string(&m) {
+            let path = self.root.join("MANIFEST");
+            let tmp  = self.root.join("MANIFEST.tmp");
+            let _ = fs::write(&tmp, &json);
+            let _ = fs::rename(&tmp, &path);
+        }
     }
 
     /// Return the current Merkle head string. O(1) — read from cache.
@@ -308,6 +353,92 @@ impl Db {
             }
         }
     }
+}
+
+/// Background cold-scan worker. Called from a std::thread spawned by startup_rebuild().
+/// Reads all objects, rebuilds seq/head/sorted-indexes, writes MANIFEST, sets ready flag.
+fn cold_scan_background(
+    root:           PathBuf,
+    objects:        *const ObjectStore,
+    head:           *const RwLock<String>,
+    seq_atomic:     *const AtomicU64,
+    sorted_indexes: *const SortedIndexes,
+    ready_flag:     Arc<AtomicBool>,
+) {
+    use rayon::prelude::*;
+    use blake2::{Blake2b512, Digest};
+
+    // SAFETY: caller guarantees Db outlives this thread (Arc<Db> in Manager).
+    let objects        = unsafe { &*objects };
+    let head           = unsafe { &*head };
+    let seq_atomic     = unsafe { &*seq_atomic };
+    let sorted_indexes = unsafe { &*sorted_indexes };
+
+    let hashes: Vec<String> = objects.all_hashes().collect();
+    let total = hashes.len();
+
+    if total == 0 {
+        ready_flag.store(true, Ordering::SeqCst);
+        return;
+    }
+
+    println!("  [nedbd] background scan — {} objects...", total);
+    let t0 = std::time::Instant::now();
+    let step = (total / 10).max(1000);
+
+    let nodes: Vec<Node> = hashes.par_iter()
+        .enumerate()
+        .filter_map(|(i, h)| {
+            if i > 0 && i % step == 0 {
+                let pct     = i * 100 / total;
+                let elapsed = t0.elapsed().as_secs_f32();
+                let rate    = i as f32 / elapsed;
+                let eta     = (total - i) as f32 / rate;
+                eprint!("\r  [nedbd]   {:>3}%  {:>8,} / {:>8,}  ({:>8,.0}/s  eta {:.0}s)   ",
+                    pct, i, total, rate, eta);
+            }
+            objects.read(h).ok()
+        })
+        .collect();
+
+    eprintln!("\r  [nedbd]   100%  {:>8,} / {:>8,}  ({:.1}s)                        ",
+        total, total, t0.elapsed().as_secs_f32());
+
+    let max_seq = nodes.iter().map(|n| n.seq).max().unwrap_or(0);
+    seq_atomic.store(max_seq + 1, Ordering::SeqCst);
+
+    for node in &nodes {
+        if let Value::Object(ref obj) = node.data {
+            for (field, value) in obj {
+                if sorted_indexes.has(&node.coll, field) {
+                    sorted_indexes.insert(&node.coll, field, value, &node.hash);
+                }
+            }
+        }
+    }
+
+    // Compute Merkle head from sorted hashes
+    let mut sorted_hashes = hashes;
+    sorted_hashes.sort();
+    let mut h = Blake2b512::new();
+    h.update(max_seq.to_le_bytes());
+    for hash_str in &sorted_hashes {
+        h.update(hash_str.as_bytes());
+    }
+    let new_head = hex::encode(&h.finalize()[..32]);
+    *head.write() = new_head.clone();
+
+    // Write MANIFEST atomically
+    let m     = Manifest { seq: max_seq, head: new_head };
+    let json  = serde_json::to_string(&m).unwrap_or_default();
+    let path  = root.join("MANIFEST");
+    let tmp   = root.join("MANIFEST.tmp");
+    let _ = fs::write(&tmp, &json);
+    let _ = fs::rename(&tmp, &path);
+
+    // Signal server: writes can now proceed
+    ready_flag.store(true, Ordering::SeqCst);
+    println!("  [nedbd] background scan complete — seq={} objects={} MANIFEST written", max_seq, total);
 }
 
 fn now() -> f64 {

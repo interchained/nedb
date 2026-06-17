@@ -13,24 +13,41 @@ use std::sync::Arc;
 use axum::{
     extract::{Path as AxPath, State, Query as AxQuery},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Response, sse::{Event, KeepAlive, Sse}},
     routing::{delete, get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt as _;
 
 use crate::db::Db;
 use crate::nql;
 use crate::store::Node;
 
+// ── Log channel — broadcast to all /events SSE subscribers ────────────────────
+
+const LOG_CHANNEL_CAP: usize = 512;
+
+/// Send a timestamped log line to both stdout and all /events subscribers.
+macro_rules! nlog {
+    ($tx:expr, $($arg:tt)*) => {{
+        let line = format!($($arg)*);
+        println!("{}", line);
+        let _ = $tx.send(line);
+    }};
+}
+
 // ── Manager ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct Manager {
-    inner: Arc<RwLock<ManagerInner>>,
+    inner:     Arc<RwLock<ManagerInner>>,
     pub token: Option<String>,
+    /// Broadcast channel — every log line goes here; /events streams them.
+    pub log_tx: broadcast::Sender<String>,
 }
 
 struct ManagerInner {
@@ -41,6 +58,7 @@ struct ManagerInner {
 
 impl Manager {
     pub fn new(data_dir: &Path, tmk: Option<[u8; 32]>, token: Option<String>) -> Self {
+        let (log_tx, _) = broadcast::channel(LOG_CHANNEL_CAP);
         Self {
             inner: Arc::new(RwLock::new(ManagerInner {
                 data_dir: data_dir.to_path_buf(),
@@ -48,6 +66,7 @@ impl Manager {
                 tmk,
             })),
             token,
+            log_tx,
         }
     }
 
@@ -68,16 +87,17 @@ impl Manager {
                 names.push(entry.file_name().to_string_lossy().to_string());
             }
         }
+        let log_tx = self.log_tx.clone();
         let mut inner = self.inner.write().await;
         for name in names {
             let db_path = inner.data_dir.join(&name);
             let dek = tmk.map(|k| crate::store::Dek::from_tmk(&k, name.as_bytes()));
             match Db::open(&db_path, dek) {
                 Ok(db) => {
-                    println!("  [nedbd] opened database {:?}", name);
+                    nlog!(log_tx, "  [nedbd] opened database {:?}", name);
                     inner.dbs.insert(name, Arc::new(db));
                 }
-                Err(e) => eprintln!("  [nedbd] failed to open {:?}: {}", name, e),
+                Err(e) => nlog!(log_tx, "  [nedbd] ERROR opening {:?}: {}", name, e),
             }
         }
         Ok(())
@@ -110,6 +130,13 @@ impl Manager {
 
     async fn names(&self) -> Vec<String> {
         self.inner.read().await.dbs.keys().cloned().collect()
+    }
+
+    /// Emit a log line to stdout and all /events SSE subscribers.
+    pub fn log(&self, msg: impl Into<String>) {
+        let line = msg.into();
+        println!("{}", line);
+        let _ = self.log_tx.send(line);
     }
 
     fn check_auth(&self, headers: &HeaderMap) -> bool {
@@ -278,6 +305,12 @@ async fn put_document(
         }
         Some(db) => db,
     };
+    // Block writes until background startup scan completes (cold start only).
+    // Reads and queries always proceed immediately.
+    if !db.startup_ready.load(std::sync::atomic::Ordering::SeqCst) {
+        return err(StatusCode::SERVICE_UNAVAILABLE,
+            "database startup in progress — reads available, writes retry in a moment");
+    }
     let caused_by = body.caused_by.unwrap_or_default();
     match db.put(&body.coll, &body.id, body.doc, caused_by, body.valid_from, body.valid_to) {
         Ok(node) => {
@@ -344,6 +377,10 @@ async fn batch_operations(
         Some(db) => db,
     };
 
+    if !db.startup_ready.load(std::sync::atomic::Ordering::SeqCst) {
+        return err(StatusCode::SERVICE_UNAVAILABLE,
+            "database startup in progress — reads available, writes retry in a moment");
+    }
     let mut results = vec![];
     for op in body.ops {
         let op_type = op.op.to_lowercase();
@@ -464,11 +501,25 @@ async fn get_log(
     ok(json!({"log": log_entries, "seq": seq, "head": head}))
 }
 
+// ── SSE log stream — GET /events ──────────────────────────────────────────────
+
+async fn log_events(State(mgr): State<Manager>) -> Sse<impl futures_core::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let rx = mgr.log_tx.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|msg| {
+        match msg {
+            Ok(line) => Some(Ok(Event::default().data(line))),
+            Err(_)   => None,  // lagged — skip
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 pub fn router(mgr: Manager) -> Router {
     Router::new()
         .route("/health",                                  get(health))
+        .route("/events",                                  get(log_events))
         .route("/v1/databases",                            get(list_databases).post(create_database))
         .route("/v1/databases/:name",                      get(get_database).delete(drop_database))
         .route("/v1/databases/:name/query",                post(query_database))

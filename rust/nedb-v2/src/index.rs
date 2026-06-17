@@ -233,6 +233,11 @@ impl SortedIndexes {
     pub fn has(&self, coll: &str, field: &str) -> bool {
         self.inner.contains_key(&(coll.to_string(), field.to_string()))
     }
+
+    /// True if no sorted indexes have been registered yet.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
 }
 
 #[cfg(test)]

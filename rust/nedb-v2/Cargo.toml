@@ -1,6 +1,6 @@
 [package]
 name        = "nedb-core-v2"
-version     = "2.0.17"
+version     = "2.0.20"
 edition     = "2021"
 description = "NEDB v2 — content-addressed DAG storage engine with NQL and HTTP server"
 license     = "BUSL-1.1"
@@ -31,7 +31,11 @@ parking_lot  = "0.12"
 # HTTP server
 axum         = { version = "0.7", features = ["json", "query"] }
 tokio        = { version = "1",   features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http   = { version = "0.5", features = ["cors"] }
+
+# SSE log streaming
+futures-core = "0.3"
 
 # Error handling
 thiserror    = "1"
