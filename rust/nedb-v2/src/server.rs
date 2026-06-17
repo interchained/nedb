@@ -586,14 +586,50 @@ pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, t
     print!("{}", banner);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app)
-        .tcp_nodelay(true)
-        .with_graceful_shutdown(async {
+
+    // ── Scheduled hourly checkpoint ────────────────────────────────────────────
+    // Flush MANIFEST every hour aligned to the system clock (top of the hour).
+    // Ensures warm-start data is always fresh even on long-running servers.
+    let mgr_hourly = mgr_for_shutdown.clone();
+    tokio::spawn(async move {
+        loop {
+            // Sleep until the next top-of-hour boundary
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs()).unwrap_or(0);
+            let secs_into_hour = now_secs % 3600;
+            let sleep_secs = 3600 - secs_into_hour;
+            tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
+            mgr_hourly.flush_all().await;
+            println!("  [nedbd] hourly checkpoint — manifests flushed");
+        }
+    });
+
+    // ── Graceful shutdown: SIGINT (Ctrl+C) + SIGTERM (systemctl stop) ─────────
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).unwrap();
+            let mut sigint  = signal(SignalKind::interrupt()).unwrap();
+            tokio::select! {
+                _ = sigterm.recv() => println!("  [nedbd] SIGTERM — flushing and exiting..."),
+                _ = sigint.recv()  => println!("  [nedbd] SIGINT  — flushing and exiting..."),
+            }
+        }
+        #[cfg(not(unix))]
+        {
             tokio::signal::ctrl_c().await.ok();
             println!("  [nedbd] shutting down — flushing manifests...");
-        })
+        }
+    };
+
+    axum::serve(listener, app)
+        .tcp_nodelay(true)
+        .with_graceful_shutdown(shutdown)
         .await?;
-    // Flush all manifest files before exit
+
+    // Final flush on exit
     mgr_for_shutdown.flush_all().await;
     println!("  [nedbd] goodbye");
     Ok(())
