@@ -210,11 +210,11 @@ impl Manager {
         }
     }
 
-    /// Flush all open databases — call on graceful shutdown.
+    /// Flush all open databases (id-index WAL + MANIFEST) — call on graceful shutdown.
     pub async fn flush_all(&self) {
         let inner = self.inner.read().await;
         for db in inner.dbs.values() {
-            db.flush_manifest_if_dirty();
+            db.flush_all();  // WAL + manifest
         }
     }
 

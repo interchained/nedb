@@ -88,24 +88,68 @@ fn id_shard(id: &str) -> String {
 }
 
 /// Per-document ID index — atomic file-per-doc, sharded across 256 subdirs.
+///
+/// Write path: updates go to `write_buf` (DashMap, zero I/O, lock-free).
+/// Background ticker calls `flush_write_buf()` every 1s — Rayon-parallel disk writes.
+/// Read path: `write_buf` checked first (latest value), then disk.
+/// This eliminates per-PUT `fs::rename` from the hot path, fixing concurrent write contention.
 pub struct IdIndex {
-    root: PathBuf,
+    root:      PathBuf,
     /// In-memory store: (coll, id) → hash. None = disk-backed (normal mode).
-    mem:  Option<Arc<dashmap::DashMap<(String, String), String>>>,
+    mem:       Option<Arc<dashmap::DashMap<(String, String), String>>>,
+    /// WAL write buffer — disk-backed mode buffers here, flushed to disk periodically.
+    write_buf: Arc<dashmap::DashMap<(String, String), Option<String>>>,  // None = tombstone
 }
 
 impl IdIndex {
     pub fn new(db_root: &Path) -> Result<Self> {
         let root = db_root.join("indexes");
         fs::create_dir_all(&root)?;
-        Ok(Self { root, mem: None })
+        Ok(Self { root, mem: None, write_buf: Arc::new(dashmap::DashMap::new()) })
     }
 
     /// Create a pure in-memory id index — no disk I/O.
     pub fn in_memory() -> Self {
         Self {
-            root: PathBuf::from(":memory:"),
-            mem:  Some(Arc::new(dashmap::DashMap::new())),
+            root:      PathBuf::from(":memory:"),
+            mem:       Some(Arc::new(dashmap::DashMap::new())),
+            write_buf: Arc::new(dashmap::DashMap::new()),
+        }
+    }
+
+    /// Flush the WAL write buffer to disk in parallel. Called by the background ticker.
+    /// No-op for in-memory databases. Safe to call concurrently with writes.
+    pub fn flush_write_buf(&self) {
+        if self.mem.is_some() || self.write_buf.is_empty() { return; }
+        use rayon::prelude::*;
+        // Drain all pending entries and write them in parallel
+        let entries: Vec<((String, String), Option<String>)> = self.write_buf
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        entries.par_iter().for_each(|((coll, id), hash_opt)| {
+            match hash_opt {
+                Some(hash) => {
+                    // Write/update: tmp → rename
+                    let path = self.path(coll, id);
+                    if let Some(parent) = path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let tmp = path.with_extension("tmp");
+                    if fs::write(&tmp, hash).is_ok() {
+                        let _ = fs::rename(&tmp, &path);
+                    }
+                }
+                None => {
+                    // Tombstone: remove the file
+                    let path = self.path(coll, id);
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        });
+        // Clear flushed entries
+        for ((coll, id), _) in &entries {
+            self.write_buf.remove(&(coll.clone(), id.clone()));
         }
     }
 
@@ -119,30 +163,39 @@ impl IdIndex {
     }
 
     /// Get the current object hash for a document.
+    /// Checks WAL write buffer first (most recent), then disk.
     pub fn get(&self, coll: &str, id: &str) -> Option<String> {
         if let Some(ref mem) = self.mem {
             return mem.get(&(coll.to_string(), id.to_string())).map(|v| v.clone());
         }
+        // Check WAL buffer first — may have an unflushed write or tombstone
+        let key = (coll.to_string(), id.to_string());
+        if let Some(entry) = self.write_buf.get(&key) {
+            return entry.value().clone();  // None = tombstoned
+        }
+        // Fall through to disk
         let content = fs::read_to_string(self.path(coll, id)).ok()?;
         let h = content.trim().to_string();
         if h.is_empty() { None } else { Some(h) }
     }
 
-    /// Set the current object hash for a document (atomic on disk, instant in memory).
+    /// Set the current object hash for a document.
+    /// Disk mode: writes to WAL buffer only (zero I/O on hot path).
+    /// Background ticker flushes WAL to disk every 1s via Rayon.
     pub fn set(&self, coll: &str, id: &str, hash: &str) -> Result<()> {
         if let Some(ref mem) = self.mem {
             mem.insert((coll.to_string(), id.to_string()), hash.to_string());
             return Ok(());
         }
-        let path = self.path(coll, id);
-        fs::create_dir_all(path.parent().unwrap())?;
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, hash)?;
-        fs::rename(&tmp, &path).context("atomic id index update")?;
+        // WAL: buffer the update, no disk I/O here
+        self.write_buf.insert(
+            (coll.to_string(), id.to_string()),
+            Some(hash.to_string()),
+        );
         Ok(())
     }
 
-    /// List all doc IDs in a collection (memory map or shard subdirectories).
+    /// List all doc IDs in a collection (memory map or disk + WAL merge).
     pub fn list_ids(&self, coll: &str) -> Vec<String> {
         if let Some(ref mem) = self.mem {
             return mem.iter()
@@ -150,6 +203,7 @@ impl IdIndex {
                 .map(|e| e.key().1.clone())
                 .collect();
         }
+        // Read from disk then overlay WAL (adds buffered writes, removes tombstones)
         let id_root = self.root.join(coll).join("id");
         // Each entry in id_root is a 2-char hex shard dir
         fs::read_dir(&id_root)
@@ -169,19 +223,34 @@ impl IdIndex {
                     })
                     .collect::<Vec<_>>()
             })
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            // Overlay WAL: add buffered writes, remove tombstones
+            .chain(
+                self.write_buf.iter()
+                    .filter(|e| e.key().0 == coll && e.value().is_some())
+                    .map(|e| e.key().1.clone())
+            )
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .filter(|id| {
+                // Exclude WAL tombstones
+                self.write_buf.get(&(coll.to_string(), id.clone()))
+                    .map(|v| v.is_some())
+                    .unwrap_or(true)
+            })
             .collect()
     }
 
     /// Remove the id index entry for a document (tombstone / delete).
+    /// Disk mode: writes a tombstone to the WAL buffer; flushed to disk on next ticker.
     pub fn remove(&self, coll: &str, id: &str) -> Result<()> {
         if let Some(ref mem) = self.mem {
             mem.remove(&(coll.to_string(), id.to_string()));
             return Ok(());
         }
-        let path = self.path(coll, id);
-        if path.exists() {
-            fs::remove_file(&path).context("remove id index entry")?;
-        }
+        // WAL tombstone: None value means "delete this file on flush"
+        self.write_buf.insert((coll.to_string(), id.to_string()), None);
         Ok(())
     }
 

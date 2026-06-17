@@ -288,6 +288,12 @@ impl Db {
         self.manifest_dirty.store(true, Ordering::Release);
     }
 
+    /// Flush both the id-index WAL and MANIFEST. Used on graceful shutdown.
+    pub fn flush_all(&self) {
+        self.id_index.flush_write_buf();
+        self.flush_manifest();
+    }
+
     /// Flush MANIFEST to disk if dirty. No-op for in-memory databases.
     pub fn flush_manifest_if_dirty(&self) {
         if self.root == std::path::PathBuf::from(":memory:") { return; }
@@ -312,13 +318,17 @@ impl Db {
         }
     }
 
-    /// Start a background thread that flushes MANIFEST every `interval_ms` milliseconds.
+    /// Start a background thread that flushes both the id-index WAL and MANIFEST
+    /// every `interval_ms` milliseconds.
     /// Call this after Arc::new(db) — the Arc keeps Db alive for the thread's lifetime.
     pub fn start_manifest_ticker(self_arc: Arc<Self>, interval_ms: u64) {
         let db = self_arc;
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                // Flush id-index WAL to disk (parallel Rayon writes)
+                db.id_index.flush_write_buf();
+                // Then flush MANIFEST
                 db.flush_manifest_if_dirty();
             }
         });
