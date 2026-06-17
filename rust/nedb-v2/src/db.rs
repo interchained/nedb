@@ -43,6 +43,23 @@ pub struct Db {
 }
 
 impl Db {
+    /// Create a pure in-memory database — no disk I/O, no migration, instant startup.
+    /// Perfect for tests, hot-cache layers, and ephemeral sessions.
+    /// All data is lost when the Db is dropped.
+    pub fn in_memory() -> Self {
+        Self {
+            objects:        ObjectStore::in_memory(),
+            id_index:       IdIndex::in_memory(),
+            sorted_indexes: SortedIndexes::new(),
+            graph:          GraphStore::in_memory(),
+            root:           std::path::PathBuf::from(":memory:"),
+            seq:            AtomicU64::new(0),
+            head:           RwLock::new(String::new()),
+            startup_ready:  Arc::new(AtomicBool::new(true)),  // always ready
+            manifest_dirty: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Open (or create) a database. Runs v1→v2 migration automatically if log.aof is present.
     pub fn open(db_root: &Path, dek: Option<Dek>) -> Result<Self> {
         std::fs::create_dir_all(db_root)?;
@@ -119,6 +136,12 @@ impl Db {
     pub fn start_cold_scan(self_arc: Arc<Self>) {
         if self_arc.startup_ready.load(Ordering::SeqCst) {
             return; // warm start — already ready
+        }
+        // Fast path: if the database is empty (new or just created), skip the
+        // background thread entirely. No objects to scan = instant startup.
+        if self_arc.objects.all_hashes().next().is_none() {
+            self_arc.startup_ready.store(true, Ordering::SeqCst);
+            return;
         }
         println!("  [nedbd] cold start — background scan starting, server accepting reads now");
         std::thread::spawn(move || {
@@ -271,8 +294,15 @@ impl Db {
         self.manifest_dirty.store(true, Ordering::Release);
     }
 
-    /// Flush MANIFEST to disk if dirty. Called by background ticker and on shutdown.
+    /// Flush both the id-index WAL and MANIFEST. Used on graceful shutdown.
+    pub fn flush_all(&self) {
+        self.id_index.flush_write_buf();
+        self.flush_manifest();
+    }
+
+    /// Flush MANIFEST to disk if dirty. No-op for in-memory databases.
     pub fn flush_manifest_if_dirty(&self) {
+        if self.root == std::path::PathBuf::from(":memory:") { return; }
         if self.manifest_dirty.compare_exchange(
             true, false, Ordering::AcqRel, Ordering::Relaxed
         ).is_ok() {
@@ -280,8 +310,9 @@ impl Db {
         }
     }
 
-    /// Atomically persist current seq+head to MANIFEST.
+    /// Atomically persist current seq+head to MANIFEST. No-op for in-memory databases.
     pub fn flush_manifest(&self) {
+        if self.root == std::path::PathBuf::from(":memory:") { return; }
         let seq  = self.seq.load(Ordering::SeqCst);
         let head = self.head.read().clone();
         let m = Manifest { seq, head };
@@ -293,13 +324,17 @@ impl Db {
         }
     }
 
-    /// Start a background thread that flushes MANIFEST every `interval_ms` milliseconds.
+    /// Start a background thread that flushes both the id-index WAL and MANIFEST
+    /// every `interval_ms` milliseconds.
     /// Call this after Arc::new(db) — the Arc keeps Db alive for the thread's lifetime.
     pub fn start_manifest_ticker(self_arc: Arc<Self>, interval_ms: u64) {
         let db = self_arc;
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                // Flush id-index WAL to disk (parallel Rayon writes)
+                db.id_index.flush_write_buf();
+                // Then flush MANIFEST
                 db.flush_manifest_if_dirty();
             }
         });

@@ -13,17 +13,28 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use anyhow::Result;
 
 pub struct GraphStore {
     root: PathBuf,
+    /// In-memory edges: (from, edge_type) → Set<to>. None = disk-backed.
+    mem:  Option<Arc<dashmap::DashMap<(String, String), std::collections::HashSet<String>>>>,
 }
 
 impl GraphStore {
     pub fn new(db_root: &Path) -> Result<Self> {
         let root = db_root.join("graph");
         fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self { root, mem: None })
+    }
+
+    /// Create a pure in-memory graph store — no disk I/O.
+    pub fn in_memory() -> Self {
+        Self {
+            root: PathBuf::from(":memory:"),
+            mem:  Some(Arc::new(dashmap::DashMap::new())),
+        }
     }
 
     fn edge_path(&self, from: &str, edge_type: &str, to: &str) -> PathBuf {
@@ -32,9 +43,14 @@ impl GraphStore {
 
     /// Add a directed edge: from → to with the given type label.
     pub fn add_edge(&self, from: &str, edge_type: &str, to: &str) -> Result<()> {
+        if let Some(ref mem) = self.mem {
+            mem.entry((from.to_string(), edge_type.to_string()))
+               .or_default()
+               .insert(to.to_string());
+            return Ok(());
+        }
         let path = self.edge_path(from, edge_type, to);
         fs::create_dir_all(path.parent().unwrap())?;
-        // Atomic: O_CREAT | O_EXCL is atomic on POSIX for a new file
         if !path.exists() {
             fs::write(&path, b"")?;
         }
@@ -43,6 +59,11 @@ impl GraphStore {
 
     /// Get all outgoing edges of a given type from a node.
     pub fn outgoing(&self, from: &str, edge_type: &str) -> Vec<String> {
+        if let Some(ref mem) = self.mem {
+            return mem.get(&(from.to_string(), edge_type.to_string()))
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default();
+        }
         let dir = self.root.join(from).join(edge_type);
         fs::read_dir(&dir)
             .into_iter()

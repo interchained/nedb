@@ -8,6 +8,7 @@
 //!   NEDBD_PORT=7070         HTTP port (default 7070)
 //!   NEDBD_TOKEN=<token>     Bearer token for auth (optional)
 //!   NEDB_TMK=<32-byte-hex>  Master key for AES-256-GCM encryption (optional)
+//!   NEDBD_MEMORY=1          Pure in-memory mode — no disk I/O, data lost on exit
 
 use nedb_core_v2::server;
 
@@ -29,5 +30,9 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| hex::decode(s).ok())
         .and_then(|b| b.try_into().ok());
 
-    server::run(&host, port, &data_dir, tmk, token).await
+    let memory_mode = std::env::var("NEDBD_MEMORY")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+
+    server::run(&host, port, &data_dir, tmk, token, memory_mode).await
 }

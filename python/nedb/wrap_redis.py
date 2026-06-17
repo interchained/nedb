@@ -151,12 +151,31 @@ class NedBdProxy:
         self._req("DELETE", f"/v1/databases/{self._name}/rows/{coll}/{id}")
 
     def link(self, frm: str, rel: str, to: str, **_kw) -> None:
-        self._req("POST", self._db("/link"), {"frm": frm, "rel": rel, "to": to})
+        # v1 nedbd has POST /link; v2 DAG stores relations as NQL-queryable docs
+        # in a __links__ collection — compatible with TRAVERSE queries.
+        try:
+            self._req("POST", self._db("/link"), {"frm": frm, "rel": rel, "to": to})
+        except RuntimeError as e:
+            if "404" in str(e) or "not found" in str(e).lower():
+                # v2 DAG: store as a document so NQL can traverse it
+                self._req("POST", self._db("/put"), {
+                    "coll": "__links__",
+                    "id":   f"{frm}|{rel}|{to}",
+                    "doc":  {"_from": frm, "_rel": rel, "_to": to},
+                })
+            else:
+                raise
 
     def unlink(self, frm: str, rel: str, to: str, **_kw) -> None:
-        # nedbd doesn't have a dedicated unlink endpoint yet — use NQL delete
-        # fallback: store as a tombstone via link with _unlinked flag
-        pass  # no-op; future: DELETE /v1/databases/{name}/links/{frm}/{rel}/{to}
+        try:
+            self._req("DELETE", f"/v1/databases/{self._name}/links/{frm}/{rel}/{to}")
+        except RuntimeError:
+            # v2 fallback: tombstone the __links__ doc
+            try:
+                self._req("DELETE",
+                          f"/v1/databases/{self._name}/rows/__links__/{frm}|{rel}|{to}")
+            except RuntimeError:
+                pass
 
     def neighbors(self, frm: str, rel: str, as_of: Optional[int] = None) -> List[str]:
         frm_coll, frm_id = (frm.split(":", 1) + [""])[:2]
@@ -423,9 +442,28 @@ class NEDBSurface:
         return total
 
     def _backfill_one(self, mapping: CollectionMapping, batch_size: int) -> int:
-        """Import all keys matching one mapping from Redis into NEDB."""
-        count = 0
-        cursor = 0
+        """Import all keys matching one mapping from Redis into NEDB.
+
+        In nedbd mode uses /batch for high throughput (v2 DAG: ~4000 ops/s).
+        In-process mode falls back to individual puts.
+        """
+        count   = 0
+        cursor  = 0
+        pending: List[dict] = []
+
+        def _flush() -> int:
+            if not pending or not self._nedbd_mode:
+                return 0
+            proxy: NedBdProxy = self._db  # type: ignore[assignment]
+            try:
+                r = proxy._req("POST", proxy._db("/batch"), {"ops": list(pending)})
+                n = r.get("count", len(pending))
+                pending.clear()
+                return n
+            except Exception:
+                pending.clear()
+                return 0
+
         while True:
             cursor, keys = self._r.scan(cursor, match=mapping.pattern,
                                         count=batch_size)
@@ -441,16 +479,24 @@ class NEDBSurface:
                         continue
                     doc = mapping.parse_value(raw_val)
                     doc.setdefault("_source", "backfill")
-                    self._db.put(mapping.collection, doc_id, doc,
-                                 client="__backfill__",
-                                 evidence="backfill",
-                                 confidence=1.0)
-                    self._persist_last_op()
-                    count += 1
+                    if self._nedbd_mode:
+                        pending.append({"op": "put", "coll": mapping.collection,
+                                        "id": doc_id, "doc": doc})
+                        if len(pending) >= 500:
+                            count += _flush()
+                    else:
+                        self._db.put(mapping.collection, doc_id, doc,
+                                     client="__backfill__",
+                                     evidence="backfill",
+                                     confidence=1.0)
+                        self._persist_last_op()
+                        count += 1
                 except Exception:
                     pass  # skip unreadable keys
             if cursor == 0:
                 break
+
+        count += _flush()  # flush remainder
         return count
 
     # ── Write shadowing ───────────────────────────────────────────────────────
@@ -641,10 +687,11 @@ def wrap_redis(r: Any, db_name: str = "default",
     Args:
         r:           An existing ``redis.Redis`` (or compatible) connection.
         db_name:     Logical database name. NEDB uses ``nedb:{db_name}:*``.
-        nedbd_url:   Optional URL of a running nedbd server, e.g.
-                     ``"http://localhost:8421"``.  When set, all ``r.nedb.*``
-                     calls are forwarded to nedbd instead of running in-process.
-                     nedbd handles its own durable AOF persistence on disk.
+        nedbd_url:   Optional URL of a running nedbd server.
+                     v1 AOF:   ``"http://localhost:7070"`` (nedbd, no flag)
+                     v2 DAG:   ``"http://localhost:7070"`` (nedbd --dag)
+                     When set, all r.nedb.* calls go to nedbd over HTTP.
+                     v2 DAG backfill uses /batch for ~4000 ops/s throughput.
         nedbd_token: Optional bearer token for nedbd authentication
                      (set via ``NEDBD_TOKEN`` env on the server).
 

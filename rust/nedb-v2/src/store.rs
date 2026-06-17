@@ -11,6 +11,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use blake2::{Blake2b512, Digest};
@@ -93,6 +94,8 @@ fn decrypt(data: &[u8], dek: &Dek) -> Result<Vec<u8>> {
 pub struct ObjectStore {
     root: PathBuf,
     dek:  Option<Dek>,
+    /// In-memory store: hash → raw bytes. None = disk-backed (normal mode).
+    mem:  Option<Arc<dashmap::DashMap<String, Vec<u8>>>>,
 }
 
 impl ObjectStore {
@@ -100,7 +103,16 @@ impl ObjectStore {
         let root = db_root.join("objects");
         fs::create_dir_all(&root)
             .context("create objects/ dir")?;
-        Ok(Self { root, dek })
+        Ok(Self { root, dek, mem: None })
+    }
+
+    /// Create a pure in-memory object store — no disk, no files.
+    pub fn in_memory() -> Self {
+        Self {
+            root: PathBuf::from(":memory:"),
+            dek:  None,
+            mem:  Some(Arc::new(dashmap::DashMap::new())),
+        }
     }
 
     /// Write a node. Returns the content hash (the node's permanent ID in the DAG).
@@ -112,14 +124,19 @@ impl ObjectStore {
         };
         let hash = blake2b(&content);
 
-        // Write atomically: content to .tmp, then rename
-        let dir  = self.root.join(&hash[..2]);
-        fs::create_dir_all(&dir)?;
-        let path = dir.join(&hash[2..]);
-        if !path.exists() {                          // idempotent
-            let tmp = path.with_extension("tmp");
-            fs::write(&tmp, &content)?;
-            fs::rename(&tmp, &path)?;
+        if let Some(ref mem) = self.mem {
+            // In-memory: store in DashMap — idempotent
+            mem.entry(hash.clone()).or_insert_with(|| content);
+        } else {
+            // Disk: write atomically via tmp → rename
+            let dir  = self.root.join(&hash[..2]);
+            fs::create_dir_all(&dir)?;
+            let path = dir.join(&hash[2..]);
+            if !path.exists() {
+                let tmp = path.with_extension("tmp");
+                fs::write(&tmp, &content)?;
+                fs::rename(&tmp, &path)?;
+            }
         }
         node.hash = hash.clone();
         Ok(hash)
@@ -130,15 +147,21 @@ impl ObjectStore {
         if hash.len() < 3 {
             anyhow::bail!("invalid object hash (too short): {:?}", hash);
         }
-        let path = self.root.join(&hash[..2]).join(&hash[2..]);
-        let content = fs::read(&path)
-            .with_context(|| format!("read object {}", hash))?;
 
-        // Hash verification — any bit rot or tampering is caught here
-        let actual = blake2b(&content);
-        if actual != hash {
-            bail!("object {} tampered: expected {} got {}", hash, hash, actual);
-        }
+        let content: Vec<u8> = if let Some(ref mem) = self.mem {
+            mem.get(hash)
+                .map(|v| v.clone())
+                .ok_or_else(|| anyhow::anyhow!("object not found in memory: {}", hash))?
+        } else {
+            let path = self.root.join(&hash[..2]).join(&hash[2..]);
+            let c = fs::read(&path).with_context(|| format!("read object {}", hash))?;
+            // Hash verification — any bit rot or tampering is caught here
+            let actual = blake2b(&c);
+            if actual != hash {
+                bail!("object {} tampered: expected {} got {}", hash, hash, actual);
+            }
+            c
+        };
 
         let raw = match &self.dek {
             Some(dek) => decrypt(&content, dek)?,
@@ -146,18 +169,22 @@ impl ObjectStore {
         };
         let mut node: Node = serde_json::from_slice(&raw)
             .context("deserialize node")?;
-        // hash is skip_serializing_if = "is_empty" so it's not in the file.
-        // Restore it from the path we used to look up this object.
         if node.hash.is_empty() {
             node.hash = hash.to_string();
         }
         Ok(node)
     }
 
-    /// List all object hashes (for startup index rebuild).
-    pub fn all_hashes(&self) -> impl Iterator<Item = String> + '_ {
+    /// List all object hashes (for startup index rebuild / verify).
+    pub fn all_hashes(&self) -> Box<dyn Iterator<Item = String> + '_> {
+        // In-memory: collect from DashMap
+        if let Some(ref mem) = self.mem {
+            let hashes: Vec<String> = mem.iter().map(|e| e.key().clone()).collect();
+            return Box::new(hashes.into_iter());
+        }
+        // Disk: walk objects/ directory tree
         let root = self.root.clone();
-        fs::read_dir(&root)
+        Box::new(fs::read_dir(&root)
             .into_iter()
             .flatten()
             .filter_map(|e| e.ok())
@@ -173,7 +200,7 @@ impl ObjectStore {
                         if name.ends_with(".tmp") { return None; }
                         Some(format!("{}{}", prefix, name))
                     })
-            })
+            }))
     }
 
     /// Verify all objects. Returns (ok_count, tampered_hashes).

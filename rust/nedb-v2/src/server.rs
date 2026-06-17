@@ -65,19 +65,21 @@ pub struct Manager {
 }
 
 struct ManagerInner {
-    data_dir: PathBuf,
-    dbs:      HashMap<String, Arc<Db>>,
-    tmk:      Option<[u8; 32]>,
+    data_dir:    PathBuf,
+    dbs:         HashMap<String, Arc<Db>>,
+    tmk:         Option<[u8; 32]>,
+    memory_mode: bool,
 }
 
 impl Manager {
-    pub fn new(data_dir: &Path, tmk: Option<[u8; 32]>, token: Option<String>) -> Self {
+    pub fn new(data_dir: &Path, tmk: Option<[u8; 32]>, token: Option<String>, memory_mode: bool) -> Self {
         let (log_tx, _) = broadcast::channel(LOG_CHANNEL_CAP);
         Self {
             inner: Arc::new(RwLock::new(ManagerInner {
                 data_dir: data_dir.to_path_buf(),
                 dbs:      HashMap::new(),
                 tmk,
+                memory_mode,
             })),
             token,
             log_tx,
@@ -134,10 +136,12 @@ impl Manager {
 
     /// Open all existing databases in the data directory on startup.
     pub async fn open_all(&self) -> anyhow::Result<()> {
-        let (data_dir, tmk) = {
+        let (data_dir, tmk, memory_mode) = {
             let inner = self.inner.read().await;
-            (inner.data_dir.clone(), inner.tmk)
+            (inner.data_dir.clone(), inner.tmk, inner.memory_mode)
         };
+        // In memory mode: nothing to open from disk — all DBs created on first write
+        if memory_mode { return Ok(()); }
         if !data_dir.exists() {
             std::fs::create_dir_all(&data_dir)?;
             return Ok(());
@@ -174,15 +178,21 @@ impl Manager {
     }
 
     async fn create_db(&self, name: &str) -> anyhow::Result<Arc<Db>> {
-        let (data_dir, tmk) = {
+        let (data_dir, tmk, memory_mode) = {
             let inner = self.inner.read().await;
-            (inner.data_dir.clone(), inner.tmk)
+            (inner.data_dir.clone(), inner.tmk, inner.memory_mode)
         };
-        let db_path = data_dir.join(name);
-        let dek = tmk.map(|k| crate::store::Dek::from_tmk(&k, name.as_bytes()));
-        let db = Arc::new(Db::open(&db_path, dek)?);
-        Db::start_cold_scan(Arc::clone(&db));
-        Db::start_manifest_ticker(Arc::clone(&db), 1000);
+        let db = if memory_mode {
+            // Pure in-memory — instant, no files
+            Arc::new(Db::in_memory())
+        } else {
+            let db_path = data_dir.join(name);
+            let dek = tmk.map(|k| crate::store::Dek::from_tmk(&k, name.as_bytes()));
+            let db = Arc::new(Db::open(&db_path, dek)?);
+            Db::start_cold_scan(Arc::clone(&db));
+            Db::start_manifest_ticker(Arc::clone(&db), 1000);
+            db
+        };
         self.inner.write().await.dbs.insert(name.to_string(), db.clone());
         Ok(db)
     }
@@ -200,11 +210,11 @@ impl Manager {
         }
     }
 
-    /// Flush all open databases — call on graceful shutdown.
+    /// Flush all open databases (id-index WAL + MANIFEST) — call on graceful shutdown.
     pub async fn flush_all(&self) {
         let inner = self.inner.read().await;
         for db in inner.dbs.values() {
-            db.flush_manifest_if_dirty();
+            db.flush_all();  // WAL + manifest
         }
     }
 
@@ -257,14 +267,15 @@ fn db_seq_head(db: &Db) -> (u64, String) {
 
 async fn health(State(mgr): State<Manager>) -> Response {
     let names = mgr.names().await;
+    let inner = mgr.inner.read().await;
     ok(json!({
         "ok":        true,
         "service":   "nedbd",
         "version":   env!("CARGO_PKG_VERSION"),
-        "engine":    "dag",          // always "dag" for the v2 Rust binary
+        "engine":    "dag",
+        "memory":    inner.memory_mode,
         "databases": names,
-        "encrypted": mgr.inner.read().await.tmk.is_some(),
-        "startup_ready": mgr.names().await.iter().all(|_| true), // simplified — server is up
+        "encrypted": inner.tmk.is_some(),
     }))
 }
 
@@ -394,14 +405,25 @@ async fn put_document(
             "database startup in progress — reads available, writes retry in a moment");
     }
     let caused_by = body.caused_by.unwrap_or_default();
-    match db.put(&body.coll, &body.id, body.doc, caused_by, body.valid_from, body.valid_to) {
-        Ok(node) => {
+    // Run synchronous file I/O (objects.write) on a blocking thread so concurrent
+    // PUTs don't serialize on the tokio async thread pool.
+    let coll = body.coll.clone();
+    let id   = body.id.clone();
+    let doc  = body.doc.clone();
+    let vf   = body.valid_from.clone();
+    let vt   = body.valid_to.clone();
+    let db2  = Arc::clone(&db);
+    let result = tokio::task::spawn_blocking(move || {
+        db2.put(&coll, &id, doc, caused_by, vf, vt)
+    }).await;
+    match result {
+        Err(join_err) => err(StatusCode::INTERNAL_SERVER_ERROR, &join_err.to_string()),
+        Ok(Err(e))    => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Ok(Ok(node))  => {
             let (seq, head) = db_seq_head(&db);
-            // Notify live query subscribers of the write
             mgr.notify_subscribers(&name, &db);
             ok(json!({"ok": true, "doc": node_to_response(&node), "seq": seq, "head": head}))
         }
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
 
@@ -723,8 +745,8 @@ pub fn router(mgr: Manager) -> Router {
 }
 
 /// Start the nedbd v2 server.
-pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, token: Option<String>) -> anyhow::Result<()> {
-    let mgr = Manager::new(Path::new(data_dir), tmk, token);
+pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, token: Option<String>, memory_mode: bool) -> anyhow::Result<()> {
+    let mgr = Manager::new(Path::new(data_dir), tmk, token, memory_mode);
     mgr.open_all().await?;
 
     let has_token = mgr.token.is_some();
@@ -746,13 +768,15 @@ pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, t
   data     {}
   enc      {}
   token    {}
+  memory   {}
   ─────────────────────────────────────────────────────────────
 "#,
         env!("CARGO_PKG_VERSION"),
         addr,
         data_dir,
         if tmk.is_some() { "AES-256-GCM" } else { "off" },
-        if has_token { "on" } else { "off (set NEDBD_TOKEN to require auth)" }
+        if has_token { "on" } else { "off (set NEDBD_TOKEN to require auth)" },
+        if memory_mode { "yes — all data lost on exit (NEDBD_MEMORY=1)" } else { "no — durable DAG on disk" }
     );
     print!("{}", banner);
 
