@@ -1,0 +1,139 @@
+# Codemagic CI — NEDB macOS native wheels
+#
+# Builds the nedbd-v2 binary + maturin Python wheel for both Mac targets:
+#   - aarch64-apple-darwin (Apple Silicon — M-series)
+#   - x86_64-apple-darwin  (Intel Mac)
+#
+# Triggers on v* tags pushed to Eth-Interchained/nedb.
+# Uploads the resulting wheels directly to PyPI via twine.
+#
+# Secrets required (set in Codemagic App Settings → Environment variables):
+#   PYPI_API_TOKEN  — PyPI token with upload access to nedb-engine
+#   NPM_TOKEN       — npm token (optional, for napi npm publish)
+
+workflows:
+
+  # ── Apple Silicon wheel (aarch64) ─────────────────────────────────────
+  macos-arm64-wheel:
+    name: "nedb-engine wheel — macOS arm64"
+    max_build_duration: 60
+    instance_type: mac_mini_m2   # Apple Silicon — M2 Mac Mini
+    triggering:
+      events:
+        - tag
+      tag_patterns:
+        - pattern: "v*"
+          include: true
+    environment:
+      vars:
+        RUST_TARGET: aarch64-apple-darwin
+        WHEEL_LABEL: macos-arm64
+      groups:
+        - nedb_secrets          # contains PYPI_API_TOKEN
+    scripts:
+      - name: Install Rust
+        script: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          source "$HOME/.cargo/env"
+          rustup target add $RUST_TARGET
+          echo "rustc: $(rustc --version)"
+
+      - name: Install Python tools
+        script: pip3 install --upgrade maturin twine
+
+      - name: Build nedbd-v2 binary
+        script: |
+          source "$HOME/.cargo/env"
+          cd rust/nedb-v2
+          cargo build --release --target $RUST_TARGET
+          BIN="target/$RUST_TARGET/release/nedbd"
+          cp "$BIN" ../../python/nedb/nedbd-v2
+          chmod +x ../../python/nedb/nedbd-v2
+          echo "Binary: $(ls -lh ../../python/nedb/nedbd-v2)"
+
+      - name: Stage Python source for maturin
+        script: |
+          rm -rf rust/crates/nedb-py/python
+          mkdir -p rust/crates/nedb-py/python
+          cp -r python/nedb rust/crates/nedb-py/python/nedb
+          find rust/crates/nedb-py/python/nedb -name "nedbd-v2*" -exec chmod +x {} \;
+          echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) py files"
+
+      - name: Build wheel (maturin)
+        script: |
+          source "$HOME/.cargo/env"
+          cd rust/crates/nedb-py
+          maturin build --release --out ../../../dist --target $RUST_TARGET
+          echo "Wheel:"
+          ls -lh ../../../dist/*.whl
+
+      - name: Publish to PyPI
+        script: |
+          TWINE_USERNAME=__token__ \
+          TWINE_PASSWORD=$PYPI_API_TOKEN \
+          twine upload --skip-existing --verbose dist/*.whl
+
+    artifacts:
+      - dist/*.whl
+
+  # ── Intel Mac wheel (x86_64) ──────────────────────────────────────────
+  macos-intel-wheel:
+    name: "nedb-engine wheel — macOS x86_64"
+    max_build_duration: 60
+    instance_type: mac_mini_m2   # cross-compiles x86_64 from M2
+    triggering:
+      events:
+        - tag
+      tag_patterns:
+        - pattern: "v*"
+          include: true
+    environment:
+      vars:
+        RUST_TARGET: x86_64-apple-darwin
+        WHEEL_LABEL: macos-x86_64
+      groups:
+        - nedb_secrets
+    scripts:
+      - name: Install Rust + Intel target
+        script: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          source "$HOME/.cargo/env"
+          rustup target add $RUST_TARGET
+          echo "rustc: $(rustc --version)"
+
+      - name: Install Python tools
+        script: pip3 install --upgrade maturin twine
+
+      - name: Build nedbd-v2 binary (cross-compile x86_64)
+        script: |
+          source "$HOME/.cargo/env"
+          cd rust/nedb-v2
+          cargo build --release --target $RUST_TARGET
+          BIN="target/$RUST_TARGET/release/nedbd"
+          cp "$BIN" ../../python/nedb/nedbd-v2
+          chmod +x ../../python/nedb/nedbd-v2
+          echo "Binary: $(ls -lh ../../python/nedb/nedbd-v2)"
+
+      - name: Stage Python source for maturin
+        script: |
+          rm -rf rust/crates/nedb-py/python
+          mkdir -p rust/crates/nedb-py/python
+          cp -r python/nedb rust/crates/nedb-py/python/nedb
+          find rust/crates/nedb-py/python/nedb -name "nedbd-v2*" -exec chmod +x {} \;
+
+      - name: Build wheel (maturin)
+        script: |
+          source "$HOME/.cargo/env"
+          cd rust/crates/nedb-py
+          maturin build --release --out ../../../dist --target $RUST_TARGET
+          echo "Wheel:"
+          ls -lh ../../../dist/*.whl
+
+      - name: Publish to PyPI
+        script: |
+          TWINE_USERNAME=__token__ \
+          TWINE_PASSWORD=$PYPI_API_TOKEN \
+          twine upload --skip-existing --verbose dist/*.whl
+
+    artifacts:
+      - dist/*.whl
