@@ -28,6 +28,10 @@ pub struct Db {
     pub sorted_indexes: SortedIndexes,
     pub graph:          GraphStore,
     pub root:           PathBuf,
+    /// Dirty flag — set true when head changes, cleared after manifest flush.
+    /// Decouples flush_manifest from the hot write path so concurrent writes
+    /// don't serialise on 2× file I/O per PUT.
+    manifest_dirty:     Arc<AtomicBool>,
     pub seq:            AtomicU64,
     /// Cached Merkle head — updated incrementally on every write (O(1)).
     head:               RwLock<String>,
@@ -56,7 +60,8 @@ impl Db {
             root: db_root.to_path_buf(),
             seq:  AtomicU64::new(0),
             head: RwLock::new(String::new()),
-            startup_ready: Arc::new(AtomicBool::new(false)),
+            startup_ready:  Arc::new(AtomicBool::new(false)),
+            manifest_dirty: Arc::new(AtomicBool::new(false)),
         };
 
         // Auto-migrate v1 → v2 if needed (pass DEK so encrypted AOFs convert correctly)
@@ -187,7 +192,9 @@ impl Db {
         Ok(node)
     }
 
-    /// Update the running Merkle head with a new write. O(1).
+    /// Update the running Merkle head with a new write. O(1), lock-free on the flush path.
+    /// Sets dirty flag — the background ticker calls flush_manifest periodically.
+    /// This removes 2× file I/O ops from the hot write path, unblocking concurrent writes.
     fn update_head(&self, seq: u64, new_hash: &str) {
         use blake2::{Blake2b512, Digest};
         let prev = self.head.read().clone();
@@ -196,12 +203,21 @@ impl Db {
         h.update(seq.to_le_bytes());
         h.update(new_hash.as_bytes());
         *self.head.write() = hex::encode(&h.finalize()[..32]);
-        // Persist MANIFEST so next startup is instant
-        self.flush_manifest();
+        // Mark dirty — background ticker will flush to MANIFEST (no I/O on write path)
+        self.manifest_dirty.store(true, Ordering::Release);
+    }
+
+    /// Flush MANIFEST to disk if dirty. Called by background ticker and on shutdown.
+    pub fn flush_manifest_if_dirty(&self) {
+        if self.manifest_dirty.compare_exchange(
+            true, false, Ordering::AcqRel, Ordering::Relaxed
+        ).is_ok() {
+            self.flush_manifest();
+        }
     }
 
     /// Atomically persist current seq+head to MANIFEST.
-    fn flush_manifest(&self) {
+    pub fn flush_manifest(&self) {
         let seq  = self.seq.load(Ordering::SeqCst);
         let head = self.head.read().clone();
         let m = Manifest { seq, head };
@@ -211,6 +227,18 @@ impl Db {
             let _ = fs::write(&tmp, &json);
             let _ = fs::rename(&tmp, &path);
         }
+    }
+
+    /// Start a background thread that flushes MANIFEST every `interval_ms` milliseconds.
+    /// Call this after Arc::new(db) — the Arc keeps Db alive for the thread's lifetime.
+    pub fn start_manifest_ticker(self_arc: Arc<Self>, interval_ms: u64) {
+        let db = self_arc;
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                db.flush_manifest_if_dirty();
+            }
+        });
     }
 
     /// Return the current Merkle head string. O(1) — read from cache.
