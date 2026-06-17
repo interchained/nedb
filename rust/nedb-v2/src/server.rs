@@ -95,10 +95,10 @@ impl Manager {
             match Db::open(&db_path, dek) {
                 Ok(db) => {
                     nlog!(log_tx, "  [nedbd] opened database {:?}", name);
-                    // Arc::new BEFORE start_cold_scan — Db must be heap-allocated
-                    // for field addresses to be stable across the thread boundary.
                     let db_arc = Arc::new(db);
                     Db::start_cold_scan(Arc::clone(&db_arc));
+                    // Flush MANIFEST every 1s in background — removes I/O from write path
+                    Db::start_manifest_ticker(Arc::clone(&db_arc), 1000);
                     inner.dbs.insert(name, db_arc);
                 }
                 Err(e) => nlog!(log_tx, "  [nedbd] ERROR opening {:?}: {}", name, e),
@@ -120,17 +120,30 @@ impl Manager {
         let dek = tmk.map(|k| crate::store::Dek::from_tmk(&k, name.as_bytes()));
         let db = Arc::new(Db::open(&db_path, dek)?);
         Db::start_cold_scan(Arc::clone(&db));
+        Db::start_manifest_ticker(Arc::clone(&db), 1000);
         self.inner.write().await.dbs.insert(name.to_string(), db.clone());
         Ok(db)
     }
 
     async fn drop_db(&self, name: &str) -> bool {
-        let removed = self.inner.write().await.dbs.remove(name).is_some();
-        if removed {
+        let db = self.inner.write().await.dbs.remove(name);
+        if let Some(db) = db {
+            // Flush manifest before dropping
+            db.flush_manifest_if_dirty();
             let data_dir = self.inner.read().await.data_dir.clone();
             let _ = std::fs::remove_dir_all(data_dir.join(name));
+            true
+        } else {
+            false
         }
-        removed
+    }
+
+    /// Flush all open databases — call on graceful shutdown.
+    pub async fn flush_all(&self) {
+        let inner = self.inner.read().await;
+        for db in inner.dbs.values() {
+            db.flush_manifest_if_dirty();
+        }
     }
 
     async fn names(&self) -> Vec<String> {
@@ -544,6 +557,7 @@ pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, t
     mgr.open_all().await?;
 
     let has_token = mgr.token.is_some();
+    let mgr_for_shutdown = mgr.clone();
     let app = router(mgr);
     let addr = format!("{}:{}", host, port).parse::<std::net::SocketAddr>()?;
     let banner = format!(r#"
@@ -572,10 +586,15 @@ pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, t
     print!("{}", banner);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    // TCP_NODELAY disables Nagle's algorithm — eliminates 40-200ms artificial
-    // latency on macOS loopback for small request/response payloads.
     axum::serve(listener, app)
         .tcp_nodelay(true)
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c().await.ok();
+            println!("  [nedbd] shutting down — flushing manifests...");
+        })
         .await?;
+    // Flush all manifest files before exit
+    mgr_for_shutdown.flush_all().await;
+    println!("  [nedbd] goodbye");
     Ok(())
 }
