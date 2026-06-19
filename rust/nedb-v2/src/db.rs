@@ -119,7 +119,7 @@ impl Db {
                 .ok()
                 .and_then(|s| serde_json::from_str::<Manifest>(&s).ok())
             {
-                self.seq.store(m.seq + 1, Ordering::SeqCst);
+                self.seq.store(m.seq, Ordering::SeqCst); // m.seq is already the next-to-assign counter
                 *self.head.write() = m.head.clone();
                 self.startup_ready.store(true, Ordering::SeqCst);
                 println!("  [nedbd] warm start — seq={} head={}...", m.seq, &m.head[..8]);
@@ -491,40 +491,48 @@ impl Db {
     }
 
     /// Add an explicit named relation edge between two documents.
-    /// frm and to are "coll:id" strings. Edges are stored in the graph store
-    /// as: graph/{frm_hash}/{rel}/{to_hash} and the reverse.
+    /// Add an explicit named relation between two "coll:id" nodes.
+    /// Relations stored as __links__ documents — NQL-queryable, time-travelable,
+    /// consistent with the PyO3 binding which uses the same __links__ convention.
     pub fn link(&self, frm: &str, rel: &str, to: &str) -> Result<()> {
-        // Parse "coll:id" → (coll, id)
         let (frm_coll, frm_id) = frm.split_once(':')
             .ok_or_else(|| anyhow::anyhow!("link frm must be 'coll:id', got: {}", frm))?;
         let (to_coll, to_id) = to.split_once(':')
             .ok_or_else(|| anyhow::anyhow!("link to must be 'coll:id', got: {}", to))?;
-
-        let frm_hash = self.id_index.get(frm_coll, frm_id)
-            .ok_or_else(|| anyhow::anyhow!("link: frm not found: {}", frm))?;
-        let to_hash = self.id_index.get(to_coll, to_id)
-            .ok_or_else(|| anyhow::anyhow!("link: to not found: {}", to))?;
-
-        let rev = format!("{}_rev", rel);
-        self.graph.add_edge(&frm_hash, rel, &to_hash)?;
-        self.graph.add_edge(&to_hash, &rev, &frm_hash)?;
+        if self.id_index.get(frm_coll, frm_id).is_none() {
+            anyhow::bail!("link: frm not found: {}", frm);
+        }
+        if self.id_index.get(to_coll, to_id).is_none() {
+            anyhow::bail!("link: to not found: {}", to);
+        }
+        let link_id = format!("{}|{}|{}", frm, rel, to);
+        let doc = serde_json::json!({"_from": frm, "_rel": rel, "_to": to});
+        self.put("__links__", &link_id, doc, vec![], None, None)?;
         Ok(())
     }
 
-    /// Get all neighbor hashes for a node via a named relation.
-    /// frm is "coll:id". Returns current-version Node objects.
+    /// Remove a named relation (deletes the __links__ document).
+    pub fn unlink(&self, frm: &str, rel: &str, to: &str) -> Result<bool> {
+        let link_id = format!("{}|{}|{}", frm, rel, to);
+        self.delete("__links__", &link_id)
+    }
+
+    /// Get neighbor nodes via a named relation.
+    /// Queries __links__ — consistent with the PyO3 binding.
     pub fn neighbors(&self, frm: &str, rel: &str) -> Vec<Node> {
-        let (coll, id) = match frm.split_once(':') {
-            Some(p) => p,
-            None    => return vec![],
-        };
-        let hash = match self.id_index.get(coll, id) {
-            Some(h) => h,
-            None    => return vec![],
-        };
-        self.graph.outgoing(&hash, rel)
+        self.id_index
+            .list_ids("__links__")
             .into_iter()
-            .filter_map(|h| self.objects.read(&h).ok())
+            .filter_map(|id| self.get("__links__", &id))
+            .filter(|node| {
+                node.data.get("_from").and_then(|v| v.as_str()) == Some(frm)
+                    && node.data.get("_rel").and_then(|v| v.as_str()) == Some(rel)
+            })
+            .filter_map(|node| {
+                let to = node.data.get("_to")?.as_str()?;
+                let (to_coll, to_id) = to.split_once(':')?;
+                self.get(to_coll, to_id)
+            })
             .collect()
     }
 }
@@ -728,14 +736,24 @@ mod tests_v2 {
     }
 
     #[test]
-    fn link_reverse_edge_stored() {
+    fn link_stored_in_links_collection() {
+        // Links are stored as __links__ documents, not as graph edges.
+        // The __links__ collection is NQL-queryable and consistent with the PyO3 binding.
         let db = Db::in_memory();
         db.put("driver", "d1", serde_json::json!({"name": "Bob"}),   vec![], None, None).unwrap();
         db.put("trip",   "t1", serde_json::json!({"status": "req"}), vec![], None, None).unwrap();
         db.link("driver:d1", "handles", "trip:t1").unwrap();
-        let inbound = db.neighbors("trip:t1", "handles_rev");
-        assert_eq!(inbound.len(), 1);
-        assert_eq!(inbound[0].id, "d1");
+        // Verify the __links__ document was created
+        let link_doc = db.get("__links__", "driver:d1|handles|trip:t1");
+        assert!(link_doc.is_some(), "__links__ doc should exist");
+        let doc = link_doc.unwrap();
+        assert_eq!(doc.data["_from"], "driver:d1");
+        assert_eq!(doc.data["_rel"],  "handles");
+        assert_eq!(doc.data["_to"],   "trip:t1");
+        // neighbors() resolves to the target node
+        let nb = db.neighbors("driver:d1", "handles");
+        assert_eq!(nb.len(), 1);
+        assert_eq!(nb[0].id, "t1");
     }
 
     #[test]

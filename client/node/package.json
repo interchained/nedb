@@ -1,6 +1,6 @@
 {
   "name": "nedb-engine-client",
-  "version": "2.2.7",
+  "version": "2.2.8",
   "description": "TypeScript/JavaScript client for the nedbd HTTP API (nedb-engine)",
   "main": "dist/index.js",
   "module": "dist/index.esm.js",
