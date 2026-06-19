@@ -81,17 +81,23 @@ def main():
     except Exception as e:
         sys.exit(f"  ERROR: cannot reach {base}/v1/databases/{db} — {e}")
 
-    collections_raw = detail.get("collections", {})
-    if not collections_raw:
+    collections_raw = detail.get("collections", [])
+    # v2 returns a list of names; v1 returns a dict {name: count}
+    if isinstance(collections_raw, dict):
+        coll_names = list(collections_raw.keys())
+    else:
+        coll_names = list(collections_raw)
+
+    if not coll_names:
         sys.exit(f"  ERROR: database '{db}' has no collections yet (empty?)")
 
     # Skip internal collections
-    user_colls = [c for c in collections_raw.keys()
+    user_colls = [c for c in coll_names
                   if not c.startswith("_") and c not in ("__links__",)]
 
     if not user_colls:
         print(f"  No user collections found. Writing minimal schema.")
-        user_colls = list(collections_raw.keys())[:5]
+        user_colls = coll_names[:5]
 
     print(f"  Found {len(user_colls)} collections: {', '.join(user_colls[:8])}{'…' if len(user_colls) > 8 else ''}")
 
