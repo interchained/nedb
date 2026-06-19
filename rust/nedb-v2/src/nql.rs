@@ -419,6 +419,20 @@ pub fn execute(db: &Db, nql: &str) -> Result<Vec<Value>> {
         } else {
             db.order_by_asc(&q.coll, order_field, limit)
         }
+    } else if let (Some(n), true) = (q.limit, q.wheres.is_empty()
+            && q.search.is_none() && q.trace.is_none()
+            && q.traverse.is_none() && q.group_by.is_none()
+            && q.valid_as_of.is_none()) {
+        // LIMIT-only fast path: no filters, no ordering, no trace.
+        // Take only the first N IDs from the id-index and fetch those docs.
+        // This makes `FROM coll LIMIT 1` O(N) not O(total) — critical for
+        // the Studio "Preparing…" phase which samples every collection.
+        db.id_index
+            .list_ids(&q.coll)
+            .into_iter()
+            .take(n)
+            .filter_map(|id| db.get(&q.coll, &id))
+            .collect()
     } else {
         // Default: all docs in collection
         db.list(&q.coll)
