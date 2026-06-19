@@ -122,7 +122,8 @@ impl Db {
                 self.seq.store(m.seq, Ordering::SeqCst); // m.seq is already the next-to-assign counter
                 *self.head.write() = m.head.clone();
                 self.startup_ready.store(true, Ordering::SeqCst);
-                println!("  [nedbd] warm start — seq={} head={}...", m.seq, &m.head[..8]);
+                let head_preview = &m.head[..m.head.len().min(8)];
+                println!("  [nedbd] warm start — seq={} head={}...", m.seq, head_preview);
                 return Ok(());
             }
             eprintln!("  [nedbd] MANIFEST corrupt, falling back to cold scan");
