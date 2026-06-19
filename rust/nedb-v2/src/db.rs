@@ -119,14 +119,20 @@ impl Db {
                 .ok()
                 .and_then(|s| serde_json::from_str::<Manifest>(&s).ok())
             {
-                self.seq.store(m.seq, Ordering::SeqCst); // m.seq is already the next-to-assign counter
-                *self.head.write() = m.head.clone();
-                self.startup_ready.store(true, Ordering::SeqCst);
-                let head_preview = &m.head[..m.head.len().min(8)];
-                println!("  [nedbd] warm start — seq={} head={}...", m.seq, head_preview);
-                return Ok(());
+                // Self-heal: MANIFEST with an empty or short head is corrupt/stale.
+                // Fall through to cold scan so the head is rebuilt correctly from objects.
+                if m.head.len() < 8 {
+                    eprintln!("  [nedbd] MANIFEST head invalid (len={}), self-healing via cold scan", m.head.len());
+                } else {
+                    self.seq.store(m.seq, Ordering::SeqCst); // m.seq is already the next-to-assign counter
+                    *self.head.write() = m.head.clone();
+                    self.startup_ready.store(true, Ordering::SeqCst);
+                    println!("  [nedbd] warm start — seq={} head={}...", m.seq, &m.head[..8]);
+                    return Ok(());
+                }
+            } else {
+                eprintln!("  [nedbd] MANIFEST corrupt or missing, falling back to cold scan");
             }
-            eprintln!("  [nedbd] MANIFEST corrupt, falling back to cold scan");
         }
 
         // Cold path: mark as not ready, return immediately.
