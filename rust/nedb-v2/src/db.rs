@@ -677,3 +677,87 @@ mod tests {
         assert_eq!(current.data["v"], 2);
     }
 }
+
+#[cfg(test)]
+mod tests_v2 {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn seq_index_populated_on_put() {
+        let db = Db::in_memory();
+        let a = db.put("item", "a", serde_json::json!({"x": 1}), vec![], None, None).unwrap();
+        let b = db.put("item", "b", serde_json::json!({"x": 2}), vec![], None, None).unwrap();
+        assert_eq!(db.get_hash_by_seq(a.seq), Some(a.hash.clone()));
+        assert_eq!(db.get_hash_by_seq(b.seq), Some(b.hash.clone()));
+        assert_eq!(db.get_hash_by_seq(9999), None);
+    }
+
+    #[test]
+    fn seq_index_survives_batch() {
+        let db = Db::in_memory();
+        let nodes = db.put_batch(vec![
+            ("item".into(), "x".into(), serde_json::json!({"v": 1}), vec![], None, None),
+            ("item".into(), "y".into(), serde_json::json!({"v": 2}), vec![], None, None),
+        ]).unwrap();
+        for node in &nodes {
+            assert_eq!(db.get_hash_by_seq(node.seq), Some(node.hash.clone()));
+        }
+    }
+
+    #[test]
+    fn link_and_neighbors() {
+        let db = Db::in_memory();
+        db.put("driver", "d1", serde_json::json!({"name": "Bob"}),   vec![], None, None).unwrap();
+        db.put("driver", "d2", serde_json::json!({"name": "Carol"}), vec![], None, None).unwrap();
+        db.put("trip",   "t1", serde_json::json!({"status": "req"}), vec![], None, None).unwrap();
+        db.put("trip",   "t2", serde_json::json!({"status": "req"}), vec![], None, None).unwrap();
+
+        db.link("driver:d1", "handles", "trip:t1").unwrap();
+        db.link("driver:d1", "handles", "trip:t2").unwrap();
+        db.link("driver:d2", "handles", "trip:t1").unwrap();
+
+        let d1_trips = db.neighbors("driver:d1", "handles");
+        assert_eq!(d1_trips.len(), 2);
+        let ids: std::collections::HashSet<&str> = d1_trips.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains("t1") && ids.contains("t2"));
+
+        let d2_trips = db.neighbors("driver:d2", "handles");
+        assert_eq!(d2_trips.len(), 1);
+        assert_eq!(d2_trips[0].id, "t1");
+    }
+
+    #[test]
+    fn link_reverse_edge_stored() {
+        let db = Db::in_memory();
+        db.put("driver", "d1", serde_json::json!({"name": "Bob"}),   vec![], None, None).unwrap();
+        db.put("trip",   "t1", serde_json::json!({"status": "req"}), vec![], None, None).unwrap();
+        db.link("driver:d1", "handles", "trip:t1").unwrap();
+        let inbound = db.neighbors("trip:t1", "handles_rev");
+        assert_eq!(inbound.len(), 1);
+        assert_eq!(inbound[0].id, "d1");
+    }
+
+    #[test]
+    fn link_missing_node_errors() {
+        let db = Db::in_memory();
+        db.put("driver", "d1", serde_json::json!({}), vec![], None, None).unwrap();
+        assert!(db.link("driver:d1", "handles", "trip:ghost").is_err());
+    }
+
+    #[test]
+    fn link_durable_survives_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let db = Db::open(dir.path(), None).unwrap();
+            db.put("driver", "d1", serde_json::json!({"name": "Bob"}),   vec![], None, None).unwrap();
+            db.put("trip",   "t1", serde_json::json!({"status": "req"}), vec![], None, None).unwrap();
+            db.link("driver:d1", "handles", "trip:t1").unwrap();
+        }
+        let db2 = Db::open(dir.path(), None).unwrap();
+        db2.startup_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        let trips = db2.neighbors("driver:d1", "handles");
+        assert_eq!(trips.len(), 1);
+        assert_eq!(trips[0].id, "t1");
+    }
+}
