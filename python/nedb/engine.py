@@ -29,7 +29,9 @@ def apply_op(store: MVCCStore, relations: Relations, indexes: Indexes, op: Op,
     """Deterministically fold one op into materialized state."""
     p = op.payload
     if op.op == "put":
-        key, coll, doc = p["key"], p["coll"], p["doc"]
+        key, coll = p["key"], p["coll"]
+        doc = dict(p["doc"])          # copy so we don't mutate the op payload
+        doc["_seq"] = op.seq          # inject sequence number into every stored doc
         old = store.get(key)
         if old is not None:
             indexes.remove(coll, key, old)
@@ -657,7 +659,10 @@ class NEDB:
                             if op.op == "put" and op.payload.get("key") == key_p:
                                 queue.append(op.seq)
                                 break
-                for seq in queue:
+                # BFS — feed found dep_seqs back into the queue for full
+                # transitive traversal (mirrors the backward TRACE frontier loop).
+                while queue:
+                    seq = queue.pop(0)
                     for dep_seq in self.cause_map.get(seq, []):
                         if dep_seq in visited_seqs_fwd:
                             continue
@@ -669,6 +674,7 @@ class NEDB:
                                 dep_doc = self.store.get(dep_key, as_of)
                                 if dep_doc is not None:
                                     out_fwd.append((dep_key, dep_doc))
+                                    queue.append(dep_seq)  # continue BFS
                 rows = out_fwd
 
         if plan.get("limit") is not None:
