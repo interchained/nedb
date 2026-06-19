@@ -637,7 +637,10 @@ class NEDB:
                             op = self.log.ops[cause_seq]
                             if op.op == "put":
                                 cause_key = op.payload.get("key", "")
-                                cause_doc = self.store.get(cause_key, as_of)
+                                # Use cause_seq as the AS OF point so TRACE returns
+                                # the historical version that existed when the causal
+                                # link was created — not the current (possibly updated) doc.
+                                cause_doc = self.store.get(cause_key, cause_seq)
                                 if cause_doc is not None:
                                     out_docs.append((cause_key, cause_doc))
                                     frontier.append(cause_doc)
