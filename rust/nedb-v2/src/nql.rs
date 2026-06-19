@@ -103,7 +103,7 @@ impl<'a> Lexer<'a> {
             let upper = word.to_uppercase();
             let keywords = ["FROM","AS","OF","VALID","WHERE","AND","ORDER","BY",
                             "DESC","LIMIT","GROUP","COUNT","SUM","AVG","MIN","MAX",
-                            "TRACE","REVERSE","SEARCH","NOT","NULL","TRUE","FALSE"];
+                            "TRACE","TRAVERSE","REVERSE","SEARCH","NOT","NULL","TRUE","FALSE"];
             if keywords.contains(&upper.as_str()) {
                 return Tok::Kw(upper);
             }
@@ -151,6 +151,7 @@ pub struct Query {
     pub group_by:   Option<(String, GroupAgg)>,
     pub trace:      Option<String>,     // edge type (usually "caused_by")
     pub trace_rev:  bool,
+    pub traverse:   Option<String>,     // named relation for TRAVERSE rel
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────
@@ -195,6 +196,7 @@ impl Parser {
             order_by: None, order_desc: false,
             limit: None, group_by: None,
             trace: None, trace_rev: false,
+            traverse: None,
         };
 
         loop {
@@ -296,6 +298,15 @@ impl Parser {
                     if let Tok::Kw(k) = self.peek() {
                         if k == "REVERSE" { self.advance(); q.trace_rev = true; }
                     }
+                }
+
+                Tok::Kw(k) if k == "TRAVERSE" => {
+                    self.advance();
+                    let rel = match self.advance() {
+                        Tok::Ident(s) | Tok::Kw(s) => s,
+                        other => bail!("TRAVERSE: expected relation name, got {:?}", other),
+                    };
+                    q.traverse = Some(rel);
                 }
 
                 _ => { self.advance(); } // skip unrecognised
@@ -435,6 +446,18 @@ pub fn execute(db: &Db, nql: &str) -> Result<Vec<Value>> {
             traced.extend(chain);
         }
         rows = traced;
+    }
+
+    // ── TRAVERSE rel — one-hop named-relation lookup ──────────────────────────
+
+    if let Some(ref rel) = q.traverse {
+        let mut traversed: Vec<Node> = vec![];
+        for root in &rows {
+            let frm = format!("{}:{}", root.coll, root.id);
+            let neighbors = db.neighbors(&frm, rel);
+            traversed.extend(neighbors);
+        }
+        rows = traversed;
     }
 
     // ── ORDER BY (post-filter sort if no sorted index was used) ───────────────
@@ -586,5 +609,90 @@ mod tests {
         let (rows, _) = query(&db, r#"FROM events VALID AS OF "2025-03-01""#).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["type"], "a");
+    }
+}
+
+#[cfg(test)]
+mod tests_traverse {
+    use super::*;
+    use tempfile::tempdir;
+    use crate::db::Db;
+
+    #[test]
+    fn traverse_one_hop() {
+        let db = Db::in_memory();
+        db.put("driver", "d1", serde_json::json!({"name": "Bob"}),   vec![], None, None).unwrap();
+        db.put("driver", "d2", serde_json::json!({"name": "Carol"}), vec![], None, None).unwrap();
+        db.put("trip",   "t1", serde_json::json!({"status": "req"}), vec![], None, None).unwrap();
+        db.put("trip",   "t2", serde_json::json!({"status": "ok"}),  vec![], None, None).unwrap();
+
+        db.link("driver:d1", "handles", "trip:t1").unwrap();
+        db.link("driver:d1", "handles", "trip:t2").unwrap();
+
+        let (rows, count) = query(&db, r#"FROM driver WHERE _id = "d1" TRAVERSE handles"#).unwrap();
+        assert_eq!(count, 2);
+        let ids: std::collections::HashSet<&str> = rows.iter()
+            .filter_map(|r| r["_id"].as_str())
+            .collect();
+        assert!(ids.contains("t1") && ids.contains("t2"));
+    }
+
+    #[test]
+    fn traverse_returns_empty_when_no_links() {
+        let db = Db::in_memory();
+        db.put("driver", "d1", serde_json::json!({"name": "Bob"}), vec![], None, None).unwrap();
+        let (rows, count) = query(&db, r#"FROM driver WHERE _id = "d1" TRAVERSE handles"#).unwrap();
+        assert_eq!(count, 0);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn traverse_multi_source() {
+        // When WHERE matches multiple rows, TRAVERSE unions all their neighbors
+        let db = Db::in_memory();
+        db.put("driver", "d1", serde_json::json!({"status": "active"}), vec![], None, None).unwrap();
+        db.put("driver", "d2", serde_json::json!({"status": "active"}), vec![], None, None).unwrap();
+        db.put("trip",   "t1", serde_json::json!({"n": 1}), vec![], None, None).unwrap();
+        db.put("trip",   "t2", serde_json::json!({"n": 2}), vec![], None, None).unwrap();
+        db.put("trip",   "t3", serde_json::json!({"n": 3}), vec![], None, None).unwrap();
+
+        db.link("driver:d1", "handles", "trip:t1").unwrap();
+        db.link("driver:d1", "handles", "trip:t2").unwrap();
+        db.link("driver:d2", "handles", "trip:t3").unwrap();
+
+        let (rows, count) = query(&db, r#"FROM driver WHERE status = "active" TRAVERSE handles"#).unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn traverse_nql_keyword_case_insensitive() {
+        // Parser normalises to uppercase — "traverse" and "TRAVERSE" both work
+        let db = Db::in_memory();
+        db.put("driver", "d1", serde_json::json!({}), vec![], None, None).unwrap();
+        db.put("trip",   "t1", serde_json::json!({}), vec![], None, None).unwrap();
+        db.link("driver:d1", "handles", "trip:t1").unwrap();
+        // uppercase
+        let (r1, c1) = query(&db, r#"FROM driver WHERE _id = "d1" TRAVERSE handles"#).unwrap();
+        assert_eq!(c1, 1);
+        // lowercase (lexer uppercases keywords)
+        let (r2, c2) = query(&db, r#"FROM driver WHERE _id = "d1" traverse handles"#).unwrap();
+        assert_eq!(c2, 1);
+        assert_eq!(r1[0]["_id"], r2[0]["_id"]);
+    }
+
+    #[test]
+    fn traverse_durable() {
+        let dir = tempdir().unwrap();
+        {
+            let db = Db::open(dir.path(), None).unwrap();
+            db.put("driver", "d1", serde_json::json!({"name": "Bob"}),   vec![], None, None).unwrap();
+            db.put("trip",   "t1", serde_json::json!({"status": "req"}), vec![], None, None).unwrap();
+            db.link("driver:d1", "handles", "trip:t1").unwrap();
+        }
+        let db2 = Db::open(dir.path(), None).unwrap();
+        db2.startup_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (rows, count) = query(&db2, r#"FROM driver WHERE _id = "d1" TRAVERSE handles"#).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(rows[0]["_id"], "t1");
     }
 }

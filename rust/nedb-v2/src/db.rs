@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use anyhow::Result;
+use dashmap::DashMap;
 use serde_json::Value;
 use parking_lot::RwLock;
 
@@ -40,6 +41,10 @@ pub struct Db {
     /// Cold starts set this true in the background thread when scan completes.
     /// Writes are held with 503 until this is true; reads always proceed.
     pub startup_ready:  Arc<AtomicBool>,
+    /// Seq → hash lookup for v1 compatibility. Populated by put(), put_batch(),
+    /// and the cold-scan background pass. Only covers nodes from the current
+    /// process session + cold-scan; older seqs not in this map cannot be resolved.
+    seq_index:          Arc<DashMap<u64, String>>,
 }
 
 impl Db {
@@ -57,6 +62,7 @@ impl Db {
             head:           RwLock::new(String::new()),
             startup_ready:  Arc::new(AtomicBool::new(true)),  // always ready
             manifest_dirty: Arc::new(AtomicBool::new(false)),
+            seq_index:      Arc::new(DashMap::new()),
         }
     }
 
@@ -79,6 +85,7 @@ impl Db {
             head: RwLock::new(String::new()),
             startup_ready:  Arc::new(AtomicBool::new(false)),
             manifest_dirty: Arc::new(AtomicBool::new(false)),
+            seq_index:      Arc::new(DashMap::new()),
         };
 
         // Auto-migrate v1 → v2 if needed (pass DEK so encrypted AOFs convert correctly)
@@ -189,6 +196,7 @@ impl Db {
 
         // Write to object store (atomic, content-addressed)
         let hash = self.objects.write(&mut node)?;
+        self.seq_index.insert(seq, hash.clone());
 
         // Update id index (atomic file)
         self.id_index.set(coll, id, &hash)?;
@@ -258,6 +266,7 @@ impl Db {
 
         // Sorted indexes + causal graph (sequential — small overhead, usually no indexes)
         for node in &nodes {
+            self.seq_index.insert(node.seq, node.hash.clone());
             if let Value::Object(ref obj) = node.data {
                 for (field, value) in obj {
                     if self.sorted_indexes.has(&node.coll, field) {
@@ -474,6 +483,50 @@ impl Db {
             }
         }
     }
+
+    /// Resolve a sequence number to its content hash (v1 compatibility).
+    /// Only covers nodes written in the current process session + cold-scan nodes.
+    pub fn get_hash_by_seq(&self, seq: u64) -> Option<String> {
+        self.seq_index.get(&seq).map(|r| r.clone())
+    }
+
+    /// Add an explicit named relation edge between two documents.
+    /// frm and to are "coll:id" strings. Edges are stored in the graph store
+    /// as: graph/{frm_hash}/{rel}/{to_hash} and the reverse.
+    pub fn link(&self, frm: &str, rel: &str, to: &str) -> Result<()> {
+        // Parse "coll:id" → (coll, id)
+        let (frm_coll, frm_id) = frm.split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("link frm must be 'coll:id', got: {}", frm))?;
+        let (to_coll, to_id) = to.split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("link to must be 'coll:id', got: {}", to))?;
+
+        let frm_hash = self.id_index.get(frm_coll, frm_id)
+            .ok_or_else(|| anyhow::anyhow!("link: frm not found: {}", frm))?;
+        let to_hash = self.id_index.get(to_coll, to_id)
+            .ok_or_else(|| anyhow::anyhow!("link: to not found: {}", to))?;
+
+        let rev = format!("{}_rev", rel);
+        self.graph.add_edge(&frm_hash, rel, &to_hash)?;
+        self.graph.add_edge(&to_hash, &rev, &frm_hash)?;
+        Ok(())
+    }
+
+    /// Get all neighbor hashes for a node via a named relation.
+    /// frm is "coll:id". Returns current-version Node objects.
+    pub fn neighbors(&self, frm: &str, rel: &str) -> Vec<Node> {
+        let (coll, id) = match frm.split_once(':') {
+            Some(p) => p,
+            None    => return vec![],
+        };
+        let hash = match self.id_index.get(coll, id) {
+            Some(h) => h,
+            None    => return vec![],
+        };
+        self.graph.outgoing(&hash, rel)
+            .into_iter()
+            .filter_map(|h| self.objects.read(&h).ok())
+            .collect()
+    }
 }
 
 /// Background cold-scan worker. Takes Arc<Db> — safe, Db is on the heap.
@@ -522,6 +575,7 @@ fn cold_scan_background_arc(db: Arc<Db>) {
     seq_atomic.store(max_seq + 1, Ordering::SeqCst);
 
     for node in &nodes {
+        db.seq_index.insert(node.seq, node.hash.clone());
         if let Value::Object(ref obj) = node.data {
             for (field, value) in obj {
                 if sorted_indexes.has(&node.coll, field) {
@@ -621,5 +675,89 @@ mod tests {
         assert_eq!(at_v1.data["v"], 1);
         let current = db.get("docs", "x").unwrap();
         assert_eq!(current.data["v"], 2);
+    }
+}
+
+#[cfg(test)]
+mod tests_v2 {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn seq_index_populated_on_put() {
+        let db = Db::in_memory();
+        let a = db.put("item", "a", serde_json::json!({"x": 1}), vec![], None, None).unwrap();
+        let b = db.put("item", "b", serde_json::json!({"x": 2}), vec![], None, None).unwrap();
+        assert_eq!(db.get_hash_by_seq(a.seq), Some(a.hash.clone()));
+        assert_eq!(db.get_hash_by_seq(b.seq), Some(b.hash.clone()));
+        assert_eq!(db.get_hash_by_seq(9999), None);
+    }
+
+    #[test]
+    fn seq_index_survives_batch() {
+        let db = Db::in_memory();
+        let nodes = db.put_batch(vec![
+            ("item".into(), "x".into(), serde_json::json!({"v": 1}), vec![], None, None),
+            ("item".into(), "y".into(), serde_json::json!({"v": 2}), vec![], None, None),
+        ]).unwrap();
+        for node in &nodes {
+            assert_eq!(db.get_hash_by_seq(node.seq), Some(node.hash.clone()));
+        }
+    }
+
+    #[test]
+    fn link_and_neighbors() {
+        let db = Db::in_memory();
+        db.put("driver", "d1", serde_json::json!({"name": "Bob"}),   vec![], None, None).unwrap();
+        db.put("driver", "d2", serde_json::json!({"name": "Carol"}), vec![], None, None).unwrap();
+        db.put("trip",   "t1", serde_json::json!({"status": "req"}), vec![], None, None).unwrap();
+        db.put("trip",   "t2", serde_json::json!({"status": "req"}), vec![], None, None).unwrap();
+
+        db.link("driver:d1", "handles", "trip:t1").unwrap();
+        db.link("driver:d1", "handles", "trip:t2").unwrap();
+        db.link("driver:d2", "handles", "trip:t1").unwrap();
+
+        let d1_trips = db.neighbors("driver:d1", "handles");
+        assert_eq!(d1_trips.len(), 2);
+        let ids: std::collections::HashSet<&str> = d1_trips.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains("t1") && ids.contains("t2"));
+
+        let d2_trips = db.neighbors("driver:d2", "handles");
+        assert_eq!(d2_trips.len(), 1);
+        assert_eq!(d2_trips[0].id, "t1");
+    }
+
+    #[test]
+    fn link_reverse_edge_stored() {
+        let db = Db::in_memory();
+        db.put("driver", "d1", serde_json::json!({"name": "Bob"}),   vec![], None, None).unwrap();
+        db.put("trip",   "t1", serde_json::json!({"status": "req"}), vec![], None, None).unwrap();
+        db.link("driver:d1", "handles", "trip:t1").unwrap();
+        let inbound = db.neighbors("trip:t1", "handles_rev");
+        assert_eq!(inbound.len(), 1);
+        assert_eq!(inbound[0].id, "d1");
+    }
+
+    #[test]
+    fn link_missing_node_errors() {
+        let db = Db::in_memory();
+        db.put("driver", "d1", serde_json::json!({}), vec![], None, None).unwrap();
+        assert!(db.link("driver:d1", "handles", "trip:ghost").is_err());
+    }
+
+    #[test]
+    fn link_durable_survives_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let db = Db::open(dir.path(), None).unwrap();
+            db.put("driver", "d1", serde_json::json!({"name": "Bob"}),   vec![], None, None).unwrap();
+            db.put("trip",   "t1", serde_json::json!({"status": "req"}), vec![], None, None).unwrap();
+            db.link("driver:d1", "handles", "trip:t1").unwrap();
+        }
+        let db2 = Db::open(dir.path(), None).unwrap();
+        db2.startup_ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        let trips = db2.neighbors("driver:d1", "handles");
+        assert_eq!(trips.len(), 1);
+        assert_eq!(trips[0].id, "t1");
     }
 }

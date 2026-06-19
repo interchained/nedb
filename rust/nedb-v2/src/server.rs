@@ -371,7 +371,7 @@ struct PutBody {
     coll:       String,
     id:         String,
     doc:        Value,
-    caused_by:  Option<Vec<String>>,
+    caused_by:  Option<Vec<serde_json::Value>>,
     valid_from: Option<String>,
     valid_to:   Option<String>,
     #[allow(dead_code)] evidence:   Option<String>,
@@ -379,6 +379,13 @@ struct PutBody {
     #[allow(dead_code)] client:     Option<String>,
     #[allow(dead_code)] nonce:      Option<u64>,
     #[allow(dead_code)] idem:       Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LinkBody {
+    frm: String,
+    rel: String,
+    to:  String,
 }
 
 async fn put_document(
@@ -404,7 +411,17 @@ async fn put_document(
         return err(StatusCode::SERVICE_UNAVAILABLE,
             "database startup in progress — reads available, writes retry in a moment");
     }
-    let caused_by = body.caused_by.unwrap_or_default();
+    // Resolve caused_by items: accept hash strings (v2 native) OR seq integers (v1 compat).
+    let caused_by: Vec<String> = body.caused_by.unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| match v {
+            serde_json::Value::String(s) => Some(s),
+            serde_json::Value::Number(n) => {
+                n.as_u64().and_then(|seq| db.get_hash_by_seq(seq))
+            }
+            _ => None,
+        })
+        .collect();
     // Run synchronous file I/O (objects.write) on a blocking thread so concurrent
     // PUTs don't serialize on the tokio async thread pool.
     let coll = body.coll.clone();
@@ -437,6 +454,29 @@ fn node_to_response(node: &Node) -> Value {
     })
 }
 
+async fn link_document(
+    State(mgr): State<Manager>,
+    headers: HeaderMap,
+    AxPath(name): AxPath<String>,
+    Json(body): Json<LinkBody>,
+) -> Response {
+    if !mgr.check_auth(&headers) { return err(StatusCode::UNAUTHORIZED, "unauthorized"); }
+    let db = match mgr.get_db(&name).await {
+        None => return err(StatusCode::NOT_FOUND, &format!("database not found: {}", name)),
+        Some(db) => db,
+    };
+    if !db.startup_ready.load(std::sync::atomic::Ordering::SeqCst) {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "startup scan in progress");
+    }
+    match db.link(&body.frm, &body.rel, &body.to) {
+        Ok(()) => {
+            let (seq, head) = db_seq_head(&db);
+            ok(json!({"ok": true, "frm": body.frm, "rel": body.rel, "to": body.to, "seq": seq, "head": head}))
+        }
+        Err(e) => err(StatusCode::BAD_REQUEST, &e.to_string()),
+    }
+}
+
 async fn delete_document(
     State(mgr): State<Manager>,
     headers: HeaderMap,
@@ -463,7 +503,7 @@ struct BatchOp {
     coll: Option<String>,
     id:  Option<String>,
     doc: Option<Value>,
-    caused_by: Option<Vec<String>>,
+    caused_by: Option<Vec<serde_json::Value>>,
 }
 #[derive(Deserialize)]
 struct BatchBody { ops: Vec<BatchOp> }
@@ -499,12 +539,23 @@ async fn batch_operations(
         let t = op.op.to_lowercase();
         match t.as_str() {
             "put" => {
+                // Resolve caused_by items: accept hash strings (v2 native) OR seq integers (v1 compat).
+                let caused_by: Vec<String> = op.caused_by.clone().unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        serde_json::Value::String(s) => Some(s),
+                        serde_json::Value::Number(n) => {
+                            n.as_u64().and_then(|seq| db.get_hash_by_seq(seq))
+                        }
+                        _ => None,
+                    })
+                    .collect();
                 op_order.push(("put", put_ops.len()));
                 put_ops.push((
                     op.coll.clone().unwrap_or_default(),
                     op.id.clone().unwrap_or_default(),
                     op.doc.clone().unwrap_or(json!({})),
-                    op.caused_by.clone().unwrap_or_default(),
+                    caused_by,
                     None::<String>,
                     None::<String>,
                 ));
@@ -733,6 +784,7 @@ pub fn router(mgr: Manager) -> Router {
         .route("/v1/databases/:name",                            get(get_database).delete(drop_database))
         .route("/v1/databases/:name/query",                      post(query_database))
         .route("/v1/databases/:name/put",                        post(put_document))
+        .route("/v1/databases/:name/link",                       post(link_document))
         .route("/v1/databases/:name/rows/:coll/:id",             delete(delete_document))
         .route("/v1/databases/:name/batch",                      post(batch_operations))
         .route("/v1/databases/:name/index",                      post(create_index))
