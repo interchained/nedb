@@ -24,26 +24,52 @@ TMK sources (priority order):
 HKDF normalization: the TMK may be any length ≥ 16 bytes; it is always
 stretched / compressed to exactly 32 bytes via HKDF-SHA256 before use, so
 passphrases and key files of any size are accepted safely.
+
+Backend: pycryptodome (primary, cross-platform, pre-built wheels for all OSes
+including Windows MinGW — no cffi / C compiler required).  Falls back to
+cryptography if pycryptodome is not available (backwards compatibility for
+existing installations that already have cryptography).
+
+Install:
+    pip install nedb-engine[encryption]      # installs pycryptodome
 """
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import os
 from typing import Optional
 
-# Optional dependency — graceful error if not installed.
+# ── Backend detection ────────────────────────────────────────────────────────
+# pycryptodome is the primary backend: pre-built binary wheels for all
+# platforms (Linux / macOS / Windows x86 / Windows arm64 / Windows MinGW)
+# with no cffi dependency — installs everywhere without a C compiler.
+_BACKEND: Optional[str] = None
+_HAVE_CRYPTO = False
+
 try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-    from cryptography.hazmat.primitives import hashes
-    _HAVE_CRYPTO = True
+    from Crypto.Cipher import AES as _PCD_AES             # type: ignore[import]
+    from Crypto.Protocol.KDF import HKDF as _PCD_HKDF     # type: ignore[import]
+    from Crypto.Hash import SHA256 as _PCD_SHA256          # type: ignore[import]
+    _BACKEND      = "pycryptodome"
+    _HAVE_CRYPTO  = True
 except ImportError:
-    _HAVE_CRYPTO = False
+    pass
+
+if not _HAVE_CRYPTO:
+    # Fallback: cryptography (older installations / explicit [encryption] extra)
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _CG_AESGCM  # type: ignore[import]
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF as _CG_HKDF          # type: ignore[import]
+        from cryptography.hazmat.primitives import hashes as _CG_hashes                # type: ignore[import]
+        _BACKEND     = "cryptography"
+        _HAVE_CRYPTO = True
+    except ImportError:
+        pass
 
 KEY_LEN   = 32    # 256-bit
 NONCE_LEN = 12    # 96-bit GCM nonce (standard recommendation)
+TAG_LEN   = 16    # 128-bit GCM authentication tag
 
 # Additional Authenticated Data tags — bind ciphertext to its purpose.
 _AAD_DEK  = b"NEDB-DEK-v1"
@@ -53,16 +79,30 @@ _AAD_DATA = b"NEDB-data-v1"
 def _require_crypto() -> None:
     if not _HAVE_CRYPTO:
         raise ImportError(
-            "pip install cryptography  is required for NEDB encryption at rest."
+            "NEDB encryption at rest requires pycryptodome or cryptography.\n"
+            "Install with:  pip install 'nedb-engine[encryption]'\n"
+            "  (or:         pip install pycryptodome)"
         )
 
+
+# ── Key derivation ────────────────────────────────────────────────────────────
 
 def derive_key(material: bytes) -> bytes:
     """Normalise any-length key material to exactly 32 bytes via HKDF-SHA256."""
     _require_crypto()
-    h = HKDF(algorithm=hashes.SHA256(), length=KEY_LEN,
-              salt=b"NEDB-hkdf-v1", info=b"nedb-key")
-    return h.derive(material)
+    if _BACKEND == "pycryptodome":
+        return _PCD_HKDF(
+            master=material, key_len=KEY_LEN,
+            salt=b"NEDB-hkdf-v1",
+            hashmod=_PCD_SHA256,
+            context=b"nedb-key",
+        )
+    else:
+        h = _CG_HKDF(
+            algorithm=_CG_hashes.SHA256(), length=KEY_LEN,
+            salt=b"NEDB-hkdf-v1", info=b"nedb-key",
+        )
+        return h.derive(material)
 
 
 def resolve_tmk(tmk_arg: Optional[bytes] = None) -> Optional[bytes]:
@@ -86,24 +126,40 @@ def resolve_tmk(tmk_arg: Optional[bytes] = None) -> Optional[bytes]:
     return derive_key(material)
 
 
-# ── Low-level primitives ─────────────────────────────────────────────────────
+# ── Low-level primitives ──────────────────────────────────────────────────────
+# On-disk format: nonce‖ciphertext‖tag  (12 + len + 16 bytes)
+# Both backends produce and consume the same byte layout for full compatibility
+# with databases created by either backend.
 
-def encrypt_bytes(plaintext: bytes, dek: bytes) -> bytes:
+def encrypt_bytes(plaintext: bytes, dek: bytes, aad: bytes = _AAD_DATA) -> bytes:
     """AES-256-GCM encrypt. Returns nonce‖ciphertext‖tag (12 + len + 16 bytes)."""
     _require_crypto()
     nonce = os.urandom(NONCE_LEN)
-    ct = AESGCM(dek).encrypt(nonce, plaintext, _AAD_DATA)
-    return nonce + ct
+    if _BACKEND == "pycryptodome":
+        cipher = _PCD_AES.new(dek, _PCD_AES.MODE_GCM, nonce=nonce)
+        cipher.update(aad)
+        ciphertext, tag = cipher.encrypt_and_digest(plaintext)
+        return nonce + ciphertext + tag
+    else:
+        ct_with_tag = _CG_AESGCM(dek).encrypt(nonce, plaintext, aad)
+        return nonce + ct_with_tag
 
 
-def decrypt_bytes(data: bytes, dek: bytes) -> bytes:
-    """AES-256-GCM decrypt. Raises cryptography.exceptions.InvalidTag on tampering."""
+def decrypt_bytes(data: bytes, dek: bytes, aad: bytes = _AAD_DATA) -> bytes:
+    """AES-256-GCM decrypt. Raises ValueError / InvalidTag on tampering."""
     _require_crypto()
-    nonce, ct = data[:NONCE_LEN], data[NONCE_LEN:]
-    return AESGCM(dek).decrypt(nonce, ct, _AAD_DATA)
+    nonce      = data[:NONCE_LEN]
+    ciphertext = data[NONCE_LEN:-TAG_LEN]
+    tag        = data[-TAG_LEN:]
+    if _BACKEND == "pycryptodome":
+        cipher = _PCD_AES.new(dek, _PCD_AES.MODE_GCM, nonce=nonce)
+        cipher.update(aad)
+        return cipher.decrypt_and_verify(ciphertext, tag)
+    else:
+        return _CG_AESGCM(dek).decrypt(nonce, ciphertext + tag, aad)
 
 
-# ── DEK management ───────────────────────────────────────────────────────────
+# ── DEK management ────────────────────────────────────────────────────────────
 
 KEY_ENC_FILE = "key.enc"
 
@@ -121,16 +177,29 @@ def wrap_dek(dek: bytes, tmk: bytes) -> dict:
     """Encrypt the DEK with the TMK → a JSON-serialisable dict."""
     _require_crypto()
     nonce = os.urandom(NONCE_LEN)
-    ct = AESGCM(tmk).encrypt(nonce, dek, _AAD_DEK)
-    return {"v": 1, "alg": "AES-256-GCM", "n": nonce.hex(), "ct": ct.hex()}
+    if _BACKEND == "pycryptodome":
+        cipher = _PCD_AES.new(tmk, _PCD_AES.MODE_GCM, nonce=nonce)
+        cipher.update(_AAD_DEK)
+        ct, tag = cipher.encrypt_and_digest(dek)
+        ct_with_tag = ct + tag
+    else:
+        ct_with_tag = _CG_AESGCM(tmk).encrypt(nonce, dek, _AAD_DEK)
+    return {"v": 1, "alg": "AES-256-GCM", "n": nonce.hex(), "ct": ct_with_tag.hex()}
 
 
 def unwrap_dek(wrapped: dict, tmk: bytes) -> bytes:
-    """Decrypt the DEK using the TMK. Raises InvalidTag if the TMK is wrong."""
+    """Decrypt the DEK using the TMK. Raises if the TMK is wrong or data tampered."""
     _require_crypto()
-    nonce = bytes.fromhex(wrapped["n"])
-    ct    = bytes.fromhex(wrapped["ct"])
-    return AESGCM(tmk).decrypt(nonce, ct, _AAD_DEK)
+    nonce       = bytes.fromhex(wrapped["n"])
+    ct_with_tag = bytes.fromhex(wrapped["ct"])
+    ct          = ct_with_tag[:-TAG_LEN]
+    tag         = ct_with_tag[-TAG_LEN:]
+    if _BACKEND == "pycryptodome":
+        cipher = _PCD_AES.new(tmk, _PCD_AES.MODE_GCM, nonce=nonce)
+        cipher.update(_AAD_DEK)
+        return cipher.decrypt_and_verify(ct, tag)
+    else:
+        return _CG_AESGCM(tmk).decrypt(nonce, ct_with_tag, _AAD_DEK)
 
 
 def load_or_create_dek(data_dir: str, tmk: bytes) -> bytes:
@@ -143,7 +212,6 @@ def load_or_create_dek(data_dir: str, tmk: bytes) -> bytes:
         with open(path, encoding="utf-8") as fh:
             wrapped = json.load(fh)
         return unwrap_dek(wrapped, tmk)
-    # New database — generate a fresh DEK and persist it wrapped.
     dek = generate_dek()
     _save_wrapped_dek(data_dir, dek, tmk)
     return dek
@@ -168,13 +236,9 @@ def rewrap_dek(data_dir: str, old_tmk: bytes, new_tmk: bytes) -> None:
     _save_wrapped_dek(data_dir, dek, new_tmk)
 
 
-# ── AOF line helpers ─────────────────────────────────────────────────────────
+# ── AOF line helpers ──────────────────────────────────────────────────────────
 
 def aof_encode(op_json: str, dek: Optional[bytes]) -> str:
-    """
-    Encode one AOF line. If dek is set, the JSON is encrypted and the line
-    is a compact JSON envelope. Otherwise the original JSON is returned as-is.
-    """
     if dek is None:
         return op_json
     ct = encrypt_bytes(op_json.encode(), dek)
@@ -183,10 +247,6 @@ def aof_encode(op_json: str, dek: Optional[bytes]) -> str:
 
 
 def aof_decode(line: str, dek: Optional[bytes]) -> str:
-    """
-    Decode one AOF line. Handles both encrypted and plain lines transparently
-    so a database can be opened with or without a DEK.
-    """
     stripped = line.strip()
     if not stripped:
         return stripped
@@ -197,24 +257,21 @@ def aof_decode(line: str, dek: Optional[bytes]) -> str:
                 ct = base64.b64decode(env["ct"])
                 return decrypt_bytes(ct, dek).decode()
         except Exception:
-            pass  # fall through to plain read (migration from unencrypted)
+            pass
     return stripped
 
 
-# ── Snapshot helpers ─────────────────────────────────────────────────────────
+# ── Snapshot helpers ──────────────────────────────────────────────────────────
 
 def snapshot_encode(content: bytes, dek: Optional[bytes]) -> bytes:
-    """Encrypt the entire snapshot.json content if a DEK is set."""
     if dek is None:
         return content
     ct = encrypt_bytes(content, dek)
-    envelope = json.dumps({"enc": 1, "ct": base64.b64encode(ct).decode()},
-                          separators=(",", ":"))
-    return envelope.encode()
+    return json.dumps({"enc": 1, "ct": base64.b64encode(ct).decode()},
+                      separators=(",", ":")).encode()
 
 
 def snapshot_decode(raw: bytes, dek: Optional[bytes]) -> bytes:
-    """Decrypt snapshot.json content if it's encrypted."""
     if dek is None:
         return raw
     try:
@@ -224,16 +281,14 @@ def snapshot_decode(raw: bytes, dek: Optional[bytes]) -> bytes:
             return decrypt_bytes(ct, dek)
     except Exception:
         pass
-    return raw  # plain (migration from unencrypted)
+    return raw
 
 
-# ── BlobStore chunk helpers ──────────────────────────────────────────────────
+# ── BlobStore chunk helpers ───────────────────────────────────────────────────
 
 def chunk_encode(compressed_bytes: bytes, dek: Optional[bytes]) -> bytes:
-    """Encrypt a compressed chunk before storing it. Toggle-able."""
     return encrypt_bytes(compressed_bytes, dek) if dek is not None else compressed_bytes
 
 
 def chunk_decode(stored_bytes: bytes, dek: Optional[bytes]) -> bytes:
-    """Decrypt a stored chunk. Toggle-able."""
     return decrypt_bytes(stored_bytes, dek) if dek is not None else stored_bytes

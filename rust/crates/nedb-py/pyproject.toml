@@ -9,7 +9,7 @@ build-backend = "maturin"
 
 [project]
 name = "nedb-engine"
-version = "2.2.10"
+version = "2.2.24"
 description = "NEDB — versioned, self-compressing, time-traveling embedded database with Rust native core"
 requires-python = ">=3.8"
 license = { text = "GPL-3.0-or-later" }
@@ -23,7 +23,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Database :: Database Engines/Servers",
 ]
-dependencies = ["cryptography>=41"]
+dependencies = ["pycryptodome>=3.19"]
 
 [project.scripts]
 nedbd = "nedb.server:main"

@@ -20,14 +20,76 @@ jobs:
   pypi:
     name: Publish to PyPI (universal)
     runs-on: ubuntu-latest
+    # Wait for Linux+Windows native extensions AND nedbd-v2 binaries.
+    # Mac extensions arrive from Codemagic via the GitHub release poll below.
+    needs: [node-binaries, create-release, wheels]
+    if: "!cancelled()"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: python3 tests/test_nedb.py        # 11/11 invariants gate the release
+      # ── Collect _native extensions from CI artifact store ──────────────────
+      # Each wheels job extracted nedb/_native.* from its built wheel and
+      # uploaded it as native-ext-{label}.  Download them all here.
+      - name: Download _native extension artifacts (Linux + Windows)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-ext-*
+          merge-multiple: true
+          path: native-ext
+      - name: Stage _native extensions into python/nedb/
+        shell: bash
+        run: |
+          echo "native-ext contents:"; find native-ext -type f | sort || echo "(none)"
+          # Copy every _native.* file found into the Python package.
+          find native-ext -type f -name "_native*" | while read f; do
+            fname=$(basename "$f")
+            cp "$f" "python/nedb/$fname"
+            chmod +x "python/nedb/$fname" 2>/dev/null || true
+            echo "  staged: python/nedb/$fname"
+          done
+      # ── Wait for Mac extensions from Codemagic ────────────────────────────
+      # Codemagic uploads nedbd-v2-darwin-* AND mac _native .so files to the
+      # GitHub release.  Poll until both server binaries appear (the extensions
+      # come in the same upload), then download everything.
+      - name: Wait for Mac artifacts from Codemagic + download all
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          VERSION="${{ github.ref_name }}"
+          echo "Polling GitHub release for Mac nedbd-v2 + _native binaries..."
+          for i in $(seq 1 35); do
+            ASSETS=$(gh release view "$VERSION" --json assets --jq '[.assets[].name]' 2>/dev/null || echo "[]")
+            ARM=$(echo "$ASSETS" | grep -c "nedbd-v2-darwin-arm64" || true)
+            X86=$(echo "$ASSETS" | grep -c "nedbd-v2-darwin-x64" || true)
+            echo "  Attempt $i/35 — darwin-arm64=$ARM darwin-x64=$X86"
+            if [ "$ARM" -gt 0 ] && [ "$X86" -gt 0 ]; then
+              echo "Mac binaries found — downloading"
+              break
+            fi
+            [ "$i" -eq 35 ] && echo "Timeout — proceeding without Mac"
+            sleep 60
+          done
+          gh release download "$VERSION" --pattern "nedbd-v2-*" --dir . --clobber || true
+          gh release download "$VERSION" --pattern "_native*darwin*" --dir native-ext --clobber || true
+          # Stage nedbd-v2 server binaries
+          [ -f nedbd-v2-linux-x64 ]      && cp nedbd-v2-linux-x64      python/nedb/nedbd-v2              && chmod +x python/nedb/nedbd-v2
+          [ -f nedbd-v2-win-x64.exe ]    && cp nedbd-v2-win-x64.exe    python/nedb/nedbd-v2.exe
+          [ -f nedbd-v2-darwin-arm64 ]   && cp nedbd-v2-darwin-arm64   python/nedb/nedbd-v2-darwin-arm64 && chmod +x python/nedb/nedbd-v2-darwin-arm64
+          [ -f nedbd-v2-darwin-x64 ]     && cp nedbd-v2-darwin-x64     python/nedb/nedbd-v2-darwin-x64   && chmod +x python/nedb/nedbd-v2-darwin-x64
+          # Stage any Mac _native extensions that Codemagic uploaded
+          find native-ext -type f -name "_native*darwin*" 2>/dev/null | while read f; do
+            fname=$(basename "$f")
+            cp "$f" "python/nedb/$fname" && chmod +x "python/nedb/$fname" || true
+            echo "  staged mac ext: python/nedb/$fname"
+          done
+          echo "Final python/nedb/ contents:"
+          ls -lh python/nedb/nedbd* python/nedb/_native* 2>/dev/null || echo "(none)"
+      - run: python3 tests/test_nedb.py
       - run: pip install --upgrade build twine
-      - run: python -m build                   # -> py3-none-any wheel + sdist
+      - run: python -m build
       - name: Publish to PyPI
         if: startsWith(github.ref, 'refs/tags/')
         env:
@@ -48,31 +110,60 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, label: linux-x86_64   }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,   label: windows-x86_64}
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  label: linux-x86_64,   mingw: false }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,    label: windows-x86_64, mingw: false }
           # macOS wheels (arm64 + x86_64) are built by Codemagic on M2 Mac Minis.
-          # Removing them here eliminates the shared-runner queue wait entirely.
+          # MinGW/MSYS2 users get the binary via the fat py3-none-any universal wheel.
+          # PyPI rejects mingw_x86_64 platform tags so a separate MinGW wheel is omitted.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # ── MinGW / MSYS2 setup (windows-gnu only) ────────────────────────────────
+      # MSYS2 MinGW64 Python has platform tags like mingw_x86_64_msvcrt_gnu.
+      # Maturin must run INSIDE MSYS2 using that Python as the interpreter so
+      # the resulting wheel is tagged for MinGW and pip on MSYS2 installs it.
+      - name: Set up MSYS2 MinGW64 (Python + pip + gcc + rust)
+        if: matrix.mingw
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-python
+            mingw-w64-x86_64-python-pip
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-rust
+      # ── Standard Rust toolchain (non-MinGW only) ───────────────────────────
       - uses: dtolnay/rust-toolchain@stable
+        if: "!matrix.mingw"
         with:
           targets: ${{ matrix.target }}
+      # ── nedbd-v2 binary (MSVC build for both — .exe runs in any Windows env) ─
       - name: Build nedbd-v2 (DAG engine binary)
+        if: "!matrix.mingw"
         shell: bash
         run: |
           cd rust
           cargo build --release --bin nedbd --package nedb-core-v2 --target ${{ matrix.target }}
           cd ..
           EXT=""
-          [[ "${{ matrix.os }}" == "windows-latest" ]] && EXT=".exe"
+          [[ "${{ matrix.target }}" == *"windows"* ]] && EXT=".exe"
           BIN="rust/target/${{ matrix.target }}/release/nedbd${EXT}"
           DEST="python/nedb/nedbd-v2${EXT}"
           cp "$BIN" "$DEST"
           chmod +x "$DEST" || true
           echo "nedbd-v2 staged: $(ls -lh $DEST)"
+      - name: Build nedbd-v2 (MinGW binary)
+        if: matrix.mingw
+        shell: msys2 {0}
+        run: |
+          cd rust
+          cargo build --release --bin nedbd --package nedb-core-v2
+          cd ..
+          cp rust/target/release/nedbd.exe python/nedb/nedbd-v2.exe
+          echo "nedbd-v2 MinGW staged: $(ls -lh python/nedb/nedbd-v2.exe)"
       - name: Stage Python source + binary into maturin layout
         shell: bash
         run: |
@@ -81,14 +172,15 @@ jobs:
           cp -r python/nedb rust/crates/nedb-py/python/nedb
           find rust/crates/nedb-py/python/nedb -name "nedbd-v2*" -exec chmod +x {} \; || true
           echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) .py files"
-          # Verify binary made it — fail loudly if missing (maturin include= requires it)
           if ls rust/crates/nedb-py/python/nedb/nedbd-v2* 2>/dev/null; then
             echo "nedbd-v2 binary confirmed in staging area"
           else
-            echo "ERROR: nedbd-v2 binary missing from staging area — wheel would lack the binary"
+            echo "ERROR: nedbd-v2 binary missing from staging area"
             exit 1
           fi
-      - name: Build wheel (maturin)
+      # ── Build wheel — maturin-action for standard targets ─────────────────
+      - name: Build wheel (maturin — standard)
+        if: "!matrix.mingw"
         uses: PyO3/maturin-action@v1
         with:
           command: build
@@ -96,10 +188,43 @@ jobs:
           args: --release --out ../../../dist
           manylinux: auto
           target: ${{ matrix.target }}
+      # ── Build wheel — MSYS2 maturin for MinGW ─────────────────────────────
+      # Run maturin with MSYS2 MinGW Python so the wheel gets mingw_x86_64_*
+      # platform tags that MSYS2/Git Bash pip recognises and installs.
+      - name: Install maturin in MSYS2 (MinGW only)
+        if: matrix.mingw
+        shell: msys2 {0}
+        run: pip install maturin
+      - name: Build wheel (maturin — MinGW)
+        if: matrix.mingw
+        shell: msys2 {0}
+        run: |
+          mkdir -p dist
+          cd rust/crates/nedb-py
+          maturin build --release --out ../../../dist
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.label }}
           path: dist
+      # Extract the _native .pyd/.so from the wheel so the pypi job can embed
+      # it in the universal wheel — lets `from nedb._native import NedbCore`
+      # work on any platform without needing the platform wheel installed.
+      - name: Extract _native extension for universal wheel
+        if: "!matrix.mingw"
+        shell: bash
+        run: |
+          mkdir -p native-ext/nedb
+          for whl in dist/*.whl; do
+            unzip -j "$whl" "nedb/_native*" -d native-ext/nedb 2>/dev/null || true
+          done
+          chmod +x native-ext/nedb/_native* 2>/dev/null || true
+          echo "native-ext contents:"; ls -lhR native-ext/ 2>/dev/null || echo "(none)"
+      - uses: actions/upload-artifact@v4
+        if: "!matrix.mingw"
+        with:
+          name: native-ext-${{ matrix.label }}
+          path: native-ext
+          if-no-files-found: ignore
 
   publish-native:
     name: Publish native wheels to PyPI
@@ -173,7 +298,27 @@ jobs:
         run: npm install
       - name: Build native addon
         run: npx napi build --platform --release --target ${{ matrix.target }} --cargo-cwd rust/crates/nedb-node
-      - name: Upload .node binary to GitHub release
+      - name: Build nedbd-v2 binary (DAG engine daemon)
+        shell: bash
+        run: |
+          cd rust
+          cargo build --release --bin nedbd --package nedb-core-v2 --target ${{ matrix.target }}
+          cd ..
+          # Stage the binary with the platform-suffixed name the JS shim expects.
+          # Naming matches the .node convention: nedbd-v2-<platform>-<arch>[.exe]
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-gnu" ]]; then
+            SRC="rust/target/${{ matrix.target }}/release/nedbd"
+            DEST="nedbd-v2-linux-x64"
+          elif [[ "${{ matrix.target }}" == "x86_64-pc-windows-msvc" ]]; then
+            SRC="rust/target/${{ matrix.target }}/release/nedbd.exe"
+            DEST="nedbd-v2-win-x64.exe"
+          else
+            echo "Unknown target ${{ matrix.target }}"; exit 1
+          fi
+          cp "$SRC" "$DEST"
+          chmod +x "$DEST" || true
+          echo "Staged nedbd-v2 binary: $(ls -lh $DEST)"
+      - name: Upload .node + nedbd-v2 binaries to GitHub release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -181,13 +326,20 @@ jobs:
           for f in *.node; do
             [ -f "$f" ] && gh release upload "${{ github.ref_name }}" "$f" --clobber || true
           done
+          # Upload platform-suffixed nedbd-v2 binary (linux-x64 or win-x64.exe)
+          for f in nedbd-v2-linux-x64 nedbd-v2-win-x64.exe; do
+            [ -f "$f" ] && gh release upload "${{ github.ref_name }}" "$f" --clobber || true
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: node-${{ matrix.target }}
           path: |
             *.node
+            nedbd-v2-linux-x64
+            nedbd-v2-win-x64.exe
             index.js
             index.d.ts
+          if-no-files-found: ignore
 
   publish-npm:
     needs: [node-binaries]
@@ -201,7 +353,7 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
-      - name: Download Linux + Windows napi artifacts
+      - name: Download Linux + Windows napi + nedbd-v2 artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: node-*
@@ -220,16 +372,32 @@ jobs:
             X86=$(echo "$ASSETS" | grep -c "darwin-x64" || true)
             echo "  Attempt $i/35 — arm64=$ARM x86_64=$X86"
             if [ "$ARM" -gt 0 ] && [ "$X86" -gt 0 ]; then
-              echo "Mac binaries found — downloading"
+              echo "Mac binaries found — downloading .node + nedbd-v2"
               gh release download "$VERSION" --pattern "*.node" --dir . --clobber
+              # Pull every platform-suffixed nedbd-v2 binary from the release
+              # (linux-x64 and win-x64.exe are already local from the artifact step
+              # above; --clobber makes the download idempotent. darwin-arm64 and
+              # darwin-x64 come from Codemagic.)
+              gh release download "$VERSION" --pattern "nedbd-v2-*" --dir . --clobber || true
               break
             fi
             if [ "$i" -eq 35 ]; then
               echo "Timeout — publishing without Mac binaries (Codemagic may still upload later)"
+              # Still grab whatever nedbd-v2-* assets exist on the release so we
+              # ship at minimum the linux/windows binaries we know are uploaded.
+              gh release download "$VERSION" --pattern "nedbd-v2-*" --dir . --clobber || true
             fi
             sleep 60
           done
-          echo "Final .node files: $(ls *.node 2>/dev/null || echo 'none')"
+          echo "Final .node files:     $(ls *.node 2>/dev/null || echo 'none')"
+          echo "Final nedbd-v2 files:  $(ls nedbd-v2-* 2>/dev/null || echo 'none')"
+      - name: Make nedbd-v2 binaries executable
+        shell: bash
+        run: |
+          for f in nedbd-v2-linux-x64 nedbd-v2-darwin-arm64 nedbd-v2-darwin-x64; do
+            [ -f "$f" ] && chmod +x "$f"
+          done
+          ls -lh nedbd-v2-* 2>/dev/null || true
       - name: Publish to npm (all available platform binaries)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

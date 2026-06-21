@@ -159,6 +159,16 @@ impl NedbCore {
     fn flush(&self) { self.inner.flush_all(); }
 }
 
+/// Flush index WAL and MANIFEST when the Python object is freed.
+/// Ensures id_index and MANIFEST are written to disk on `del db` or
+/// when the object goes out of scope — no explicit flush() call needed.
+impl Drop for NedbCore {
+    fn drop(&mut self) {
+        // Only flush durable databases (no-op for in-memory)
+        self.inner.flush_all();
+    }
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NedbCore>()?;

@@ -10,7 +10,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nedb-engine"
-version = "2.2.10"
+version = "2.2.24"
 description = "NEDB — a versioned, self-compressing, time-traveling embedded database (replay-protected, idempotent, relational, searchable) with durable AOF persistence and a server daemon (nedbd)."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -27,8 +27,15 @@ classifiers = [
 ]
 
 dependencies = [
-    "cryptography>=41",   # AES-256-GCM at-rest encryption; pre-built wheels on all platforms
+    # AES-256-GCM at-rest encryption (pycryptodome — pre-built wheels for all platforms
+    # including Windows MinGW, no cffi / C compiler required).
+    # Also accepted: cryptography>=41 (falls back automatically if pycryptodome absent).
+    "pycryptodome>=3.19",
 ]
+
+[project.optional-dependencies]
+# Alternative crypto backend (for installations that already have cryptography).
+encryption = ["cryptography>=41"]
 
 [project.scripts]
 nedbd = "nedb.server:main"

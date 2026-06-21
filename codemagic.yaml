@@ -98,18 +98,26 @@ workflows:
             --cargo-cwd rust/crates/nedb-node
           echo "napi .node files: $(ls *.node 2>/dev/null)"
 
-      - name: Upload Mac arm64 .node to GitHub release
+      - name: Upload Mac arm64 binaries to GitHub release
         script: |
-          # Install gh CLI if not present
           which gh || brew install gh
           VERSION=$(node -e "console.log(require('./package.json').version)")
           TAG="v$VERSION"
-          echo "Uploading Mac arm64 .node to GitHub release $TAG"
-          for f in *.node; do
-            [ -f "$f" ] && gh release upload "$TAG" "$f" \
-              --repo Eth-Interchained/nedb --clobber || true
+          echo "Uploading Mac arm64 artifacts to GitHub release $TAG"
+          # nedbd-v2 server binary
+          cp python/nedb/nedbd-v2 nedbd-v2-darwin-arm64
+          gh release upload "$TAG" nedbd-v2-darwin-arm64 --repo Eth-Interchained/nedb --clobber
+          # _native extension (so pypi fat-wheel includes it for Mac users)
+          for whl in dist/*.whl; do
+            unzip -j "$whl" "nedb/_native*" -d . 2>/dev/null || true
           done
-          echo "Uploaded: $(ls *.node 2>/dev/null)"
+          for f in _native*darwin*arm64*; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
+          done
+          # napi .node addon
+          for f in *.node; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
+          done
 
     artifacts:
       - dist/*.whl
@@ -193,17 +201,26 @@ workflows:
             --cargo-cwd rust/crates/nedb-node
           echo "napi .node files: $(ls *.node 2>/dev/null)"
 
-      - name: Upload Mac x86_64 .node to GitHub release
+      - name: Upload Mac x86_64 binaries to GitHub release
         script: |
           which gh || brew install gh
           VERSION=$(node -e "console.log(require('./package.json').version)")
           TAG="v$VERSION"
-          echo "Uploading Mac x86_64 .node to GitHub release $TAG"
-          for f in *.node; do
-            [ -f "$f" ] && gh release upload "$TAG" "$f" \
-              --repo Eth-Interchained/nedb --clobber || true
+          echo "Uploading Mac x86_64 artifacts to GitHub release $TAG"
+          # nedbd-v2 server binary
+          cp python/nedb/nedbd-v2 nedbd-v2-darwin-x64
+          gh release upload "$TAG" nedbd-v2-darwin-x64 --repo Eth-Interchained/nedb --clobber
+          # _native extension
+          for whl in dist/*.whl; do
+            unzip -j "$whl" "nedb/_native*" -d . 2>/dev/null || true
           done
-          echo "Uploaded: $(ls *.node 2>/dev/null)"
+          for f in _native*darwin*x86_64*; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
+          done
+          # napi .node addon
+          for f in *.node; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
+          done
 
     artifacts:
       - dist/*.whl

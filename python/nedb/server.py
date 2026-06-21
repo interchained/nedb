@@ -561,26 +561,57 @@ def main() -> None:
 
     # ── DAG mode: exec into the Rust v2 binary, replacing this process entirely ──
     if args.dag:
-        import shutil as _shutil, sys as _sys
+        import shutil as _shutil, subprocess as _sub, sys as _sys
         _pkg_dir = os.path.dirname(os.path.abspath(__file__))
-        _candidates = [
-            os.path.join(_pkg_dir, "nedbd-v2"),
-            os.path.join(_pkg_dir, "nedbd_v2"),
-            _shutil.which("nedbd-v2") or "",
-            _shutil.which("nedbd_v2") or "",
+        _cwd     = os.getcwd()
+        # Include .exe variants for Windows; search order:
+        # 1. Bundled in the Python wheel (platform wheel includes the binary)
+        # 2. PATH
+        # 3. Cargo release build relative to CWD (built from source)
+        # 4. Cargo release build relative to the package location
+        import platform as _platform
+        _ext  = ".exe" if _sys.platform == "win32" else ""
+        _arch = "arm64" if _platform.machine() in ("arm64", "aarch64") else "x64"
+        # Platform-specific names (in order of preference)
+        _names = (
+            # Mac: platform-specific binary bundled in fat wheel
+            ([f"nedbd-v2-darwin-{_arch}"] if _sys.platform == "darwin" else []) +
+            # Linux/Windows: generic names (also bundled in fat wheel)
+            ["nedbd-v2" + _ext, "nedbd_v2" + _ext] +
+            # Fallback: try both exe variants
+            (["nedbd-v2.exe", "nedbd_v2.exe"] if _sys.platform != "win32" else [])
+        )
+        _cargo_names = ["nedbd", "nedbd.exe"]
+        _cargo_dirs = [
+            os.path.join(_cwd, "rust", "nedb-v2", "target", "release"),
+            os.path.join(_cwd, "target", "release"),
+            os.path.join(os.path.dirname(_pkg_dir), "rust", "nedb-v2", "target", "release"),
         ]
+        _candidates = (
+            [os.path.join(_pkg_dir, n) for n in _names]
+            + [_shutil.which(n) or "" for n in _names]
+            + [os.path.join(d, n) for d in _cargo_dirs for n in _cargo_names]
+        )
         _bin = next((c for c in _candidates if c and os.path.isfile(c)), None)
         if _bin is None:
             print("nedbd --dag: v2 Rust binary not found.", file=_sys.stderr)
-            print("  Expected 'nedbd-v2' alongside the package or in PATH.", file=_sys.stderr)
-            print("  Build: cd rust/nedb-v2 && cargo build --release", file=_sys.stderr)
-            print("  Copy:  cp rust/nedb-v2/target/release/nedbd nedbd-v2 && nedbd --dag", file=_sys.stderr)
+            print("  Expected 'nedbd-v2' (or 'nedbd-v2.exe' on Windows) alongside the", file=_sys.stderr)
+            print("  package or on PATH.  Options:", file=_sys.stderr)
+            print("    pip install --upgrade nedb-engine  (platform wheel bundles the binary)", file=_sys.stderr)
+            print("    cd rust/nedb-v2 && cargo build --release", file=_sys.stderr)
+            print("    # then copy: nedbd-v2[.exe] to PATH or the nedb package dir", file=_sys.stderr)
             _sys.exit(1)
+        # Rust binary: nedbd-v2 [data_dir]
+        # Port/token/TMK are passed via environment variables (not CLI flags).
         os.environ["NEDBD_PORT"] = str(args.port)
         if args.token:
             os.environ["NEDBD_TOKEN"] = args.token
-        # exec replaces this process — clean signal handling, no Python overhead
-        os.execv(_bin, [_bin, args.data])
+        _argv = [_bin, args.data]   # data_dir is the only positional arg
+        # os.execv replaces the process on POSIX; use subprocess on Windows
+        if _sys.platform == "win32":
+            _sys.exit(_sub.call(_argv))
+        else:
+            os.execv(_bin, _argv)
 
     # Resolve log level: CLI flag beats env var.
     # Level 0: only errors (always printed)
