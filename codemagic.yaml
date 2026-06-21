@@ -98,18 +98,23 @@ workflows:
             --cargo-cwd rust/crates/nedb-node
           echo "napi .node files: $(ls *.node 2>/dev/null)"
 
-      - name: Upload Mac arm64 .node to GitHub release
+      - name: Upload Mac arm64 binaries to GitHub release
         script: |
           # Install gh CLI if not present
           which gh || brew install gh
           VERSION=$(node -e "console.log(require('./package.json').version)")
           TAG="v$VERSION"
-          echo "Uploading Mac arm64 .node to GitHub release $TAG"
+          echo "Uploading Mac arm64 artifacts to GitHub release $TAG"
+          # Upload nedbd-v2 binary (named for the pypi fat-wheel assembly job)
+          cp python/nedb/nedbd-v2 nedbd-v2-darwin-arm64
+          gh release upload "$TAG" nedbd-v2-darwin-arm64 \
+            --repo Eth-Interchained/nedb --clobber
+          # Upload napi .node addon
           for f in *.node; do
             [ -f "$f" ] && gh release upload "$TAG" "$f" \
               --repo Eth-Interchained/nedb --clobber || true
           done
-          echo "Uploaded: $(ls *.node 2>/dev/null)"
+          echo "Uploaded: nedbd-v2-darwin-arm64 $(ls *.node 2>/dev/null)"
 
     artifacts:
       - dist/*.whl
@@ -193,17 +198,22 @@ workflows:
             --cargo-cwd rust/crates/nedb-node
           echo "napi .node files: $(ls *.node 2>/dev/null)"
 
-      - name: Upload Mac x86_64 .node to GitHub release
+      - name: Upload Mac x86_64 binaries to GitHub release
         script: |
           which gh || brew install gh
           VERSION=$(node -e "console.log(require('./package.json').version)")
           TAG="v$VERSION"
-          echo "Uploading Mac x86_64 .node to GitHub release $TAG"
+          echo "Uploading Mac x86_64 artifacts to GitHub release $TAG"
+          # Upload nedbd-v2 binary (named for the pypi fat-wheel assembly job)
+          cp python/nedb/nedbd-v2 nedbd-v2-darwin-x64
+          gh release upload "$TAG" nedbd-v2-darwin-x64 \
+            --repo Eth-Interchained/nedb --clobber
+          # Upload napi .node addon
           for f in *.node; do
             [ -f "$f" ] && gh release upload "$TAG" "$f" \
               --repo Eth-Interchained/nedb --clobber || true
           done
-          echo "Uploaded: $(ls *.node 2>/dev/null)"
+          echo "Uploaded: nedbd-v2-darwin-x64 $(ls *.node 2>/dev/null)"
 
     artifacts:
       - dist/*.whl
