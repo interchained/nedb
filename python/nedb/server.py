@@ -583,13 +583,10 @@ def main() -> None:
         )
         _bin = next((c for c in _candidates if c and os.path.isfile(c)), None)
         if _bin is None:
-            print("nedbd --dag: v2 Rust binary not found.", file=_sys.stderr)
-            print("  Expected 'nedbd-v2' (or 'nedbd-v2.exe' on Windows) alongside the", file=_sys.stderr)
-            print("  package or on PATH.  Options:", file=_sys.stderr)
-            print("    pip install --upgrade nedb-engine  (platform wheel bundles the binary)", file=_sys.stderr)
-            print("    cd rust/nedb-v2 && cargo build --release", file=_sys.stderr)
-            print("    # then copy: nedbd-v2[.exe] to PATH or the nedb package dir", file=_sys.stderr)
-            _sys.exit(1)
+            # Auto-download from GitHub releases — handles MinGW Python, Linux ARM,
+            # and any platform where the pip wheel doesn't match but the standalone
+            # binary still runs (e.g. MSVC .exe works fine from Git Bash / MINGW64).
+            _bin = _dag_download_binary(_pkg_dir, _sys)
         # Rust binary: nedbd-v2 [data_dir]
         # Port/token/TMK are passed via environment variables (not CLI flags).
         os.environ["NEDBD_PORT"] = str(args.port)
