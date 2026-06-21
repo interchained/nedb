@@ -19,30 +19,174 @@ Features demonstrated:
   ✦ verify() (tamper-evident proof — nothing was changed)
   ✦ The AHA: close the DB, reopen, chain is intact
 
-Run: pip install nedb-engine && python3 tests/test_the_will.py
+Run modes:
+  Embedded (native extension):
+    pip install nedb-engine && python3 tests/test_the_will.py
+
+  HTTP mode (any platform — run nedbd first):
+    nedbd --data ./will-data --dag &
+    NEDB_URL=http://localhost:7070 python3 tests/test_the_will.py
 
 © INTERCHAINED LLC × Claude Sonnet 4.6
 """
-import json, sys, shutil, tempfile, time
+import json, os, sys, time, urllib.error, urllib.request
 from pathlib import Path
 
-try:
-    from nedb._native import NedbCore
-    import nedb as _nedb
-except ImportError:
-    print("  SKIP  nedb._native not available (universal wheel — no platform extension)")
-    print("        pip install --force-reinstall --no-cache-dir nedb-engine")
-    print("        on a platform with a native wheel (Linux x86_64, macOS, Windows x64)")
-    sys.exit(0)
+# ── Backend selection ──────────────────────────────────────────────────────────
+_NEDB_URL = os.environ.get("NEDB_URL", "").strip()
+_MODE = "http" if _NEDB_URL else "native"
 
+if _MODE == "native":
+    try:
+        from nedb._native import NedbCore
+        import nedb as _nedb
+        _VERSION = _nedb.__version__
+    except ImportError:
+        print("  SKIP  nedb._native not available on this platform.")
+        print()
+        print("  Options:")
+        print("    1. Use a platform with a native wheel (Linux x86_64, macOS, Windows x64 CPython)")
+        print("       pip install --force-reinstall --no-cache-dir nedb-engine")
+        print()
+        print("    2. Run against a live nedbd --dag server (works on any platform):")
+        print("       nedbd --data ./will-data --dag &")
+        print("       NEDB_URL=http://localhost:7070 python3 tests/test_the_will.py")
+        sys.exit(0)
+else:
+    # HTTP mode — no native extension needed
+    import nedb as _nedb
+    _VERSION = _nedb.__version__
+    NedbCore = None  # not used in HTTP mode
+
+
+# ── HTTP helper ────────────────────────────────────────────────────────────────
+def _http(method: str, url: str, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code} {method} {url}: {e.read().decode()[:200]}") from e
+
+
+# ── HttpDb: maps NedbCore API to HTTP calls ────────────────────────────────────
+class HttpDb:
+    """Thin wrapper around the nedbd HTTP API that mirrors the NedbCore interface."""
+
+    def __init__(self, base_url: str, db_name: str):
+        self._base = base_url.rstrip("/")
+        self._db   = db_name
+        self._v    = None   # cached verify result
+
+    @classmethod
+    def open(cls, base_url: str, db_name: str) -> "HttpDb":
+        # Create the database (409 if it already exists — fine)
+        try:
+            _http("POST", f"{base_url.rstrip('/')}/v1/databases",
+                  {"name": db_name})
+        except RuntimeError as e:
+            if "409" not in str(e):
+                raise
+        return cls(base_url, db_name)
+
+    def _url(self, path: str) -> str:
+        return f"{self._base}/v1/databases/{self._db}/{path}"
+
+    def put(self, coll: str, rid: str, doc_json: str) -> str:
+        """Returns JSON string with _hash and _seq (mirrors NedbCore.put)."""
+        doc = json.loads(doc_json)
+        r = _http("POST", self._url("put"), {"coll": coll, "id": rid, "doc": doc})
+        self._v = None  # invalidate cached verify
+        return json.dumps(r.get("doc", {}))
+
+    def link(self, frm: str, rel: str, to: str) -> None:
+        _http("POST", self._url("link"), {"frm": frm, "rel": rel, "to": to})
+        self._v = None
+
+    def neighbors(self, node: str, rel: str):
+        """Returns list of neighbor node ID strings (e.g. ['person:mark', ...])."""
+        rows = self._query_rows(f'FROM __links__ LIMIT 500')
+        # __links__ rows: {_from, _rel, _to}
+        return [row["_to"] for row in rows
+                if row.get("_from") == node and row.get("_rel") == rel]
+
+    def query(self, nql: str):
+        """Returns list of JSON strings (mirrors NedbCore.query)."""
+        return [json.dumps(row) for row in self._query_rows(nql)]
+
+    def _query_rows(self, nql: str):
+        r = _http("POST", self._url("query"), {"nql": nql})
+        return r.get("rows", [])
+
+    def get(self, coll: str, rid: str, as_of: int = None) -> str:
+        """Returns JSON string of the document (mirrors NedbCore.get)."""
+        if as_of is not None:
+            nql = f'FROM {coll} WHERE _id = "{rid}" AS OF {as_of}'
+        else:
+            nql = f'FROM {coll} WHERE _id = "{rid}" LIMIT 1'
+        try:
+            rows = self._query_rows(nql)
+        except RuntimeError:
+            return "{}"
+        return json.dumps(rows[0]) if rows else "{}"
+
+    def _verify_result(self):
+        if self._v is None:
+            self._v = _http("GET", self._url("verify"))
+        return self._v
+
+    def verify(self) -> bool:
+        return bool(self._verify_result().get("ok"))
+
+    def head(self) -> str:
+        return self._verify_result().get("head", "")
+
+    def seq(self) -> int:
+        return self._verify_result().get("seq", 0)
+
+
+# ── Test helpers ───────────────────────────────────────────────────────────────
+import shutil, tempfile
 PASS = FAIL = 0
 def ok(msg):  global PASS; PASS += 1; print(f"  ✓  {msg}")
 def bad(msg): global FAIL; FAIL += 1; print(f"  ✗  FAIL: {msg}")
 def chk(msg, cond): ok(msg) if cond else bad(msg)
 def J(s): return json.loads(s) if s else {}
 
-DATA_DIR = Path(tempfile.mkdtemp(prefix="nedb_will_"))
 
+# ── Database factory ───────────────────────────────────────────────────────────
+if _MODE == "native":
+    DATA_DIR = Path(tempfile.mkdtemp(prefix="nedb_will_"))
+    _loc_str = str(DATA_DIR)
+
+    def open_db(path_hint=None):
+        return NedbCore.open(str(DATA_DIR))
+
+    def reopen_db():
+        return NedbCore.open(str(DATA_DIR))
+
+    def close_db(db):
+        del db
+
+else:
+    # HTTP mode — db lives on the server; "path" is just a unique db name
+    _DB_NAME  = f"will_test_{int(time.time())}"
+    _loc_str  = f"{_NEDB_URL}/v1/databases/{_DB_NAME}"
+
+    def open_db(path_hint=None):
+        return HttpDb.open(_NEDB_URL, _DB_NAME)
+
+    def reopen_db():
+        # In HTTP mode the db never closed — just return a fresh handle
+        return HttpDb(_NEDB_URL, _DB_NAME)
+
+    def close_db(db):
+        pass  # server keeps running; nothing to close
+
+
+# ── Banner ─────────────────────────────────────────────────────────────────────
 print(f"""
   ╔══════════════════════════════════════════════════════════╗
   ║               THE PROMISE THAT CANNOT BE BROKEN          ║
@@ -52,7 +196,7 @@ print(f"""
   ║  Untouched across time.                                  ║
   ╚══════════════════════════════════════════════════════════╝
 
-  nedb-engine {_nedb.__version__}  ·  durable DAG  ·  {DATA_DIR}
+  nedb-engine {_VERSION}  ·  mode={_MODE}  ·  {_loc_str}
 """)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -62,9 +206,8 @@ print("  Robert Evans opens NEDB and writes his will.\n"
       "  Nobody can alter it without breaking the chain.\n")
 # ─────────────────────────────────────────────────────────────────────────────
 
-db = NedbCore.open(str(DATA_DIR))
+db = open_db()
 
-# The family — each person is an immutable content-addressed object
 r_robert = J(db.put("person", "robert", json.dumps({
     "name": "Robert Allen Evans", "role": "testator",
     "dob":  "1948-06-12",         "signed": "2019-03-14",
@@ -85,7 +228,6 @@ hash_lisa = r_lisa["_hash"]
 chk(f"Robert's identity sealed — hash: {hash_robert[:16]}…", len(hash_robert) == 64)
 chk(f"Mark's identity sealed  — hash: {hash_mark[:16]}…",   len(hash_mark)   == 64)
 
-# Original will — caused_by lives INSIDE the doc (v2 native format)
 r_will_v1 = J(db.put("will", "evans_will_2019", json.dumps({
     "testator":     "robert",
     "date":         "2019-03-14",
@@ -94,7 +236,7 @@ r_will_v1 = J(db.put("will", "evans_will_2019", json.dumps({
     "business":     "lisa",
     "estate_split": "50/50",
     "note":         "These are my true wishes, recorded this day.",
-    "caused_by":    [hash_robert],   # caused by Robert's testator record
+    "caused_by":    [hash_robert],
 })))
 hash_will_v1 = r_will_v1["_hash"]
 seq_will_v1  = r_will_v1["_seq"]
@@ -103,7 +245,6 @@ chk(f"Original will sealed  — hash: {hash_will_v1[:16]}…", len(hash_will_v1)
 print(f"\n    Hash: {hash_will_v1}")
 print(f"    Change one character — hash changes — chain breaks — verify() fails.\n")
 
-# Witnesses — caused_by the will they witnessed
 r_atty = J(db.put("witness", "attorney_chen", json.dumps({
     "name": "Chen & Associates", "type": "attorney",
     "witnessed": "2019-03-14",
@@ -121,7 +262,6 @@ hash_notary = r_notary["_hash"]
 chk("Attorney witness sealed in chain",  len(hash_atty)   == 64)
 chk("Notary seal sealed in chain",       len(hash_notary) == 64)
 
-# Family graph via TRAVERSE
 db.link("person:robert", "parent_of", "person:mark")
 db.link("person:robert", "parent_of", "person:lisa")
 family = db.neighbors("person:robert", "parent_of")
@@ -134,16 +274,16 @@ print("  Two years later Robert adds a codicil:\n"
       "  The amendment chains off the original — history extends.\n")
 # ─────────────────────────────────────────────────────────────────────────────
 
-r_will_v2 = J(db.put("will", "evans_will_2019", json.dumps({  # same id → new version
+r_will_v2 = J(db.put("will", "evans_will_2019", json.dumps({
     "testator":     "robert",
     "date":         "2021-08-30",
     "version":      2,
     "house":        "mark",
     "business":     "lisa",
-    "vintage_car":  "mark",        # ← the 1967 Mustang
+    "vintage_car":  "mark",
     "estate_split": "50/50",
     "note":         "Amendment: the 1967 Mustang goes to Mark. My choice.",
-    "caused_by":    [hash_will_v1],  # caused by the original
+    "caused_by":    [hash_will_v1],
 })))
 hash_will_v2 = r_will_v2["_hash"]
 seq_will_v2  = r_will_v2["_seq"]
@@ -168,7 +308,7 @@ hash_passing = r_passing["_hash"]
 r_probate = J(db.put("event", "probate_filing", json.dumps({
     "type":      "probate",
     "filed_by":  "attorney_chen",
-    "will_hash": hash_will_v2,   # attorney cites the exact object hash
+    "will_hash": hash_will_v2,
     "date":      "2024-11-15",
     "caused_by": [hash_passing, hash_will_v2, hash_atty],
 })))
@@ -182,7 +322,7 @@ print(f"    Total facts sealed:    {seq_before_close}\n")
 print("  ── The database closes. A dispute arises. ──\n")
 time.sleep(0.5)
 
-del db  # process ends — data is on disk
+close_db(db)
 
 # ─────────────────────────────────────────────────────────────────────────────
 print("  ── CHAPTER 4 — The dispute  [reopening the database] ──\n")
@@ -190,8 +330,8 @@ print("  A distant relative claims the Mustang bequest never existed.")
 print("  The attorney reopens NEDB.\n")
 # ─────────────────────────────────────────────────────────────────────────────
 
-db2 = NedbCore.open(str(DATA_DIR))
-time.sleep(0.2)  # let background scan complete for small DB
+db2 = reopen_db()
+time.sleep(0.2)
 
 verified  = db2.verify()
 head_now  = db2.head()
@@ -226,9 +366,9 @@ for node in sorted(trace, key=lambda x: x.get("_seq", 0)):
         label = label.format(v=node.get("version","?"), d=node.get("date","?"))
     print(f"  [{node.get('_seq',0):>3}]  {label}")
 
-chk("TRACE reaches original will",          any(J(r).get("_id") == "evans_will_2019"  for r in trace_rows))
-chk("TRACE reaches Robert's testator record", any(J(r).get("_id") == "robert"          for r in trace_rows))
-chk("Attorney witness in causal chain",     any(J(r).get("_id") == "attorney_chen"   for r in trace_rows))
+chk("TRACE reaches original will",            any(J(r).get("_id") == "evans_will_2019"  for r in trace_rows))
+chk("TRACE reaches Robert's testator record", any(J(r).get("_id") == "robert"           for r in trace_rows))
+chk("Attorney witness in causal chain",       any(J(r).get("_id") == "attorney_chen"    for r in trace_rows))
 
 # Time-travel: what did the will say BEFORE the amendment?
 original = J(db2.get("will", "evans_will_2019", as_of=seq_will_v1))
@@ -264,7 +404,7 @@ print(f"""
   Robert's promise kept. Mark gets the Mustang.
 
   ══════════════════════════════════════════════════════════
-  {PASS}/{total} checks passed {status}
+  {PASS}/{total} checks passed {status}  [{_MODE} mode]
 
   "Every fact in this system has a cryptographic identity.
    Every cause is linked to its effect.
@@ -274,5 +414,8 @@ print(f"""
       — INTERCHAINED LLC × Claude Sonnet 4.6
   ══════════════════════════════════════════════════════════
 """)
-shutil.rmtree(DATA_DIR, ignore_errors=True)
+
+if _MODE == "native":
+    shutil.rmtree(DATA_DIR, ignore_errors=True)
+
 sys.exit(1 if FAIL else 0)
