@@ -561,26 +561,36 @@ def main() -> None:
 
     # ── DAG mode: exec into the Rust v2 binary, replacing this process entirely ──
     if args.dag:
-        import shutil as _shutil, sys as _sys
+        import shutil as _shutil, subprocess as _sub, sys as _sys
         _pkg_dir = os.path.dirname(os.path.abspath(__file__))
-        _candidates = [
-            os.path.join(_pkg_dir, "nedbd-v2"),
-            os.path.join(_pkg_dir, "nedbd_v2"),
-            _shutil.which("nedbd-v2") or "",
-            _shutil.which("nedbd_v2") or "",
-        ]
+        # Include .exe variants for Windows; order: bundled wheel binary first
+        _names = ["nedbd-v2", "nedbd_v2", "nedbd-v2.exe", "nedbd_v2.exe"]
+        _candidates = (
+            [os.path.join(_pkg_dir, n) for n in _names]
+            + [_shutil.which(n) or "" for n in _names]
+        )
         _bin = next((c for c in _candidates if c and os.path.isfile(c)), None)
         if _bin is None:
             print("nedbd --dag: v2 Rust binary not found.", file=_sys.stderr)
-            print("  Expected 'nedbd-v2' alongside the package or in PATH.", file=_sys.stderr)
-            print("  Build: cd rust/nedb-v2 && cargo build --release", file=_sys.stderr)
-            print("  Copy:  cp rust/nedb-v2/target/release/nedbd nedbd-v2 && nedbd --dag", file=_sys.stderr)
+            print("  Expected 'nedbd-v2' (or 'nedbd-v2.exe' on Windows) alongside the", file=_sys.stderr)
+            print("  package or on PATH.  Options:", file=_sys.stderr)
+            print("    pip install --upgrade nedb-engine  (platform wheel bundles the binary)", file=_sys.stderr)
+            print("    cd rust/nedb-v2 && cargo build --release", file=_sys.stderr)
+            print("    # then copy: nedbd-v2[.exe] to PATH or the nedb package dir", file=_sys.stderr)
             _sys.exit(1)
-        os.environ["NEDBD_PORT"] = str(args.port)
+        # Build argv forwarding all recognised flags
+        _argv = [_bin, "--data", args.data, "--port", str(args.port)]
         if args.token:
-            os.environ["NEDBD_TOKEN"] = args.token
-        # exec replaces this process — clean signal handling, no Python overhead
-        os.execv(_bin, [_bin, args.data])
+            _argv += ["--token", args.token]
+        if os.environ.get("NEDBD_TOKEN") and "--token" not in _argv:
+            _argv += ["--token", os.environ["NEDBD_TOKEN"]]
+        if os.environ.get("NEDB_TMK"):
+            os.environ.setdefault("NEDB_TMK", os.environ["NEDB_TMK"])
+        # os.execv replaces the process on POSIX; use subprocess on Windows
+        if sys.platform == "win32":
+            _sys.exit(_sub.call(_argv))
+        else:
+            os.execv(_bin, _argv)
 
     # Resolve log level: CLI flag beats env var.
     # Level 0: only errors (always printed)
