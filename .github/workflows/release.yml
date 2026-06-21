@@ -82,13 +82,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  label: linux-x86_64,    mingw: false }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,    label: windows-x86_64,  mingw: false }
-          # MinGW / MSYS2 Python (Git Bash, Conda, MSYS2 environments on Windows)
-          # uses platform tags like mingw_x86_64 — needs a separate gnu-target wheel.
-          - { os: windows-latest, target: x86_64-pc-windows-gnu,     label: windows-mingw,   mingw: true  }
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  label: linux-x86_64,   mingw: false }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,    label: windows-x86_64, mingw: false }
           # macOS wheels (arm64 + x86_64) are built by Codemagic on M2 Mac Minis.
-          # Removing them here eliminates the shared-runner queue wait entirely.
+          # MinGW/MSYS2 users get the binary via the fat py3-none-any universal wheel.
+          # PyPI rejects mingw_x86_64 platform tags so a separate MinGW wheel is omitted.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
