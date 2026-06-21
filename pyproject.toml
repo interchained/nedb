@@ -10,7 +10,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nedb-engine"
-version = "2.2.24"
+version = "2.2.25"
 description = "NEDB — a versioned, self-compressing, time-traveling embedded database (replay-protected, idempotent, relational, searchable) with durable AOF persistence and a server daemon (nedbd)."
 readme = "README.md"
 requires-python = ">=3.8"

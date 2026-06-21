@@ -1,6 +1,6 @@
 {
   "name": "nedb-engine",
-  "version": "2.2.24",
+  "version": "2.2.25",
   "description": "NEDB — hash-chained, time-traveling, bi-temporal embedded database with Rust native core. SQL, Redis, MongoDB adapters. Causal Write Provenance. RESP2 wire protocol.",
   "main": "index.js",
   "types": "index.d.ts",

@@ -213,11 +213,7 @@ jobs:
         if: "!matrix.mingw"
         shell: bash
         run: |
-          mkdir -p native-ext/nedb
-          for whl in dist/*.whl; do
-            unzip -j "$whl" "nedb/_native*" -d native-ext/nedb 2>/dev/null || true
-          done
-          chmod +x native-ext/nedb/_native* 2>/dev/null || true
+          python3 scripts/extract_native.py "dist/*.whl" native-ext
           echo "native-ext contents:"; ls -lhR native-ext/ 2>/dev/null || echo "(none)"
       - uses: actions/upload-artifact@v4
         if: "!matrix.mingw"

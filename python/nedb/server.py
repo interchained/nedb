@@ -323,8 +323,12 @@ def make_handler(manager: Manager, token: Optional[str]):
                         _scalar = ("client", "nonce", "idem", "evidence", "confidence",
                                    "valid_from", "valid_to")
                         kw = {k: b[k] for k in _scalar if b.get(k) is not None}
-                        if b.get("caused_by") is not None:
-                            kw["caused_by"] = list(b["caused_by"])
+                        # caused_by may live at the top level of the request body
+                        # OR inside doc (natural for clients embedding it in the document).
+                        # Check both; top-level wins if both are present.
+                        _cb = b.get("caused_by") or doc.get("caused_by")
+                        if _cb is not None:
+                            kw["caused_by"] = list(_cb)
                         try:
                             stored = db.put(str(coll), str(rid), dict(doc), **kw)
                         except ReplayError as e:

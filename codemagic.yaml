@@ -108,9 +108,8 @@ workflows:
           cp python/nedb/nedbd-v2 nedbd-v2-darwin-arm64
           gh release upload "$TAG" nedbd-v2-darwin-arm64 --repo Eth-Interchained/nedb --clobber
           # _native extension (so pypi fat-wheel includes it for Mac users)
-          for whl in dist/*.whl; do
-            unzip -j "$whl" "nedb/_native*" -d . 2>/dev/null || true
-          done
+          python3 scripts/extract_native.py "dist/*.whl" native-ext
+          cp native-ext/nedb/_native* . 2>/dev/null || true
           for f in _native*darwin*arm64*; do
             [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
           done
@@ -211,9 +210,8 @@ workflows:
           cp python/nedb/nedbd-v2 nedbd-v2-darwin-x64
           gh release upload "$TAG" nedbd-v2-darwin-x64 --repo Eth-Interchained/nedb --clobber
           # _native extension
-          for whl in dist/*.whl; do
-            unzip -j "$whl" "nedb/_native*" -d . 2>/dev/null || true
-          done
+          python3 scripts/extract_native.py "dist/*.whl" native-ext
+          cp native-ext/nedb/_native* . 2>/dev/null || true
           for f in _native*darwin*x86_64*; do
             [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
           done
