@@ -599,7 +599,7 @@ def main() -> None:
         if os.environ.get("NEDB_TMK"):
             os.environ.setdefault("NEDB_TMK", os.environ["NEDB_TMK"])
         # os.execv replaces the process on POSIX; use subprocess on Windows
-        if sys.platform == "win32":
+        if _sys.platform == "win32":
             _sys.exit(_sub.call(_argv))
         else:
             os.execv(_bin, _argv)
