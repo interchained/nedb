@@ -38,21 +38,35 @@ except ImportError:  # pure-Python install (sdist / unsupported platform)
     # informative error instead of a bare ImportError with no guidance.
     import types as _types, sys as _sys
 
+    import sys as _sys_tmp, os as _os_tmp
+    _is_msys2 = bool(_os_tmp.environ.get("MSYSTEM")) or "mingw" in _sys_tmp.executable.lower()
+    del _sys_tmp, _os_tmp
+
     class _NativeStub(_types.ModuleType):
-        _MSG = (
+        # Primary fix: install the Rust crate → get the nedbd server → use HTTP mode.
+        # Secondary fix (CPython only): pip reinstall to get the platform wheel with _native embedded.
+        _MSG_MSYS2 = (
             "\n\n"
-            "  nedb._native is not available on this platform.\n\n"
-            "  The compiled Rust core ships with platform wheels (Linux x86_64,\n"
-            "  macOS arm64/x86_64, Windows x64 CPython).  It is NOT included in\n"
-            "  the universal wheel installed on MSYS2/MinGW Python.\n\n"
-            "  Options:\n"
-            "    1. Use the HTTP server instead (works on any platform):\n"
-            "         nedbd --dag ./data                              # start DAG server\n"
-            "         NEDB_URL=http://localhost:7070 python3 script.py\n\n"
-            "    2. Re-install on a platform that has a native wheel:\n"
-            "         pip install --force-reinstall --no-cache-dir nedb-engine\n\n"
-            "    3. Run 'nedbd --doctor' for a full diagnosis.\n"
+            "  nedb._native (embedded v2 DAG core) is not available on MSYS2/MinGW Python.\n\n"
+            "  To use NEDB v2 features, install the server binary and use HTTP mode:\n\n"
+            "    cargo install nedb-engine          # install nedbd v2 server\n"
+            "    nedbd --dag ./data                 # start DAG server\n"
+            "    NEDB_URL=http://localhost:7070 python3 your_script.py\n\n"
+            "  Run 'nedbd --doctor' for a full diagnosis.\n"
         )
+        _MSG_OTHER = (
+            "\n\n"
+            "  nedb._native (embedded v2 DAG core) is not available.\n"
+            "  You have the universal wheel — reinstall to get the platform wheel:\n\n"
+            "    pip install --force-reinstall --no-cache-dir nedb-engine\n\n"
+            "  Or install the server binary and use HTTP mode (works everywhere):\n\n"
+            "    cargo install nedb-engine          # install nedbd v2 server\n"
+            "    nedbd --dag ./data                 # start DAG server\n"
+            "    NEDB_URL=http://localhost:7070 python3 your_script.py\n\n"
+            "  Run 'nedbd --doctor' for a full diagnosis.\n"
+        )
+        _MSG = _MSG_MSYS2 if _is_msys2 else _MSG_OTHER
+
         def __getattr__(self, name: str):
             raise ImportError(f"nedb._native.{name} is not available.{self._MSG}")
 

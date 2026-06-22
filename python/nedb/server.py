@@ -676,7 +676,7 @@ def _run_doctor() -> None:  # noqa: C901
         step += 1
         if has_cargo:
             _cmd("install from crates.io (recommended)",
-                 "cargo install nedb-core-v2",
+                 "cargo install nedb-engine",
                  f"binary → {os.path.join(_cargo_bin, 'nedbd')}")
             print()
             _cmd("OR reinstall pip wheel (also bundles the binary)",
@@ -810,7 +810,7 @@ def main() -> None:
             print("", file=_sys.stderr)
             print("  Quick fixes:", file=_sys.stderr)
             print("    pip install --force-reinstall --no-cache-dir nedb-engine  # re-install with binary", file=_sys.stderr)
-            print("    cargo install nedb-core-v2                                # build from source (any platform)", file=_sys.stderr)
+            print("    cargo install nedb-engine                                # build from source (any platform)", file=_sys.stderr)
             print("", file=_sys.stderr)
             _sys.exit(1)
         # Rust binary: nedbd-v2 [data_dir]
@@ -861,6 +861,30 @@ def main() -> None:
     print(BANNER)
     level_label = {0: "errors-only", 1: "requests", 2: "deploy", 3: "verbose"}.get(_log_level, str(_log_level))
     print(f"  nedbd {__version__} — http://{host}:{port}  data={os.path.abspath(data)}  auth={auth}  log={level_label}")
+
+    # ── v2 DAG health notice ──────────────────────────────────────────────────
+    # Check once at startup whether the v2 binary and _native extension are available.
+    # Print a single actionable line if either is missing — non-blocking, no exit.
+    _has_native = False
+    try:
+        from nedb import __has_native__ as _has_native  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    _dag_bin_available = shutil.which("nedbd-v2") or shutil.which("nedbd_v2") or \
+        any(os.path.isfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), n))
+            for n in ["nedbd-v2", "nedbd-v2.exe", "nedbd_v2", "nedbd_v2.exe"])
+    if not _has_native or not _dag_bin_available:
+        print()
+    if not _dag_bin_available:
+        print("  ⚡ v2 DAG engine not found — for content-addressed, instant-cold-start mode:")
+        print("       cargo install nedb-engine   →   nedbd --dag ./data")
+    if not _has_native:
+        print("  ⚡ nedb._native not available — embedded v2 API requires the platform wheel")
+        print("       pip install --force-reinstall --no-cache-dir nedb-engine")
+        print("       OR use HTTP mode: NEDB_URL=http://localhost:7070 python3 your_script.py")
+    if not _has_native or not _dag_bin_available:
+        print("  ℹ  Run 'nedbd --doctor' for a full diagnosis and exact fix commands.")
+        print()
     # Eagerly open all known databases so backfill-encrypt (if needed) runs
     # immediately and is visible in the boot log, not hidden on first request.
     names = manager.names()
