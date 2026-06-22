@@ -111,11 +111,9 @@ class HttpDb:
         self._v = None
 
     def neighbors(self, node: str, rel: str):
-        """Returns list of neighbor node ID strings (e.g. ['person:mark', ...])."""
-        rows = self._query_rows(f'FROM __links__ LIMIT 500')
-        # __links__ rows: {_from, _rel, _to}
-        return [row["_to"] for row in rows
-                if row.get("_from") == node and row.get("_rel") == rel]
+        """Returns list of neighbor node ID strings via /neighbors endpoint."""
+        r = _http("POST", self._url("neighbors"), {"node": node, "rel": rel})
+        return r.get("nodes", [])
 
     def query(self, nql: str):
         """Returns list of JSON strings (mirrors NedbCore.query)."""

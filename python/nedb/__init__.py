@@ -34,8 +34,34 @@ try:  # compiled Rust core, present in platform wheels (PyO3 via maturin)
     from . import _native  # type: ignore
     __has_native__ = True
 except ImportError:  # pure-Python install (sdist / unsupported platform)
-    _native = None  # type: ignore
+    # Provide a stub module so `from nedb._native import NedbCore` raises an
+    # informative error instead of a bare ImportError with no guidance.
+    import types as _types, sys as _sys
+
+    class _NativeStub(_types.ModuleType):
+        _MSG = (
+            "\n\n"
+            "  nedb._native is not available on this platform.\n\n"
+            "  The compiled Rust core ships with platform wheels (Linux x86_64,\n"
+            "  macOS arm64/x86_64, Windows x64 CPython).  It is NOT included in\n"
+            "  the universal wheel installed on MSYS2/MinGW Python.\n\n"
+            "  Options:\n"
+            "    1. Use the HTTP server instead (works on any platform):\n"
+            "         nedbd --dag ./data                              # start DAG server\n"
+            "         NEDB_URL=http://localhost:7070 python3 script.py\n\n"
+            "    2. Re-install on a platform that has a native wheel:\n"
+            "         pip install --force-reinstall --no-cache-dir nedb-engine\n\n"
+            "    3. Run 'nedbd --doctor' for a full diagnosis.\n"
+        )
+        def __getattr__(self, name: str):
+            raise ImportError(f"nedb._native.{name} is not available.{self._MSG}")
+
+    _native_stub = _NativeStub("nedb._native")
+    _native_stub.__package__ = "nedb"
+    _sys.modules["nedb._native"] = _native_stub  # type: ignore
+    _native = _native_stub  # type: ignore
     __has_native__ = False
+    del _types, _sys, _NativeStub, _native_stub
 
 __all__ = [
     "NEDB", "OpLog", "Op", "ReplayError", "Query", "parse_nql",
@@ -47,4 +73,4 @@ __all__ = [
     "wrap_redis", "WrappedRedis",
     "_native", "__has_native__",
 ]
-__version__ = "2.2.25"
+__version__ = "2.2.27"

@@ -349,6 +349,13 @@ def make_handler(manager: Manager, token: Optional[str]):
                         db.link(str(b["frm"]), str(b["rel"]), str(b["to"]))
                         self._send(200, {"ok": True, "seq": db.seq, "head": db.head})
                         return
+                    if method == "POST" and action == "neighbors":
+                        b = self._body()
+                        if not b.get("node") or not b.get("rel"):
+                            raise HttpError(400, "node and rel are required")
+                        nodes = db.neighbors(str(b["node"]), str(b["rel"]))
+                        self._send(200, {"nodes": nodes, "count": len(nodes)})
+                        return
                     if method == "GET" and action == "verify":
                         self._send(200, {"ok": db.verify(), "seq": db.seq, "head": db.head})
                         return
@@ -537,6 +544,189 @@ def make_handler(manager: Manager, token: Optional[str]):
     return Handler
 
 
+def _run_doctor() -> None:  # noqa: C901
+    """Interactive environment diagnostic with exact copy-paste commands."""
+    import platform as _platform, shutil as _shutil, sys as _sys, subprocess as _sub
+
+    from . import __version__
+
+    # ── terminal colours (disabled on Windows without ANSI support) ──────────
+    _ansi = _sys.stdout.isatty() and _sys.platform != "win32" or os.environ.get("TERM")
+    def _c(code, text): return f"\033[{code}m{text}\033[0m" if _ansi else text
+    OK   = _c("32", "✓")
+    ERR  = _c("31", "✗")
+    WARN = _c("33", "!")
+    BOLD = lambda t: _c("1", t)
+    DIM  = lambda t: _c("2", t)
+    CMD  = lambda t: _c("36", t)     # cyan for copy-paste commands
+
+    def _hr(char="─", width=60): print(f"  {char * width}")
+    def _h(title): _hr(); print(f"  {BOLD(title)}"); _hr()
+    def _ok(msg):   print(f"  {OK}  {msg}")
+    def _err(msg):  print(f"  {ERR}  {msg}")
+    def _warn(msg): print(f"  {WARN}  {msg}")
+    def _cmd(label, cmd, comment=""):
+        parts = [f"      {CMD(cmd)}"]
+        if comment:
+            parts.append(f"  {DIM('# ' + comment)}")
+        elif label:
+            parts.append(f"  {DIM('# ' + label)}")
+        print("".join(parts))
+
+    print(f"\n  {BOLD('NEDB Doctor')}  ·  v{__version__}\n")
+
+    # ── 1. Python environment ─────────────────────────────────────────────────
+    _h("Python environment")
+    py_exe  = _sys.executable
+    py_ver  = _platform.python_version()
+    py_impl = _platform.python_implementation()
+    machine = _platform.machine()
+    sys_pl  = _sys.platform
+
+    # Detect MSYS2 / MinGW
+    msystem = os.environ.get("MSYSTEM", "")
+    is_msys2 = bool(msystem) or "mingw" in py_exe.lower()
+    env_tag = f"MSYS2 {msystem}" if is_msys2 else sys_pl
+
+    _ok(f"Python {py_ver}  ({py_impl}, {env_tag}, {machine})")
+    _ok(f"Executable  {py_exe}")
+
+    # pip executable
+    _pip = _shutil.which("pip3") or _shutil.which("pip") or f"{py_exe} -m pip"
+    _ok(f"pip         {_pip}")
+
+    # site-packages
+    import site as _site
+    _sp = (_site.getsitepackages() or [None])[0]
+    _ok(f"site-packages  {_sp}")
+
+    # ── 2. nedb._native ───────────────────────────────────────────────────────
+    _h("nedb._native  (embedded Rust DAG core)")
+    from nedb import __has_native__
+    has_native = __has_native__
+    if has_native:
+        _ok("nedb._native loaded — NedbCore / embedded DAG API ready")
+    else:
+        _err("nedb._native not available")
+        if is_msys2:
+            _warn("MSYS2/MinGW Python cannot load MSVC-compiled extensions.")
+            _warn("This is a known limitation — use HTTP mode (see Fix plan below).")
+        else:
+            print(f"\n  {BOLD('Fix:')}  reinstall to pull the platform wheel:\n")
+            _cmd("", f"{_pip} install --force-reinstall --no-cache-dir nedb-engine",
+                 "downloads the wheel with _native bundled")
+
+    # ── 3. nedbd-v2 binary ────────────────────────────────────────────────────
+    _h("nedbd-v2  (DAG HTTP server binary)")
+    _pkg_dir   = os.path.dirname(os.path.abspath(__file__))
+    _cwd       = os.getcwd()
+    _cargo_bin = os.path.join(os.path.expanduser("~"), ".cargo", "bin")
+    _bin_names = ["nedbd-v2", "nedbd_v2", "nedbd-v2.exe", "nedbd_v2.exe"]
+    _cargo_names = ["nedbd", "nedbd.exe"]
+    _search = (
+        [os.path.join(_pkg_dir, n) for n in _bin_names]
+        + [_shutil.which(n) or "" for n in _bin_names]
+        + [os.path.join(_cargo_bin, n) for n in _bin_names + _cargo_names]
+        + [os.path.join(_cwd, "rust", "nedb-v2", "target", "release", n)
+           for n in _bin_names + _cargo_names]
+    )
+    _bin = next((p for p in _search if p and os.path.isfile(p)), None)
+
+    if _bin:
+        _ok(f"Found:  {_bin}")
+        _ok("nedbd --dag is ready")
+    else:
+        _err("nedbd-v2 binary not found")
+        _warn(f"Searched: {_pkg_dir}  |  PATH  |  {_cargo_bin}")
+
+    # ── 4. cargo (Rust toolchain) ─────────────────────────────────────────────
+    _h("Rust toolchain")
+    _cargo_exe = _shutil.which("cargo")
+    if _cargo_exe:
+        try:
+            _cv = _sub.check_output([_cargo_exe, "--version"], stderr=_sub.DEVNULL,
+                                    timeout=5).decode().strip()
+        except Exception:
+            _cv = "(version unknown)"
+        _ok(f"cargo  {_cv}  →  {_cargo_exe}")
+        has_cargo = True
+    else:
+        _err("cargo not found on PATH")
+        _warn("Install Rust: https://rustup.rs")
+        has_cargo = False
+
+    # ── 5. Fix plan ───────────────────────────────────────────────────────────
+    print()
+    _h("Fix plan")
+
+    step = 1
+    all_good = has_native and _bin
+
+    if all_good:
+        _ok("Everything is working. Commands to use:\n")
+        _cmd("start DAG server",     f"nedbd --dag ./nedb-data")
+        _cmd("start AOF server",     f"nedbd ./nedb-data")
+        _cmd("run a test (embedded)",f"python3 tests/test_the_will.py")
+        print()
+        return
+
+    # Binary missing
+    if not _bin:
+        print(f"  {BOLD(f'Step {step}: Install the nedbd-v2 DAG server binary')}\n")
+        step += 1
+        if has_cargo:
+            _cmd("install from crates.io (recommended)",
+                 "cargo install nedb-core-v2",
+                 f"binary → {os.path.join(_cargo_bin, 'nedbd')}")
+            print()
+            _cmd("OR reinstall pip wheel (also bundles the binary)",
+                 f"{_pip} install --force-reinstall --no-cache-dir nedb-engine")
+        else:
+            _cmd("reinstall pip wheel (bundles the binary)",
+                 f"{_pip} install --force-reinstall --no-cache-dir nedb-engine")
+            print()
+            _warn("Or install Rust first (to build from source):")
+            if sys_pl == "win32" or is_msys2:
+                _cmd("", "winget install Rustlang.Rust.MSVC", "or visit https://rustup.rs")
+            else:
+                _cmd("", "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh")
+        print()
+
+    # _native missing
+    if not has_native:
+        print(f"  {BOLD(f'Step {step}: Use the embedded Rust core (nedb._native)')}\n")
+        step += 1
+        if is_msys2:
+            print(f"  {WARN}  MSYS2/MinGW cannot load MSVC extensions — use HTTP mode:\n")
+            _data_dir = os.path.join(os.path.expanduser("~"), "nedb-data")
+            _dag_cmd  = (_bin or "nedbd") + f" --dag {_data_dir}"
+            _cmd("terminal 1 — start the DAG server", _dag_cmd)
+            print()
+            _cmd("terminal 2 — run Python scripts with HTTP mode",
+                 f"NEDB_URL=http://localhost:7070 python3 your_script.py")
+            print()
+            _cmd("test the will (HTTP mode)",
+                 f"NEDB_URL=http://localhost:7070 python3 tests/test_the_will.py",
+                 "18/18 checks — no _native needed")
+        else:
+            _cmd("reinstall to pull platform wheel with _native",
+                 f"{_pip} install --force-reinstall --no-cache-dir nedb-engine")
+        print()
+
+    # Shell PATH tip
+    if _bin and _cargo_bin not in os.environ.get("PATH", ""):
+        print(f"  {BOLD('Note:')} {_cargo_bin} may not be on your PATH yet.\n")
+        if sys_pl == "win32" or is_msys2:
+            _cmd("add to PATH permanently (Git Bash / MSYS2)",
+                 f'echo \'export PATH="$PATH:{_cargo_bin}"\' >> ~/.bashrc && source ~/.bashrc')
+        else:
+            _cmd("add to PATH permanently",
+                 f'echo \'export PATH="$PATH:{_cargo_bin}"\' >> ~/.profile && source ~/.profile')
+        print()
+
+    print(f"  Run {CMD('nedbd --doctor')} again after installing to confirm everything is green.\n")
+
+
 def main() -> None:
     import argparse as _ap, signal, threading
     from .resp2 import make_resp2_server
@@ -561,7 +751,17 @@ def main() -> None:
         help="Run the v2 content-addressed DAG engine (Rust binary) instead of the v1 AOF engine. "
              "No AOF, no global lock, instant cold start. Env var NEDBD_DAG=1 also enables this.",
     )
+    parser.add_argument(
+        "--doctor", action="store_true",
+        help="Diagnose the NEDB environment — checks for native extension, DAG binary, "
+             "and prints platform-specific install instructions for anything missing.",
+    )
     args = parser.parse_args()
+
+    # ── Doctor mode ───────────────────────────────────────────────────────────
+    if args.doctor:
+        _run_doctor()
+        return
 
     # ── DAG mode: exec into the Rust v2 binary, replacing this process entirely ──
     if args.dag:
@@ -598,12 +798,20 @@ def main() -> None:
         )
         _bin = next((c for c in _candidates if c and os.path.isfile(c)), None)
         if _bin is None:
-            print("nedbd --dag: v2 Rust binary not found.", file=_sys.stderr)
-            print("  Expected 'nedbd-v2' (or 'nedbd-v2.exe' on Windows) alongside the", file=_sys.stderr)
-            print("  package or on PATH.  Options:", file=_sys.stderr)
-            print("    pip install --upgrade nedb-engine  (platform wheel bundles the binary)", file=_sys.stderr)
-            print("    cd rust/nedb-v2 && cargo build --release", file=_sys.stderr)
-            print("    # then copy: nedbd-v2[.exe] to PATH or the nedb package dir", file=_sys.stderr)
+            print("", file=_sys.stderr)
+            print("  nedbd --dag: DAG engine binary not found.", file=_sys.stderr)
+            print("", file=_sys.stderr)
+            print("  The v2 content-addressed DAG engine (nedbd-v2) is a Rust binary that ships", file=_sys.stderr)
+            print("  alongside the Python package on supported platforms.", file=_sys.stderr)
+            print("", file=_sys.stderr)
+            print("  Run 'nedbd --doctor' for a full diagnosis and platform-specific fix:", file=_sys.stderr)
+            print("", file=_sys.stderr)
+            print("    nedbd --doctor", file=_sys.stderr)
+            print("", file=_sys.stderr)
+            print("  Quick fixes:", file=_sys.stderr)
+            print("    pip install --force-reinstall --no-cache-dir nedb-engine  # re-install with binary", file=_sys.stderr)
+            print("    cargo install nedb-core-v2                                # build from source (any platform)", file=_sys.stderr)
+            print("", file=_sys.stderr)
             _sys.exit(1)
         # Rust binary: nedbd-v2 [data_dir]
         # Port/token/TMK are passed via environment variables (not CLI flags).
