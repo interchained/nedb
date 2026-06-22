@@ -8,8 +8,9 @@ Replay-protected · idempotent · relational · filterable · sortable · search
 One Rust core → ships to **PyPI** and **npm** from a single source.
 
 [![PyPI](https://img.shields.io/pypi/v/nedb-engine?label=PyPI&color=6366f1)](https://pypi.org/project/nedb-engine/)
+[![crates.io](https://img.shields.io/crates/v/nedb-engine?label=crates.io&color=f97316)](https://crates.io/crates/nedb-engine)
 [![npm](https://img.shields.io/npm/v/nedb-engine?label=npm&color=00d4ff)](https://www.npmjs.com/package/nedb-engine)
-[![Tests](https://img.shields.io/badge/tests-266%20passing-34d399)](https://github.com/aiassistsecure/nedb/actions)
+[![CI](https://img.shields.io/github/actions/workflow/status/Eth-Interchained/nedb/release.yml?label=CI&color=34d399)](https://github.com/Eth-Interchained/nedb/actions)
 [![nedb-engine-client PyPI](https://img.shields.io/pypi/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://pypi.org/project/nedb-engine-client/)
 [![nedb-engine-client npm](https://img.shields.io/npm/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://www.npmjs.com/package/nedb-engine-client)
 
