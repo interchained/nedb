@@ -10,7 +10,7 @@
 //!   NEDB_TMK=<32-byte-hex>  Master key for AES-256-GCM encryption (optional)
 //!   NEDBD_MEMORY=1          Pure in-memory mode — no disk I/O, data lost on exit
 
-use nedb_core_v2::server;
+use nedb_engine::server;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

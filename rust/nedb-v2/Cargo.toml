@@ -1,13 +1,14 @@
 [package]
-name        = "nedb-core-v2"
-version     = "2.2.27"
+name        = "nedb-engine"
+version     = "2.2.32"
 edition     = "2021"
 description = "NEDB v2 — content-addressed DAG storage engine with NQL and HTTP server (nedbd binary)"
 license     = "BUSL-1.1"
-repository  = "https://github.com/Eth-Interchained/nedb"
-homepage    = "https://github.com/Eth-Interchained/nedb"
+repository  = "https://github.com/aiassistsecure/nedb"
+homepage    = "https://github.com/aiassistsecure/nedb"
 keywords    = ["database", "dag", "embedded", "time-travel", "graph"]
 categories  = ["database-implementations", "web-programming::http-server"]
+readme      = "README.md"
 exclude     = ["../../python/**", "../../dist/**", "../../tests/**"]
 
 [[bin]]
@@ -15,7 +16,7 @@ name = "nedbd"
 path = "src/main.rs"
 
 [lib]
-name = "nedb_core_v2"
+name = "nedb_engine"
 path = "src/lib.rs"
 
 [dependencies]

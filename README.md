@@ -8,8 +8,9 @@ Replay-protected · idempotent · relational · filterable · sortable · search
 One Rust core → ships to **PyPI** and **npm** from a single source.
 
 [![PyPI](https://img.shields.io/pypi/v/nedb-engine?label=PyPI&color=6366f1)](https://pypi.org/project/nedb-engine/)
+[![crates.io](https://img.shields.io/crates/v/nedb-engine?label=crates.io&color=f97316)](https://crates.io/crates/nedb-engine)
 [![npm](https://img.shields.io/npm/v/nedb-engine?label=npm&color=00d4ff)](https://www.npmjs.com/package/nedb-engine)
-[![Tests](https://img.shields.io/badge/tests-266%20passing-34d399)](https://github.com/aiassistsecure/nedb/actions)
+[![CI](https://img.shields.io/github/actions/workflow/status/Eth-Interchained/nedb/release.yml?label=CI&color=34d399)](https://github.com/Eth-Interchained/nedb/actions)
 [![nedb-engine-client PyPI](https://img.shields.io/pypi/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://pypi.org/project/nedb-engine-client/)
 [![nedb-engine-client npm](https://img.shields.io/npm/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://www.npmjs.com/package/nedb-engine-client)
 
@@ -19,11 +20,11 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 
 ---
 
-## NEDB v2.0.36 — Production Stable
+## NEDB v2.2.31 — Production Stable
 
-**Current stable: 2.0.36** — Cross-platform native wheels shipping `nedbd-v2` binary inside `pip install nedb-engine`. Linux + Windows wheels built on GitHub Actions; macOS arm64 + x86_64 wheels built on Codemagic (M2 Mac Minis). All four platforms publish from one `v*` tag.
+**Current stable: 2.2.31** — Cross-platform native wheels shipping `nedbd-v2` binary inside `pip install nedb-engine`. Linux + Windows wheels built on GitHub Actions; macOS arm64 + x86_64 wheels built on Codemagic (M2 Mac Minis). All four platforms publish from one `v*` tag.
 
-NEDB v2 replaces the append-only log (AOF) with a **content-addressed Merkle DAG**. Every document version is an immutable, BLAKE2b-verified object. Nothing is ever overwritten. As of **v2.0.36**, restarts after the first open are **O(1) warm starts** (driven by a `MANIFEST` of `seq` + Merkle head), the **cold scan is deferred** so the daemon accepts connections immediately, and a new **`GET /events` SSE endpoint** streams scan progress + per-write events live.
+NEDB v2 replaces the append-only log (AOF) with a **content-addressed Merkle DAG**. Every document version is an immutable, BLAKE2b-verified object. Nothing is ever overwritten. As of **v2.2.31**, restarts after the first open are **O(1) warm starts** (driven by a `MANIFEST` of `seq` + Merkle head), the **cold scan is deferred** so the daemon accepts connections immediately, and a new **`GET /events` SSE endpoint** streams scan progress + per-write events live.
 
 ```bash
 # Run the v2 DAG engine — ships inside pip install nedb-engine
@@ -32,9 +33,9 @@ nedbd --dag --data ./data
 NEDBD_DAG=1 NEDB_TMK=<32-byte-hex> nedbd --data ./data
 
 curl http://127.0.0.1:7070/health
-# {"ok":true,"version":"2.0.36","service":"nedbd","engine":"dag","startup_ready":true,"encrypted":true}
+# {"ok":true,"version":"2.2.31","service":"nedbd","engine":"dag","startup_ready":true,"encrypted":true}
 
-# Tail the live event stream (new in v2.0.36)
+# Tail the live event stream (new in v2.2.31)
 curl http://127.0.0.1:7070/events
 # event: scan   data: {"objects":730000,"of":1310703,"rate":21043,"eta_s":28}
 # event: ready  data: {"seq":1310703,"head":"b2:9c14e07a…"}
@@ -58,7 +59,7 @@ curl http://127.0.0.1:7070/events
 
 **v1 AOF engine is still shipped and unchanged** — `nedbd` (no flag) runs v1.
 
-**Production status:** [vision.interchained.org](https://vision.interchained.org) is live on v2.0.36 — **1,310,703 sequences** indexed in the Vision database, AES-256-GCM encrypted at rest, at block height **620,989**.
+**Production status:** [vision.interchained.org](https://vision.interchained.org) is live on v2.2.31 — **1,310,703 sequences** indexed in the Vision database, AES-256-GCM encrypted at rest, at block height **620,989**.
 
 ---
 
@@ -223,11 +224,11 @@ nedbd --dag --data ./data                 # v2 DAG engine (or NEDBD_DAG=1)
 NEDBD_RESP2_PORT=6380 nedbd               # also speak RESP2 (redis-cli compatible)
 nedbd --log-level 2                       # 0=errors 1=requests 2=deploy 3=verbose
 
-# Live event stream (new in v2.0.36) — SSE: scan progress, ready, per-write head
+# Live event stream (new in v2.2.31) — SSE: scan progress, ready, per-write head
 curl http://127.0.0.1:7070/events
 ```
 
-### Startup modes (v2.0.36)
+### Startup modes (v2.2.31)
 
 - **Warm start** — every restart after the first open reads the `MANIFEST` file and restores `seq` + Merkle `head` in **O(1)**. No scan, no replay, independent of dataset size. Boots in milliseconds.
 - **Cold start** — first open of an existing dataset spawns the integrity scan in a background thread *and accepts connections immediately*. Reads serve instantly from the content-addressed DAG; writes return `HTTP 503 startup in progress` until the `startup_ready` gate flips. Progress (objects, rate, ETA) streams over `GET /events`.
@@ -237,7 +238,7 @@ curl http://127.0.0.1:7070/events
 | Variable | Default | Description |
 |---|---|---|
 | `NEDBD_DAG` | `0` | Set `1` to launch the v2 DAG engine (`nedbd-v2`). Same as `--dag`. |
-| `NEDBD_HOST` | `127.0.0.1` | Bind address. **v2.0.36** defaults to loopback (was `0.0.0.0`) — security hardening fix. Set explicitly to `0.0.0.0` to expose. |
+| `NEDBD_HOST` | `127.0.0.1` | Bind address. **v2.2.31** defaults to loopback (was `0.0.0.0`) — security hardening fix. Set explicitly to `0.0.0.0` to expose. |
 | `NEDBD_PORT` | `7070` | HTTP bind port. |
 | `NEDBD_TOKEN` | unset | Optional bearer token; required on every `/v1/*` request when set. |
 | `NEDB_TMK` | unset | 32-byte hex AES-256-GCM at-rest encryption key. |
@@ -300,7 +301,7 @@ db.query('FROM policy AS OF 200 VALID AS OF "2024-02-15"')
 
 ## Performance
 
-**v2 DAG Rust server (v2.0.36, Intel iMac — 10k writes / 100k reads / 30k objects, AES-256-GCM on):**
+**v2 DAG Rust server (v2.2.31, Intel iMac — 10k writes / 100k reads / 30k objects, AES-256-GCM on):**
 
 | Operation | Throughput | p50 | p99 |
 |---|---|---|---|

@@ -2,20 +2,20 @@
 //! Built into a wheel with maturin. The pure-Python package is the always-works fallback.
 //!
 //! API surface is identical to the v1 bindings so existing Python code works unchanged.
-//! Under the hood, all operations go through nedb_core_v2::Db (content-addressed DAG).
+//! Under the hood, all operations go through nedb_engine::Db (content-addressed DAG).
 
 // pyo3::prelude::* must come first so proc-macro attributes are in scope.
 use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
 use std::sync::Arc;
-use nedb_core_v2::{Db, nql};
+use nedb_engine::{Db, nql};
 use serde_json::Value;
 
 fn jerr(e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
-fn node_to_json_str(node: &nedb_core_v2::store::Node) -> String {
+fn node_to_json_str(node: &nedb_engine::store::Node) -> String {
     let mut obj = if let Value::Object(m) = &node.data { m.clone() } else { Default::default() };
     obj.insert("_id".into(),   Value::String(node.id.clone()));
     obj.insert("_hash".into(), Value::String(node.hash.clone()));

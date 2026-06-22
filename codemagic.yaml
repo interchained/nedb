@@ -57,7 +57,7 @@ workflows:
           # Build from the workspace root (rust/) so cargo uses the workspace Cargo.lock.
           # Output lands in rust/target/<triple>/release/nedbd (workspace target dir).
           cd rust
-          cargo build --release --bin nedbd --package nedb-core-v2 --target $RUST_TARGET
+          cargo build --release --bin nedbd --package nedb-engine --target $RUST_TARGET
           cd ..
           BIN="rust/target/$RUST_TARGET/release/nedbd"
           echo "Binary built: $(ls -lh $BIN)"
@@ -160,7 +160,7 @@ workflows:
           export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
           rustup target add $RUST_TARGET
           cd rust
-          cargo build --release --bin nedbd --package nedb-core-v2 --target $RUST_TARGET
+          cargo build --release --bin nedbd --package nedb-engine --target $RUST_TARGET
           cd ..
           BIN="rust/target/$RUST_TARGET/release/nedbd"
           echo "Binary built: $(ls -lh $BIN)"

@@ -12,14 +12,14 @@
 use std::sync::Arc;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use nedb_core_v2::{Db, nql};
+use nedb_engine::{Db, nql};
 use serde_json::Value;
 
 fn jerr(e: impl std::fmt::Display) -> Error {
     Error::from_reason(e.to_string())
 }
 
-fn node_to_json_str(node: &nedb_core_v2::store::Node) -> String {
+fn node_to_json_str(node: &nedb_engine::store::Node) -> String {
     let mut obj = if let Value::Object(m) = &node.data { m.clone() } else { Default::default() };
     obj.insert("_id".into(),   Value::String(node.id.clone()));
     obj.insert("_hash".into(), Value::String(node.hash.clone()));

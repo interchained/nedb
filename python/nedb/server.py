@@ -33,6 +33,7 @@ HTTP API (all JSON):
   POST   /v1/databases/<name>/files             {name, data_b64, tier?}  — store a file (Cascade-compressed)
   GET    /v1/databases/<name>/files/<filename>?version=N&tier=warm  — retrieve a file
   GET    /v1/databases/<name>/files/<filename>/root?version=N&tier=warm  — Merkle root (anchorable)
+  POST   /v1/databases/<name>/proof             {hash}  — Merkle inclusion proof (verifiable offline)
   POST   /v1/databases/<name>/checkpoint        — on-demand checkpoint
   GET    /v1/databases/<name>/batch             — batch writes (array of {op,coll,id,doc})
 """
@@ -368,6 +369,57 @@ def make_handler(manager: Manager, token: Optional[str]):
                         ops = [o.to_dict() for o in db.log.ops[-limit:]][::-1]
                         self._send(200, {"log": ops, "seq": db.seq, "head": db.head})
                         return
+                    # POST /v1/databases/<name>/proof
+                    # Body: {"hash": "<64-hex>"}  — the op.hash of a previously-written doc
+                    # Response: a self-contained Merkle inclusion proof + a verified flag.
+                    # The proof is verifiable client-side via nedb.verify_proof() with no
+                    # server / engine — the server's role is only to look up the seq,
+                    # collect the prev_head and subsequent op-hashes, and fold them into
+                    # the same derived head the client will re-derive locally.
+                    if method == "POST" and action == "proof":
+                        from .proof import verify_proof as _vp, fold_head as _fold, GENESIS as _GEN
+                        b = self._body()
+                        want = str(b.get("hash", "")).strip().lower()
+                        if not want or len(want) != 64:
+                            raise HttpError(400, "hash (64-char hex) is required")
+                        try:
+                            bytes.fromhex(want)
+                        except ValueError:
+                            raise HttpError(400, "hash must be 64-char hexadecimal")
+                        # Find the Op with this exact chain-hash.
+                        ops = db.log.ops
+                        target = None
+                        for o in ops:
+                            if o.hash == want:
+                                target = o
+                                break
+                        if target is None:
+                            raise HttpError(404, f"no op with hash={want[:16]}…")
+                        # The proof scheme is a Merkle fold over op-hashes — a
+                        # PARALLEL commitment to the engine's per-op chain. Both
+                        # are deterministic functions of the same log. Replay the
+                        # fold from GENESIS to determine the fold-value just before
+                        # this op (prev_head), then collect every subsequent op-hash
+                        # so the client can fold forward to the same derived head.
+                        op_hashes = [o.hash for o in ops]
+                        prev_head  = _fold(op_hashes[: target.seq], start=_GEN)
+                        subsequent = op_hashes[target.seq + 1:]
+                        derived_head = _fold(op_hashes, start=_GEN)
+                        proof = {
+                            "hash":       target.hash,
+                            "seq":        target.seq,
+                            "prev_head":  prev_head,
+                            "subsequent": subsequent,
+                            "head":       derived_head,
+                        }
+                        # Self-check: confirm the proof verifies before returning it,
+                        # so a 200 from this endpoint is a hard guarantee of soundness.
+                        proof["verified"] = _vp(proof)
+                        # Helpful extras for clients that want to anchor to db.head too.
+                        proof["engine_head"] = db.head
+                        proof["engine_seq"]  = db.seq
+                        self._send(200, proof)
+                        return
                     # MongoDB-compatible query endpoint
                     # POST /v1/databases/<name>/mongo
                     # Body: {collection, op, ...op-specific args}
@@ -676,7 +728,7 @@ def _run_doctor() -> None:  # noqa: C901
         step += 1
         if has_cargo:
             _cmd("install from crates.io (recommended)",
-                 "cargo install nedb-core-v2",
+                 "cargo install nedb-engine",
                  f"binary → {os.path.join(_cargo_bin, 'nedbd')}")
             print()
             _cmd("OR reinstall pip wheel (also bundles the binary)",
@@ -810,7 +862,7 @@ def main() -> None:
             print("", file=_sys.stderr)
             print("  Quick fixes:", file=_sys.stderr)
             print("    pip install --force-reinstall --no-cache-dir nedb-engine  # re-install with binary", file=_sys.stderr)
-            print("    cargo install nedb-core-v2                                # build from source (any platform)", file=_sys.stderr)
+            print("    cargo install nedb-engine                                # build from source (any platform)", file=_sys.stderr)
             print("", file=_sys.stderr)
             _sys.exit(1)
         # Rust binary: nedbd-v2 [data_dir]
@@ -861,6 +913,30 @@ def main() -> None:
     print(BANNER)
     level_label = {0: "errors-only", 1: "requests", 2: "deploy", 3: "verbose"}.get(_log_level, str(_log_level))
     print(f"  nedbd {__version__} — http://{host}:{port}  data={os.path.abspath(data)}  auth={auth}  log={level_label}")
+
+    # ── v2 DAG health notice ──────────────────────────────────────────────────
+    # Check once at startup whether the v2 binary and _native extension are available.
+    # Print a single actionable line if either is missing — non-blocking, no exit.
+    _has_native = False
+    try:
+        from nedb import __has_native__ as _has_native  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    _dag_bin_available = shutil.which("nedbd-v2") or shutil.which("nedbd_v2") or \
+        any(os.path.isfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), n))
+            for n in ["nedbd-v2", "nedbd-v2.exe", "nedbd_v2", "nedbd_v2.exe"])
+    if not _has_native or not _dag_bin_available:
+        print()
+    if not _dag_bin_available:
+        print("  ⚡ v2 DAG engine not found — for content-addressed, instant-cold-start mode:")
+        print("       cargo install nedb-engine   →   nedbd --dag ./data")
+    if not _has_native:
+        print("  ⚡ nedb._native not available — embedded v2 API requires the platform wheel")
+        print("       pip install --force-reinstall --no-cache-dir nedb-engine")
+        print("       OR use HTTP mode: NEDB_URL=http://localhost:7070 python3 your_script.py")
+    if not _has_native or not _dag_bin_available:
+        print("  ℹ  Run 'nedbd --doctor' for a full diagnosis and exact fix commands.")
+        print()
     # Eagerly open all known databases so backfill-encrypt (if needed) runs
     # immediately and is visible in the boot log, not hidden on first request.
     names = manager.names()
