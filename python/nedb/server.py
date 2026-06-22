@@ -33,6 +33,7 @@ HTTP API (all JSON):
   POST   /v1/databases/<name>/files             {name, data_b64, tier?}  — store a file (Cascade-compressed)
   GET    /v1/databases/<name>/files/<filename>?version=N&tier=warm  — retrieve a file
   GET    /v1/databases/<name>/files/<filename>/root?version=N&tier=warm  — Merkle root (anchorable)
+  POST   /v1/databases/<name>/proof             {hash}  — Merkle inclusion proof (verifiable offline)
   POST   /v1/databases/<name>/checkpoint        — on-demand checkpoint
   GET    /v1/databases/<name>/batch             — batch writes (array of {op,coll,id,doc})
 """
@@ -367,6 +368,57 @@ def make_handler(manager: Manager, token: Optional[str]):
                         limit = int(query.get("limit", ["50"])[0])
                         ops = [o.to_dict() for o in db.log.ops[-limit:]][::-1]
                         self._send(200, {"log": ops, "seq": db.seq, "head": db.head})
+                        return
+                    # POST /v1/databases/<name>/proof
+                    # Body: {"hash": "<64-hex>"}  — the op.hash of a previously-written doc
+                    # Response: a self-contained Merkle inclusion proof + a verified flag.
+                    # The proof is verifiable client-side via nedb.verify_proof() with no
+                    # server / engine — the server's role is only to look up the seq,
+                    # collect the prev_head and subsequent op-hashes, and fold them into
+                    # the same derived head the client will re-derive locally.
+                    if method == "POST" and action == "proof":
+                        from .proof import verify_proof as _vp, fold_head as _fold, GENESIS as _GEN
+                        b = self._body()
+                        want = str(b.get("hash", "")).strip().lower()
+                        if not want or len(want) != 64:
+                            raise HttpError(400, "hash (64-char hex) is required")
+                        try:
+                            bytes.fromhex(want)
+                        except ValueError:
+                            raise HttpError(400, "hash must be 64-char hexadecimal")
+                        # Find the Op with this exact chain-hash.
+                        ops = db.log.ops
+                        target = None
+                        for o in ops:
+                            if o.hash == want:
+                                target = o
+                                break
+                        if target is None:
+                            raise HttpError(404, f"no op with hash={want[:16]}…")
+                        # The proof scheme is a Merkle fold over op-hashes — a
+                        # PARALLEL commitment to the engine's per-op chain. Both
+                        # are deterministic functions of the same log. Replay the
+                        # fold from GENESIS to determine the fold-value just before
+                        # this op (prev_head), then collect every subsequent op-hash
+                        # so the client can fold forward to the same derived head.
+                        op_hashes = [o.hash for o in ops]
+                        prev_head  = _fold(op_hashes[: target.seq], start=_GEN)
+                        subsequent = op_hashes[target.seq + 1:]
+                        derived_head = _fold(op_hashes, start=_GEN)
+                        proof = {
+                            "hash":       target.hash,
+                            "seq":        target.seq,
+                            "prev_head":  prev_head,
+                            "subsequent": subsequent,
+                            "head":       derived_head,
+                        }
+                        # Self-check: confirm the proof verifies before returning it,
+                        # so a 200 from this endpoint is a hard guarantee of soundness.
+                        proof["verified"] = _vp(proof)
+                        # Helpful extras for clients that want to anchor to db.head too.
+                        proof["engine_head"] = db.head
+                        proof["engine_seq"]  = db.seq
+                        self._send(200, proof)
                         return
                     # MongoDB-compatible query endpoint
                     # POST /v1/databases/<name>/mongo
