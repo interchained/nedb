@@ -145,8 +145,21 @@ impl NedbCore {
     }
 
     #[napi]
-    pub fn neighbors_as_of(&self, frm: String, rel: String, _as_of: BigInt) -> Vec<String> {
-        self.neighbors(frm, rel)  // AS OF on __links__ via NQL would need extension
+    pub fn neighbors_as_of(&self, frm: String, rel: String, as_of: BigInt) -> Vec<String> {
+        // Time-travel the causal DAG: edges live as docs in __links__, so an NQL
+        // AS OF query returns only the edges live at `as_of` — an edge linked at
+        // a later seq is excluded, and one unlinked since is restored. Mirrors
+        // neighbors() with `AS OF {seq}`. (Verified: AS OF before the link seq
+        // returns [], AS OF at/after returns the edge.)
+        let seq = as_of.get_u64().1;
+        let nql_str = format!(
+            r#"FROM __links__ AS OF {} WHERE _from = "{}" AND _rel = "{}""#,
+            seq, frm, rel);
+        nql::query(&self.inner, &nql_str)
+            .map(|(rows, _)| rows.iter()
+                .filter_map(|r| r.get("_to").and_then(|v| v.as_str()).map(str::to_string))
+                .collect())
+            .unwrap_or_default()
     }
 
     #[napi]
@@ -160,8 +173,18 @@ impl NedbCore {
     }
 
     #[napi]
-    pub fn inbound_as_of(&self, to: String, rel: String, _as_of: BigInt) -> Vec<String> {
-        self.inbound(to, rel)
+    pub fn inbound_as_of(&self, to: String, rel: String, as_of: BigInt) -> Vec<String> {
+        // Time-travel inbound edges — see neighbors_as_of. Mirrors inbound() with
+        // `AS OF {seq}` so only edges live at `as_of` are returned.
+        let seq = as_of.get_u64().1;
+        let nql_str = format!(
+            r#"FROM __links__ AS OF {} WHERE _to = "{}" AND _rel = "{}""#,
+            seq, to, rel);
+        nql::query(&self.inner, &nql_str)
+            .map(|(rows, _)| rows.iter()
+                .filter_map(|r| r.get("_from").and_then(|v| v.as_str()).map(str::to_string))
+                .collect())
+            .unwrap_or_default()
     }
 
     // ── Integrity ──────────────────────────────────────────────────────────────
