@@ -88,6 +88,68 @@ fn id_shard(id: &str) -> String {
     format!("{:02x}", hash & 0xff)
 }
 
+/// Encode a document id into a filesystem-safe leaf filename.
+///
+/// The id-index stores one file per document, and the id is the filename. Raw
+/// ids work on case-sensitive POSIX filesystems, but ids containing bytes that
+/// are illegal in Windows filenames (`: | / \ < > " ? *`, control chars) — most
+/// notably link ids like `driver:d1|handles|trip:t1` — cannot be written there,
+/// so the write silently fails and the entry is lost on reopen.
+///
+/// We percent-escape every byte that isn't unreserved (`A-Z a-z 0-9 - _ .`).
+/// `%` itself is escaped so decoding is unambiguous. Safe ids (block heights,
+/// hex hashes, utxo keys) are all-unreserved and return UNCHANGED, so existing
+/// chainstate paths are byte-for-byte identical and the hot path is unaffected.
+fn encode_id(id: &str) -> String {
+    fn is_unreserved(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')
+    }
+    if id.bytes().all(is_unreserved) {
+        return id.to_string();
+    }
+    let mut out = String::with_capacity(id.len() + 8);
+    for &b in id.as_bytes() {
+        if is_unreserved(b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+/// Inverse of `encode_id`. A name with no `%` (a safe id, or a legacy raw id
+/// written by an older version on a POSIX filesystem) is returned unchanged, so
+/// `list_ids` recovers the right id for both new and pre-upgrade files.
+fn decode_id(name: &str) -> String {
+    if !name.contains('%') {
+        return name.to_string();
+    }
+    fn hexval(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            _ => None,
+        }
+    }
+    let bytes = name.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hexval(bytes[i + 1]), hexval(bytes[i + 2])) {
+                out.push(hi * 16 + lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Per-document ID index — atomic file-per-doc, sharded across 256 subdirs.
 ///
 /// Write path: updates go to `write_buf` (DashMap, zero I/O, lock-free).
@@ -142,9 +204,11 @@ impl IdIndex {
                     }
                 }
                 None => {
-                    // Tombstone: remove the file
+                    // Tombstone: remove the file (encoded leaf + legacy raw if distinct)
                     let path = self.path(coll, id);
                     let _ = fs::remove_file(&path);
+                    let raw = self.raw_path(coll, id);
+                    if raw != path { let _ = fs::remove_file(&raw); }
                 }
             }
         });
@@ -158,7 +222,18 @@ impl IdIndex {
         // Shard across 256 subdirectories using first 2 hex chars of a simple
         // hash of the id. Prevents flat-directory slowdown (ext4 htree degrades
         // past ~50k files per directory) for large collections like kv.
-        // Format: indexes/{coll}/id/{shard}/{id}
+        // Format: indexes/{coll}/id/{shard}/{encode_id(id)}
+        // Shard on the RAW id (stable across versions); only the leaf filename
+        // is encoded so it is legal on every filesystem (incl. Windows).
+        let shard = id_shard(id);
+        self.root.join(coll).join("id").join(&shard).join(encode_id(id))
+    }
+
+    /// Legacy path: the raw id as the leaf filename (pre-`encode_id`). Used only
+    /// as a read/cleanup fallback so id-index entries written by older versions
+    /// on POSIX filesystems stay readable after upgrade. On Windows a raw path
+    /// with illegal chars simply fails to open (→ treated as absent).
+    fn raw_path(&self, coll: &str, id: &str) -> PathBuf {
         let shard = id_shard(id);
         self.root.join(coll).join("id").join(&shard).join(id)
     }
@@ -174,8 +249,18 @@ impl IdIndex {
         if let Some(entry) = self.write_buf.get(&key) {
             return entry.value().clone();  // None = tombstoned
         }
-        // Fall through to disk
-        let content = fs::read_to_string(self.path(coll, id)).ok()?;
+        // Fall through to disk: encoded filename first, then the legacy raw
+        // filename (pre-upgrade data). For safe ids the two paths are identical,
+        // so this is a single read on the hot path.
+        let p = self.path(coll, id);
+        let content = match fs::read_to_string(&p) {
+            Ok(c) => c,
+            Err(_) => {
+                let raw = self.raw_path(coll, id);
+                if raw == p { return None; }
+                fs::read_to_string(&raw).ok()?
+            }
+        };
         let h = content.trim().to_string();
         if h.is_empty() { None } else { Some(h) }
     }
@@ -220,7 +305,9 @@ impl IdIndex {
                     .filter_map(|e| {
                         let name = e.file_name().to_string_lossy().to_string();
                         if name.ends_with(".tmp") { return None; }
-                        Some(name)
+                        // Decode the on-disk filename back to the document id
+                        // (encoded for new files; identity for legacy/safe ids).
+                        Some(decode_id(&name))
                     })
                     .collect::<Vec<_>>()
             })
@@ -356,6 +443,44 @@ mod tests {
         let idx = IdIndex::new(dir.path()).unwrap();
         idx.set("blocks", "618000", "abcdef1234").unwrap();
         assert_eq!(idx.get("blocks", "618000"), Some("abcdef1234".to_string()));
+    }
+
+    #[test]
+    fn encode_decode_id_bijective() {
+        // Safe ids pass through unchanged (chainstate paths stay identical).
+        for safe in ["618000", "utxo-000000042", "abc_DEF.123", "deadBEEF"] {
+            assert_eq!(encode_id(safe), safe, "safe id must be identity");
+            assert_eq!(decode_id(&encode_id(safe)), safe);
+        }
+        // FS-unsafe ids (link ids, paths) round-trip and contain no illegal
+        // Windows filename chars once encoded.
+        for weird in ["driver:d1|handles|trip:t1", "a/b\\c", "x<y>z?\"*", "100%done"] {
+            let enc = encode_id(weird);
+            assert!(
+                !enc.chars().any(|c| matches!(c,
+                    ':' | '|' | '/' | '\\' | '<' | '>' | '?' | '"' | '*')),
+                "encoded leaf must be filesystem-safe: {}", enc);
+            assert_eq!(decode_id(&enc), weird, "encode/decode must round-trip");
+        }
+    }
+
+    #[test]
+    fn id_index_fs_unsafe_id_survives_disk_roundtrip() {
+        // Regression: link ids contain ':' and '|', illegal in Windows filenames.
+        // They must persist to the on-disk id-index and read back after reopen.
+        let dir = tempdir().unwrap();
+        let weird = "driver:d1|handles|trip:t1";
+        {
+            let idx = IdIndex::new(dir.path()).unwrap();
+            idx.set("__links__", weird, "deadbeefcafe").unwrap();
+            idx.flush_write_buf(); // persist WAL → disk (encoded leaf filename)
+        }
+        // Cold reopen: nothing in the WAL, must come from disk.
+        let idx2 = IdIndex::new(dir.path()).unwrap();
+        assert_eq!(idx2.get("__links__", weird), Some("deadbeefcafe".to_string()),
+                   "FS-unsafe id must be readable from disk after reopen");
+        assert_eq!(idx2.list_ids("__links__"), vec![weird.to_string()],
+                   "list_ids must decode the on-disk filename back to the id");
     }
 
     #[test]

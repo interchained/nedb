@@ -313,7 +313,33 @@ impl Db {
     /// Flush both the id-index WAL and MANIFEST. Used on graceful shutdown.
     pub fn flush_all(&self) {
         self.id_index.flush_write_buf();
+        // v3: fsync the active segment (no-op for loose/in-memory stores).
+        // One durability point per batch instead of one fsync per object.
+        if let Err(e) = self.objects.sync() {
+            eprintln!("nedb: segment sync failed: {}", e);
+        }
         self.flush_manifest();
+    }
+
+    /// Compact the v3 packed object store: keep the CURRENT version of every
+    /// document (from the id-index) and reclaim everything else. No-op unless
+    /// running with the v3 segment substrate (`--dag-v3` / NEDB_DAG_V3).
+    ///
+    /// This is a PRUNING operation: superseded/historical object versions are
+    /// dropped, so AS OF / TRACE over pruned versions is discarded — that is
+    /// what reclaims the space. Flushes first so all data is durable on disk
+    /// before the old segments are deleted.
+    pub fn compact(&self) -> Result<crate::segment::CompactStats> {
+        self.flush_all();
+        let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for coll in self.id_index.collections() {
+            for id in self.id_index.list_ids(&coll) {
+                if let Some(h) = self.id_index.get(&coll, &id) {
+                    live.insert(h);
+                }
+            }
+        }
+        self.objects.compact(&live)
     }
 
     /// Flush MANIFEST to disk if dirty. No-op for in-memory databases.
@@ -541,6 +567,27 @@ impl Db {
                 self.get(to_coll, to_id)
             })
             .collect()
+    }
+}
+
+impl Drop for Db {
+    /// Flush buffered state when the database is closed so a write-then-drop
+    /// sequence is durable without an explicit `flush_all()`.
+    ///
+    /// `IdIndex::set` only stages updates in the in-memory WAL `write_buf`;
+    /// disk persistence happens in `flush_write_buf()`, normally driven by the
+    /// manifest ticker. A short-lived `Db` (a library user's `{ let db =
+    /// Db::open(p)?; db.put(..)?; }` block, or a test) has no ticker, so without
+    /// this its writes would be silently lost on reopen. Flushing on drop
+    /// mirrors the flush-on-close contract of other embedded stores (sled,
+    /// RocksDB).
+    ///
+    /// In production this is a harmless safety net, not the primary durability
+    /// path: the manifest ticker thread holds an `Arc<Db>` for the process
+    /// lifetime, so `Drop` only fires once every owning handle is gone. No-op
+    /// for in-memory databases (`flush_all` short-circuits on `:memory:`).
+    fn drop(&mut self) {
+        self.flush_all();
     }
 }
 

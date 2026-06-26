@@ -1,6 +1,6 @@
 [package]
 name        = "nedb-engine"
-version     = "2.2.33"
+version     = "2.3.3333"
 edition     = "2021"
 description = "NEDB v2 — content-addressed DAG storage engine with NQL and HTTP server (nedbd binary)"
 license     = "BUSL-1.1"
@@ -46,5 +46,12 @@ futures-core = "0.3"
 thiserror    = "1"
 anyhow       = "1"
 
+# Fast-fsync on macOS: std's File::sync_all/sync_data map to F_FULLFSYNC there
+# (full hardware cache flush, 10-100x slower than plain fsync). NEDB_FAST_FSYNC
+# uses libc::fsync(2) instead. Unix-only dep; not pulled on Windows.
+[target.'cfg(unix)'.dependencies]
+libc         = "0.2"
+
 [dev-dependencies]
 tempfile     = "3"
+serde_json   = "1"   # integration tests (tests/) need it to build Value payloads

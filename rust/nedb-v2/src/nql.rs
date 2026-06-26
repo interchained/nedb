@@ -537,7 +537,11 @@ mod tests {
     use tempfile::tempdir;
     use crate::db::Db;
 
-    fn setup() -> Db {
+    // Returns (TempDir, Db) — the TempDir guard MUST be kept alive by the caller
+    // (`let (_tmp, db) = setup();`). If it dropped here, its Drop would delete the
+    // database directory out from under the live Db, and every objects.read()
+    // (loose object files live on disk) would fail → queries return 0 rows.
+    fn setup() -> (tempfile::TempDir, Db) {
         let dir = tempdir().unwrap();
         let db = Db::open(dir.path(), None).unwrap();
         db.create_sorted_index("blocks", "height");
@@ -546,12 +550,12 @@ mod tests {
                 serde_json::json!({"height": h, "hash": format!("000{}", h), "n_tx": h * 2}),
                 vec![], None, None).unwrap();
         }
-        db
+        (dir, db)
     }
 
     #[test]
     fn from_all() {
-        let db = setup();
+        let (_tmp, db) = setup();
         let (rows, count) = query(&db, "FROM blocks").unwrap();
         assert_eq!(count, 5);
         let _ = rows;
@@ -559,7 +563,7 @@ mod tests {
 
     #[test]
     fn where_eq() {
-        let db = setup();
+        let (_tmp, db) = setup();
         let (rows, count) = query(&db, r#"FROM blocks WHERE _id = "3""#).unwrap();
         assert_eq!(count, 1);
         assert_eq!(rows[0]["_id"], "3");
@@ -567,7 +571,7 @@ mod tests {
 
     #[test]
     fn order_by_limit() {
-        let db = setup();
+        let (_tmp, db) = setup();
         let (rows, count) = query(&db, "FROM blocks ORDER BY height ASC LIMIT 3").unwrap();
         assert_eq!(count, 3);
         assert_eq!(rows[0]["height"], 1);
@@ -576,28 +580,28 @@ mod tests {
 
     #[test]
     fn order_by_desc() {
-        let db = setup();
+        let (_tmp, db) = setup();
         let (rows, _) = query(&db, "FROM blocks ORDER BY height DESC LIMIT 2").unwrap();
         assert_eq!(rows[0]["height"], 5);
     }
 
     #[test]
     fn where_gt() {
-        let db = setup();
+        let (_tmp, db) = setup();
         let (rows, _) = query(&db, "FROM blocks WHERE height > 3").unwrap();
         assert_eq!(rows.len(), 2);
     }
 
     #[test]
     fn group_by_count() {
-        let db = setup();
+        let (_tmp, db) = setup();
         let (rows, _) = query(&db, "FROM blocks GROUP BY n_tx COUNT").unwrap();
         assert_eq!(rows.len(), 5); // all unique n_tx values
     }
 
     #[test]
     fn search() {
-        let db = setup();
+        let (_tmp, db) = setup();
         let (rows, _) = query(&db, r#"FROM blocks SEARCH "0003""#).unwrap();
         assert_eq!(rows.len(), 1);
     }

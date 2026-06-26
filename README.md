@@ -20,9 +20,13 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 
 ---
 
-## NEDB v2.2.31 — Production Stable
+## NEDB v2.3.3333 — Production Stable
 
-**Current stable: 2.2.31** — Cross-platform native wheels shipping `nedbd-v2` binary inside `pip install nedb-engine`. Linux + Windows wheels built on GitHub Actions; macOS arm64 + x86_64 wheels built on Codemagic (M2 Mac Minis). All four platforms publish from one `v*` tag.
+**Current stable: 2.3.3333** — Cross-platform native wheels shipping `nedbd-v2` binary inside `pip install nedb-engine`. Linux + Windows wheels built on GitHub Actions; macOS arm64 + x86_64 wheels built on Codemagic (M2 Mac Minis). All four platforms publish from one `v*` tag.
+
+**New in 2.3.3333:** opt-in **macOS fast-fsync** (`NEDB_FAST_FSYNC`) — the v3 segment store skips macOS's slow `F_FULLFSYNC` for a plain `fsync(2)` (default off; no-op on Linux/Windows), cutting flush latency on Fusion/SATA Macs without touching durability semantics by default. Closes the 3's cycle — next is **2.4.0**.
+
+**New in 2.3.333:** comprehensive documentation for the **NEDB v3 segment/pack object store** (see the v3 section below) — the opt-in append-only storage substrate that took a real itcd chainstate flush from *minutes* to **under 2 seconds**. Engine code is unchanged from 2.3.33, which shipped durable **flush-on-close** (a `Db` persists buffered writes when dropped, matching sled/RocksDB), a **cross-platform Windows-safe id-index** (percent-encodes filesystem-unsafe document ids — link ids, paths), and idempotent object re-writes.
 
 NEDB v2 replaces the append-only log (AOF) with a **content-addressed Merkle DAG**. Every document version is an immutable, BLAKE2b-verified object. Nothing is ever overwritten. As of **v2.2.31**, restarts after the first open are **O(1) warm starts** (driven by a `MANIFEST` of `seq` + Merkle head), the **cold scan is deferred** so the daemon accepts connections immediately, and a new **`GET /events` SSE endpoint** streams scan progress + per-write events live.
 
@@ -333,6 +337,52 @@ python3 tests/test_dag_perf.py --n 10000 --reads 100000
 
 ---
 
+## NEDB v3 — Segment / Pack Object Store
+
+**v3 is an opt-in storage substrate that replaces the loose one-file-per-object layout with append-only *segment packs* — the difference between a chainstate flush that takes *minutes* and one that takes *under two seconds*.** It is **off by default** (byte-for-byte v2), enabled with one flag, and **transparent** to everything above the storage layer: NQL, `AS OF`, `VALID AS OF`, `TRACE`, the BLAKE2b Merkle head, and causal provenance all behave identically.
+
+### Why it exists
+
+v2 stores every document version as its own content-addressed file at `objects/{hash[:2]}/{hash[2:]}`. That makes writes trivially atomic (write `.tmp` → `rename`) and corruption-proof — but each write costs a file create + `fsync` + rename **plus** a directory B-tree update. At scale that filesystem-metadata churn dominates: on a busy disk it caps sustained writes around **~185/s**, and a batch flush of a few thousand objects degrades into minutes. The bottleneck is the *number of files touched*, not the bytes written.
+
+### What it does
+
+v3 batches objects into append-only **segment packs** — `objects/segments/seg-NNNNNN.dat` — where each record is `[content_len: u32-LE][content]`. A write appends to the active segment and updates an in-memory `hash → (segment_id, offset, len)` map; a batch commits with a **single `fsync`**. Thousands of per-file syscalls collapse into one sequential append plus one durability point, so **flush cost scales with bytes (sequential I/O), not object-count × syscall overhead.**
+
+- **Compaction / pruning** — `compact()` keeps the *live set* (the current version of every document, resolved from the id-index), rewrites those records into fresh segments, and reclaims the superseded/dead versions.
+- **`.idx` sidecars** — each segment carries a sidecar (`NIX1` magic + entry count + fixed 44-byte entries + a BLAKE2b-256 checksum) so reopen rebuilds the in-memory index by reading the sidecar instead of scanning the whole pack. A missing or corrupt sidecar falls back to a full scan-and-heal — slower, never fatal.
+- **Dual-read migration** — opening an existing v2 store in v3 mode is **non-destructive**: old loose objects stay fully readable, and only *new* writes go to segments. No migration step, no downtime, no rewrite.
+- **Durable flush-on-close** — `flush_all()` (and `Db`'s `Drop`) fsync the active segment, matching the flush-on-close contract of sled / RocksDB.
+
+### How to enable
+
+```bash
+# Engine / nedbd
+nedbd --dag-v3 --data /var/lib/nedb        # or set NEDB_DAG_V3=1
+
+# itcd — Bitcoin-fork node embedding NEDB via nedb-ffi
+interchainedd -dagv3                        # puts chainstate AND block index on segments
+```
+
+The switch is read once, when each database's object store is constructed at open time. Default off → v2 loose objects.
+
+### Real-world result
+
+itcd (a Bitcoin Core 0.21 fork that replaces LevelDB chainstate with NEDB) syncing on `-dagv3`, measured `FlushStateToDisk` on real chainstate:
+
+| Flush (coins → disk) | v3 segment store | v2 loose store |
+|---|---|---|
+| 2,002 coins / 275 kB | **1.93 s** | *minutes* |
+| 2,549 coins / 366 kB | **1.71 s** | *minutes* |
+
+Note the *larger* batch finishing *faster* — v3's cost is dominated by the single per-batch `fsync`, not per-coin work, so effective throughput (~1,000–1,500 coins/s here) climbs as batches grow, against the loose store's ~185 writes/s metadata ceiling. The gap only widens as the UTXO set grows: sequential-append cost tracks data volume, while per-file cost compounds with object count.
+
+### When to use it
+
+Reach for v3 on high-write, large-object-count workloads — blockchain chainstate / block index, event sourcing, high-frequency agent memory. For small or read-mostly stores the loose layout is perfectly fine, which is exactly why v3 stays opt-in.
+
+---
+
 ## Architecture
 
 ```
@@ -426,6 +476,7 @@ docs/               index.html  reference.html  SPEC.md
 - [x] **Auto-migration** — v1 AOF → v2 DAG on first `--dag` startup
 - [x] **nedb-client** — async Python + TypeScript HTTP client (`pip/npm install nedb-client`)
 - [x] **Intel Mac support** — native wheels for `aarch64` + `x86_64` Apple Darwin
+- [x] **v3 segment/pack object store** — opt-in `--dag-v3`: append-only packs, one fsync per batch, compaction + `.idx` sidecars, non-destructive dual-read (minutes → <2s chainstate flush on itcd)
 - [ ] In-memory DAG mode — `Db::in_memory()` for zero-disk ephemeral sessions
 - [ ] PyO3 + napi-rs bindings updated to v2 DAG API
 - [ ] NEDB Studio DAG mode toggle
