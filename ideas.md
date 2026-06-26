@@ -1,21 +1,21 @@
 # NEDB — Next-Turn Ideas
 
-Specific, actionable ideas grounded in the **current v3 state** (segment store shipped in 2.3.3, documented in 2.3.333, proven on itcd chainstate). Each: one line _what_ + one line _why_.
+Grounded in the current state (**v2.4.0** — v3 segment/pack store + macOS fast-fsync shipped, documented, and spec'd; proven on itcd chainstate). Each: one line _what_ + one line _why_.
 
 ---
 
-### 1. Make `--dag-v3` the default after a cross-platform soak
-**What:** flip v3 to default-on with an explicit `--no-dag-v3` (loose) escape hatch, once it's run a full sync clean on Linux, macOS, and Windows.
-**Why:** the loose one-file-per-object store is a proven UX/perf liability (minutes-long flushes, ~185 writes/s ceiling); v3 is non-destructive via dual-read, so the upgrade path is safe and the itcd numbers (minutes → <2 s) make "off by default" the wrong default long-term.
+### 1. Compaction end-to-end (engine `compact()` → FFI → itcd trigger) — the open v3 gap
+**What:** expose `Db::compact()` through a new `nedb_compact()` FFI call and trigger it on a cadence (flush-checkpoint or shutdown) in itcd.
+**Why:** v3 segments accumulate every dead/superseded UTXO version over a full sync — without pruning the chainstate store bloats toward *all* history, not the live set, eroding v3's on-disk win and risking unbounded growth. The primitive exists in the engine; it's just unreachable from the node.
 
-### 2. Online / scheduled compaction during long syncs
-**What:** trigger `compact()` automatically on a cadence (every N segments or once dead bytes exceed M MiB) instead of only on demand.
-**Why:** chainstate overwrites coins constantly (spend → new version), so a long IBD accumulates unbounded superseded versions in the segment dir; the pruning primitive already exists — it just needs a scheduler so v3's on-disk-size win doesn't erode over a multi-day sync.
+### 2. Make `--dag-v3` the default — after compaction lands
+**What:** flip v3 on by default with a `--no-dag-v3` (loose) escape hatch.
+**Why:** a full overnight itcd sync on v3 ran clean and the flush win is an order of magnitude, so "off by default" is the wrong long-term default — but gate it behind #1 so the default store can't bloat over time.
 
-### 3. Segment observability + scoped integrity check
-**What:** expose per-store segment count, live-vs-dead bytes, and last-compaction stats via a nedbd HTTP endpoint (and matching `nedb_*` FFI), plus a segment-scoped `verify` fast path.
-**Why:** operators running v3 at chainstate scale currently have zero visibility into pack health or compaction pressure, and `-verifynedb` re-hashes every object (O(n), minutes) — a segment-targeted check would make routine integrity verification cheap enough to run often.
+### 3. Segment observability — in-engine seal log + flush metrics
+**What:** emit a one-line log when a segment seals / writes its `.idx`, and expose segment count / live-vs-dead bytes / last-compaction via a nedbd endpoint (+ a segment-scoped `verify` fast path).
+**Why:** operators have zero visibility into pack health or compaction pressure today, and the watcher episode proved observability must live *inside* the engine — external polling of the live store perturbs the very fsync it's trying to measure.
 
 ---
 
-_Future (not this cycle): a NEDB Studio segment viewer to visualize packs + compaction. Deferred — no Studio work in the current scope._
+_Longer horizon: reconcile `SPEC.md` §2 (still the v1 op-log model) with the shipped v2 content-addressed engine; update the PyO3 + napi bindings from the v1 AOF API to the v2 DAG API; Merkle inclusion proofs._
