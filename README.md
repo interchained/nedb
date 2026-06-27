@@ -20,13 +20,13 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 
 ---
 
-## NEDB v2.4.2 — Production Stable
+## NEDB v2.4.3 — Production Stable
 
-**Current stable: 2.4.2** — a polish release on the complete cross-platform line. The `nedbd-v2` daemon now does **real CLI parsing** — `--dag-v3`, `--data`, `--fast-fsync`, `--help`, `--version` are recognized flags instead of being silently swallowed as the positional data dir — and `npm test` ships a **cinematic native smoke test** that tours v1→v2 migration, the v2 DAG, the v3 segment store, and a causal-provenance audit. All native wheels (Linux + Windows on GitHub Actions; macOS arm64 + x86_64 on Codemagic M2 Mac Minis) **plus** the universal pure-Python wheel ship from a single `v*` tag, with the `nedbd-v2` binary bundled inside `pip install nedb-engine`.
+**Current stable: 2.4.3** — a polish release on the complete cross-platform line. The `nedbd-v2` daemon now does **real CLI parsing** — `--dag-v3`, `--data`, `--fast-fsync`, `--help`, `--version` are recognized flags instead of being silently swallowed as the positional data dir — and `npm test` ships a **cinematic native smoke test** that tours v1→v2 migration, the v2 DAG, the v3 segment store, and a causal-provenance audit. All native wheels (Linux + Windows on GitHub Actions; macOS arm64 + x86_64 on Codemagic M2 Mac Minis) **plus** the universal pure-Python wheel ship from a single `v*` tag, with the `nedbd-v2` binary bundled inside `pip install nedb-engine`.
 
-**The v3 storage line — consolidated, spec'd, and (as of 2.4.2) cleanly published across every platform.** It makes the NEDB **v3 segment/pack object store** a first-class, fully-documented feature:
+**The v3 storage line — consolidated, spec'd, and (as of 2.4.3) cleanly published across every platform.** It makes the NEDB **v3 segment/pack object store** a first-class, fully-documented feature:
 
-- **`--dag-v3`** (opt-in) — append-only segment store: one `fsync` per group-commit, `.idx` sidecars, compaction, non-destructive dual-read. Took a real itcd chainstate flush from *minutes* to **~1.3 s**. Parsed as a real flag by `nedbd-v2` as of v2.4.2 (or set `NEDB_DAG_V3=1`). (See the v3 section below.)
+- **`--dag-v3`** (opt-in) — append-only segment store: one `fsync` per group-commit, `.idx` sidecars, compaction, non-destructive dual-read. Took a real itcd chainstate flush from *minutes* to **~1.3 s**. Parsed as a real flag by `nedbd-v2` as of v2.4.3 (or set `NEDB_DAG_V3=1`). (See the v3 section below.)
 - **`NEDB_FAST_FSYNC`** — macOS fast-fsync: a plain `fsync(2)` instead of `F_FULLFSYNC` (default off; no-op on Linux/Windows).
 - Durable **flush-on-close**, a **Windows-safe id-index** (percent-encodes filesystem-unsafe ids), and idempotent object re-writes — shipped across the 2.3.3xxx line.
 - **`docs/SPEC.md` §3** now formally specifies the v2 object store, the v3 substrate, and the durability model.
@@ -361,7 +361,7 @@ v3 batches objects into append-only **segment packs** — `objects/segments/seg-
 
 ```bash
 # Engine / nedbd-v2 (the native daemon from npm / the native wheel)
-nedbd-v2 --dag-v3 --data /var/lib/nedb     # real flag as of v2.4.2 — or set NEDB_DAG_V3=1
+nedbd-v2 --dag-v3 --data /var/lib/nedb     # real flag as of v2.4.3 — or set NEDB_DAG_V3=1
 
 # itcd — Bitcoin-fork node embedding NEDB via nedb-ffi
 interchainedd -dagv3                        # puts chainstate AND block index on segments
