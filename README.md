@@ -20,9 +20,9 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 
 ---
 
-## NEDB v2.4.3 — Production Stable
+## NEDB v2.4.468 — Production Stable
 
-**Current stable: 2.4.3** — a polish release on the complete cross-platform line. The `nedbd-v2` daemon now does **real CLI parsing** — `--dag-v3`, `--data`, `--fast-fsync`, `--help`, `--version` are recognized flags instead of being silently swallowed as the positional data dir — and `npm test` ships a **cinematic native smoke test** that tours v1→v2 migration, the v2 DAG, the v3 segment store, and a causal-provenance audit. All native wheels (Linux + Windows on GitHub Actions; macOS arm64 + x86_64 on Codemagic M2 Mac Minis) **plus** the universal pure-Python wheel ship from a single `v*` tag, with the `nedbd-v2` binary bundled inside `pip install nedb-engine`.
+**Current stable: 2.4.468** — NEDB now ships as **three version-aligned distributions** on one tag — `nedb-engine` (flagship), `crypto-database` (verifiable v2/v3 DAG), and `aof-db` (fast append-only) — across npm / PyPI / crates.io with full mac + linux + windows native addons (see [**Releasing**](#releasing) below). On the engine side it remains a polish release on the complete cross-platform line. The `nedbd-v2` daemon now does **real CLI parsing** — `--dag-v3`, `--data`, `--fast-fsync`, `--help`, `--version` are recognized flags instead of being silently swallowed as the positional data dir — and `npm test` ships a **cinematic native smoke test** that tours v1→v2 migration, the v2 DAG, the v3 segment store, and a causal-provenance audit. All native wheels (Linux + Windows on GitHub Actions; macOS arm64 + x86_64 on Codemagic M2 Mac Minis) **plus** the universal pure-Python wheel ship from a single `v*` tag, with the `nedbd-v2` binary bundled inside `pip install nedb-engine`.
 
 **The v3 storage line — consolidated, spec'd, and (as of 2.4.3) cleanly published across every platform.** It makes the NEDB **v3 segment/pack object store** a first-class, fully-documented feature:
 
@@ -506,6 +506,28 @@ Prompt-to-database scaffolding GUI with schema graph, NQL console, time-travel s
 | [aiassistsecure/nedb-studio](https://github.com/aiassistsecure/nedb-studio) | Studio UI (GPLv3) |
 
 **Packages:** [PyPI nedb-engine](https://pypi.org/project/nedb-engine/) · [npm nedb-engine](https://www.npmjs.com/package/nedb-engine)
+
+---
+
+## Releasing
+
+NEDB and its two distributions (`crypto-database`, `aof-db`) ship from a **single version tag** via one committed tool:
+
+```bash
+python3 scripts/release.py "vFROM" "vTO"
+# e.g. the first run of the 2.4.468 line:
+python3 scripts/release.py "v2.4.68" "v2.4.468"
+```
+
+Both arguments require the leading `v` (e.g. `v2.4.468`). The script:
+
+1. **Bumps every version-bearing manifest** (npm / PyPI / crates + the engine crate, clients, and the maturin project) in the flagship **and** both distribution forks from `FROM` to `TO`, opening and merging a release PR per repo.
+2. **Repoints the `distributions/*` submodules** to the freshly-bumped fork masters.
+3. **Tags `vTO`** on `master`, firing CI/CD — `release.yml` (flagship) + `release-distros.yml` (distros) + Codemagic (macOS wheels/addons) — to publish `nedb-engine` + `crypto-database` + `aof-db` aligned on one version across npm, PyPI, and crates.io.
+
+It is **idempotent**: a manifest line already at `TO` is left untouched, a repo already fully at `TO` produces no empty PR, and an existing `vTO` tag is left in place — so a half-finished release can be re-run safely, and the remaining steps (submodule repoint, tag) always run even when the version was already correct.
+
+Requires `GITHUB_TOKEN` (`repo` + `workflow` scope) in the environment. It never force-pushes `master` and never commits to it directly — every change lands through a branch + PR + merge.
 
 ---
 
