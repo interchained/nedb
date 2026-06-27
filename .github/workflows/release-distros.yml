@@ -1,0 +1,226 @@
+name: release-distros
+
+# Publishes the NEDB *distributions* — crypto-database (verifiable v2/v3) and
+# aof-db (fast/lightweight) — on a version tag, building each from its submodule
+# under distributions/. Each is a REAL, independent build of the shared core under its
+# own name (its own .node / wheel / crate) — not a relabel of nedb-engine.
+#
+# The flagship `nedb-engine` ships from release.yml, which this file does NOT
+# touch — this is purely additive, so a problem here can never break the engine
+# publish. Central orchestration lives here, in nedb; the distro repos carry no
+# workflow of their own.
+#
+# Submodule identity (v2.4.4): the distros were renamed for publication —
+# cryptoDB -> crypto-database (npm + crates.io; PyPI stays `cryptodb` because
+# `crypto-database` is taken there) and nitroDB -> aof-db (all three). The
+# submodule folder paths mirror the new names: distributions/crypto-database and
+# distributions/aof-db. Both submodules track master and are pinned to the
+# renamed, v2.4.4-bumped commits. macOS-native distro wheels via Codemagic are a
+# documented follow-up (see codemagic.yaml).
+#
+# Secrets required: NPM_TOKEN, PYPI_API_TOKEN, CARGO_REGISTRY_TOKEN.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Native napi .node per distro × platform (Linux + Windows; macOS = Codemagic) ──
+  distro-node:
+    name: ${{ matrix.distro.name }} napi (${{ matrix.platform.target }})
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 40
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - { name: crypto-database, path: distributions/crypto-database }
+          - { name: aof-db,          path: distributions/aof-db }
+        platform:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with: { node-version: "20", registry-url: "https://registry.npmjs.org" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.platform.target }}" }
+      - name: Install @napi-rs/cli (in distro submodule)
+        working-directory: ${{ matrix.distro.path }}
+        run: npm install
+      - name: Build native addon
+        working-directory: ${{ matrix.distro.path }}
+        run: npx napi build --platform --release --target ${{ matrix.platform.target }} --cargo-cwd rust/crates/nedb-node
+      - name: Build nedbd-v2 daemon
+        working-directory: ${{ matrix.distro.path }}
+        shell: bash
+        run: |
+          cd rust
+          cargo build --release --bin nedbd --package nedb-engine --target ${{ matrix.platform.target }}
+          cd ..
+          if [[ "${{ matrix.platform.target }}" == *windows* ]]; then
+            cp rust/target/${{ matrix.platform.target }}/release/nedbd.exe nedbd-v2-win-x64.exe
+          else
+            cp rust/target/${{ matrix.platform.target }}/release/nedbd nedbd-v2-linux-x64; chmod +x nedbd-v2-linux-x64
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.distro.name }}-node-${{ matrix.platform.target }}
+          path: |
+            ${{ matrix.distro.path }}/*.node
+            ${{ matrix.distro.path }}/index.js
+            ${{ matrix.distro.path }}/index.d.ts
+            ${{ matrix.distro.path }}/nedbd-v2-linux-x64
+            ${{ matrix.distro.path }}/nedbd-v2-win-x64.exe
+          if-no-files-found: ignore
+
+  # ── Smoke gate per distro: the shipped npm test against the freshly-built addon ──
+  distro-smoke:
+    name: ${{ matrix.distro }} smoke gate
+    needs: [distro-node]
+    runs-on: ubuntu-latest
+    if: "!cancelled()"
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [crypto-database, aof-db]
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - name: Download this distro's Linux addon
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.distro == 'crypto-database' && 'crypto-database' || 'aof-db' }}-node-x86_64-unknown-linux-gnu
+          path: ${{ matrix.distro == 'crypto-database' && 'distributions/crypto-database' || 'distributions/aof-db' }}
+      - name: npm test (smoke.mjs) against the built addon — must pass to publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR=${{ matrix.distro == 'crypto-database' && 'distributions/crypto-database' || 'distributions/aof-db' }}
+          cd "$DIR"
+          node test/smoke.mjs | tee smoke-out.txt
+          grep -q "all five acts passed" smoke-out.txt
+          echo "✅ ${{ matrix.distro }} smoke gate passed"
+
+  # ── npm publish per distro (gated on its smoke) ──────────────────────────────
+  distro-publish-npm:
+    name: ${{ matrix.distro.name }} → npm
+    needs: [distro-node, distro-smoke]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') && needs.distro-smoke.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - { name: crypto-database, path: distributions/crypto-database }
+          - { name: aof-db,          path: distributions/aof-db }
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - uses: actions/setup-node@v4
+        with: { node-version: "20", registry-url: "https://registry.npmjs.org" }
+      - name: Download this distro's Linux + Windows addons
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ matrix.distro.name }}-node-*
+          merge-multiple: true
+          path: ${{ matrix.distro.path }}
+      # macOS .node addons are built on Codemagic and uploaded to the GitHub
+      # release as <napi.name>.darwin-arm64.node / <napi.name>.darwin-x64.node.
+      # Wait for THIS distro's two mac addons (mirrors the flagship publish-npm
+      # assembly), then publish so npm ships full platform coverage. On timeout we
+      # still publish Linux+Windows rather than block — mac can land on a later tag.
+      - name: Wait for this distro's macOS .node from Codemagic (max 35 min)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          VERSION="${{ github.ref_name }}"
+          NAME="${{ matrix.distro.name }}"
+          DIR="${{ matrix.distro.path }}"
+          echo "Polling release $VERSION for ${NAME}.darwin-*.node (Codemagic)…"
+          for i in $(seq 1 35); do
+            ASSETS=$(gh release view "$VERSION" --repo Eth-Interchained/nedb --json assets --jq '[.assets[].name]' 2>/dev/null || echo "[]")
+            ARM=$(echo "$ASSETS" | grep -c "${NAME}.darwin-arm64.node" || true)
+            X86=$(echo "$ASSETS" | grep -c "${NAME}.darwin-x64.node" || true)
+            echo "  attempt $i/35 — ${NAME}: arm64=$ARM x86_64=$X86"
+            if [ "$ARM" -gt 0 ] && [ "$X86" -gt 0 ]; then
+              echo "macOS addons present — downloading into $DIR"
+              gh release download "$VERSION" --repo Eth-Interchained/nedb --pattern "${NAME}.darwin-arm64.node" --dir "$DIR" --clobber
+              gh release download "$VERSION" --repo Eth-Interchained/nedb --pattern "${NAME}.darwin-x64.node" --dir "$DIR" --clobber
+              break
+            fi
+            if [ "$i" -eq 35 ]; then
+              echo "Timeout — publishing ${NAME} with Linux+Windows only; macOS can land on a later tag."
+            fi
+            sleep 60
+          done
+          echo "Final .node in $DIR: $(ls "$DIR"/*.node 2>/dev/null || echo none)"
+      - name: Publish
+        working-directory: ${{ matrix.distro.path }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+  # ── crates.io publish per distro (the thin re-export crate) ──────────────────
+  distro-publish-crate:
+    name: ${{ matrix.distro.name }} → crates.io
+    needs: [distro-smoke]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') && needs.distro-smoke.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - { name: crypto-database, path: distributions/crypto-database }
+          - { name: aof-db,          path: distributions/aof-db }
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Publish re-export crate
+        working-directory: ${{ matrix.distro.path }}/rust
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          cargo publish --package ${{ matrix.distro.name }} --allow-dirty 2>&1 \
+            || echo "Publish skipped (version may already exist on crates.io)"
+
+  # ── PyPI universal wheel per distro ──────────────────────────────────────────
+  # NOTE: crypto-database's pyproject keeps name="cryptodb" on PyPI (crypto-database
+  # is taken by a third party); aof-db publishes as aof-db. The wheel name is read
+  # from each distro's own pyproject.toml, so no matrix name change is needed here.
+  distro-pypi:
+    name: ${{ matrix.distro.name }} → PyPI (universal)
+    needs: [distro-smoke]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') && needs.distro-smoke.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - { name: crypto-database, path: distributions/crypto-database }
+          - { name: aof-db,          path: distributions/aof-db }
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Build + publish universal wheel
+        working-directory: ${{ matrix.distro.path }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          pip install --upgrade build twine
+          python -m build
+          twine upload --skip-existing --verbose dist/*

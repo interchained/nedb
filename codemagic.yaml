@@ -20,6 +20,13 @@
 #   4. publish-npm downloads all, runs ONE npm publish with the complete bundle
 #   PyPI wheels: each platform uploads independently (--skip-existing, no conflict)
 
+# ── DISTRIBUTIONS (cryptoDB / nitroDB) ───────────────────────────────────────
+# The flagship nedb-engine macOS workflows are below. The cryptoDB / nitroDB
+# distro workflows are COPIES of them that (1) init their submodule and (2) cd
+# into distributions/<distro> for every build step — self-contained, no app
+# settings needed. They build/publish under the distro's renamed manifests via
+# the same nedb_secrets tokens.
+
 workflows:
 
   # ── Apple Silicon wheel (aarch64) ─────────────────────────────────────
@@ -101,6 +108,14 @@ workflows:
       - name: Upload Mac arm64 binaries to GitHub release
         script: |
           which gh || brew install gh
+          # Hand gh a CLEAN token explicitly. Relying on implicit env pickup was
+          # 401'ing: the same token authenticates fine via an explicit Bearer
+          # header, so the value is valid — the failure is a trailing newline in
+          # the Codemagic secret corrupting the Authorization header. Strip all
+          # whitespace, set GH_TOKEN (gh prefers it over GITHUB_TOKEN), verify.
+          export GH_TOKEN="$(printf '%s' "$GITHUB_TOKEN" | tr -d '[:space:]')"
+          echo "gh token length: ${#GH_TOKEN}  (raw GITHUB_TOKEN length: ${#GITHUB_TOKEN})"
+          gh auth status || true
           VERSION=$(node -e "console.log(require('./package.json').version)")
           TAG="v$VERSION"
           echo "Uploading Mac arm64 artifacts to GitHub release $TAG"
@@ -203,6 +218,490 @@ workflows:
       - name: Upload Mac x86_64 binaries to GitHub release
         script: |
           which gh || brew install gh
+          # Hand gh a CLEAN token explicitly. Relying on implicit env pickup was
+          # 401'ing: the same token authenticates fine via an explicit Bearer
+          # header, so the value is valid — the failure is a trailing newline in
+          # the Codemagic secret corrupting the Authorization header. Strip all
+          # whitespace, set GH_TOKEN (gh prefers it over GITHUB_TOKEN), verify.
+          export GH_TOKEN="$(printf '%s' "$GITHUB_TOKEN" | tr -d '[:space:]')"
+          echo "gh token length: ${#GH_TOKEN}  (raw GITHUB_TOKEN length: ${#GITHUB_TOKEN})"
+          gh auth status || true
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          TAG="v$VERSION"
+          echo "Uploading Mac x86_64 artifacts to GitHub release $TAG"
+          # nedbd-v2 server binary
+          cp python/nedb/nedbd-v2 nedbd-v2-darwin-x64
+          gh release upload "$TAG" nedbd-v2-darwin-x64 --repo Eth-Interchained/nedb --clobber
+          # _native extension
+          python3 scripts/extract_native.py "dist/*.whl" native-ext
+          cp native-ext/nedb/_native* . 2>/dev/null || true
+          for f in _native*darwin*x86_64*; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
+          done
+          # napi .node addon
+          for f in *.node; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
+          done
+
+    artifacts:
+      - dist/*.whl
+      - "*.node"
+
+  cryptodb-macos-arm64-wheel:
+    name: "cryptoDB wheel — macOS arm64"
+    max_build_duration: 60
+    instance_type: mac_mini_m2   # Apple Silicon — M2 Mac Mini
+    triggering:
+      events:
+        - tag
+      tag_patterns:
+        - pattern: "v*"
+          include: true
+    environment:
+      vars:
+        RUST_TARGET: aarch64-apple-darwin
+        WHEEL_LABEL: macos-arm64
+      groups:
+        - nedb_secrets          # contains PYPI_API_TOKEN + GITHUB_TOKEN
+    scripts:
+      - name: Fetch distro submodule
+        script: git submodule update --init --recursive distributions/crypto-database
+
+      - name: Install Rust
+        script: |
+          cd distributions/crypto-database
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          source "$HOME/.cargo/env"
+          rustup target add $RUST_TARGET
+          echo "rustc: $(rustc --version)"
+
+      - name: Install Python tools
+        script: pip3 install --upgrade maturin twine
+
+      - name: Build nedbd-v2 binary
+        script: |
+          cd distributions/crypto-database
+          set -euo pipefail
+          source "$HOME/.cargo/env"
+          # Build from the workspace root (rust/) so cargo uses the workspace Cargo.lock.
+          # Output lands in rust/target/<triple>/release/nedbd (workspace target dir).
+          cd rust
+          cargo build --release --bin nedbd --package nedb-engine --target $RUST_TARGET
+          cd ..
+          BIN="rust/target/$RUST_TARGET/release/nedbd"
+          echo "Binary built: $(ls -lh $BIN)"
+          cp "$BIN" python/nedb/nedbd-v2
+          chmod +x python/nedb/nedbd-v2
+          echo "Binary staged: $(ls -lh python/nedb/nedbd-v2)"
+
+      - name: Stage Python source + verify binary
+        script: |
+          cd distributions/crypto-database
+          rm -rf rust/crates/nedb-py/python
+          mkdir -p rust/crates/nedb-py/python
+          cp -r python/nedb rust/crates/nedb-py/python/nedb
+          find rust/crates/nedb-py/python/nedb -name "nedbd-v2*" -exec chmod +x {} \;
+          echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) .py files"
+          # Fail loudly if binary is missing — maturin include= needs it present
+          ls -lh rust/crates/nedb-py/python/nedb/nedbd-v2 || { echo "ERROR: nedbd-v2 missing!"; exit 1; }
+          echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) py files"
+
+      - name: Build wheel (maturin)
+        script: |
+          cd distributions/crypto-database
+          source "$HOME/.cargo/env"
+          cd rust/crates/nedb-py
+          maturin build --release --out ../../../dist --target $RUST_TARGET
+          echo "Wheel:"
+          ls -lh ../../../dist/*.whl
+
+      - name: Publish to PyPI
+        script: |
+          cd distributions/crypto-database
+          TWINE_USERNAME=__token__ \
+          TWINE_PASSWORD=$PYPI_API_TOKEN \
+          twine upload --skip-existing --verbose dist/*.whl
+
+      - name: Build napi addon (arm64)
+        script: |
+          cd distributions/crypto-database
+          source "$HOME/.cargo/env"
+          npm install
+          npx napi build --platform --release --target $RUST_TARGET \
+            --cargo-cwd rust/crates/nedb-node
+          echo "napi .node files: $(ls *.node 2>/dev/null)"
+
+      - name: Upload Mac arm64 binaries to GitHub release
+        script: |
+          cd distributions/crypto-database
+          which gh || brew install gh
+          # Hand gh a CLEAN token explicitly. Relying on implicit env pickup was
+          # 401'ing: the same token authenticates fine via an explicit Bearer
+          # header, so the value is valid — the failure is a trailing newline in
+          # the Codemagic secret corrupting the Authorization header. Strip all
+          # whitespace, set GH_TOKEN (gh prefers it over GITHUB_TOKEN), verify.
+          export GH_TOKEN="$(printf '%s' "$GITHUB_TOKEN" | tr -d '[:space:]')"
+          echo "gh token length: ${#GH_TOKEN}  (raw GITHUB_TOKEN length: ${#GITHUB_TOKEN})"
+          gh auth status || true
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          TAG="v$VERSION"
+          echo "Uploading Mac arm64 artifacts to GitHub release $TAG"
+          # nedbd-v2 server binary
+          cp python/nedb/nedbd-v2 nedbd-v2-darwin-arm64
+          gh release upload "$TAG" nedbd-v2-darwin-arm64 --repo Eth-Interchained/nedb --clobber
+          # _native extension (so pypi fat-wheel includes it for Mac users)
+          python3 scripts/extract_native.py "dist/*.whl" native-ext
+          cp native-ext/nedb/_native* . 2>/dev/null || true
+          for f in _native*darwin*arm64*; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
+          done
+          # napi .node addon
+          for f in *.node; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
+          done
+
+    artifacts:
+      - dist/*.whl
+      - "*.node"
+
+  # ── Intel Mac wheel (x86_64) ──────────────────────────────────────────
+
+  cryptodb-macos-intel-wheel:
+    name: "cryptoDB wheel — macOS x86_64"
+    max_build_duration: 60
+    instance_type: mac_mini_m2   # cross-compiles x86_64 from M2
+    triggering:
+      events:
+        - tag
+      tag_patterns:
+        - pattern: "v*"
+          include: true
+    environment:
+      vars:
+        RUST_TARGET: x86_64-apple-darwin
+        WHEEL_LABEL: macos-x86_64
+      groups:
+        - nedb_secrets
+    scripts:
+      - name: Fetch distro submodule
+        script: git submodule update --init --recursive distributions/crypto-database
+
+      - name: Install Rust + Intel target
+        script: |
+          cd distributions/crypto-database
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          source "$HOME/.cargo/env"
+          rustup target add $RUST_TARGET
+          echo "rustc: $(rustc --version)"
+
+      - name: Install Python tools
+        script: pip3 install --upgrade maturin twine
+
+      - name: Build nedbd-v2 binary (cross-compile x86_64)
+        script: |
+          cd distributions/crypto-database
+          set -euo pipefail
+          source "$HOME/.cargo/env"
+          # Cross-compile x86_64 from M2: configure the Xcode clang linker explicitly
+          export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="$(xcrun --find clang)"
+          export CC_x86_64_apple_darwin="$(xcrun --find clang)"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          rustup target add $RUST_TARGET
+          cd rust
+          cargo build --release --bin nedbd --package nedb-engine --target $RUST_TARGET
+          cd ..
+          BIN="rust/target/$RUST_TARGET/release/nedbd"
+          echo "Binary built: $(ls -lh $BIN)"
+          cp "$BIN" python/nedb/nedbd-v2
+          chmod +x python/nedb/nedbd-v2
+          echo "Binary staged: $(ls -lh python/nedb/nedbd-v2)"
+
+      - name: Stage Python source + verify binary
+        script: |
+          cd distributions/crypto-database
+          rm -rf rust/crates/nedb-py/python
+          mkdir -p rust/crates/nedb-py/python
+          cp -r python/nedb rust/crates/nedb-py/python/nedb
+          find rust/crates/nedb-py/python/nedb -name "nedbd-v2*" -exec chmod +x {} \;
+          echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) .py files"
+          # Fail loudly if binary is missing — maturin include= needs it present
+          ls -lh rust/crates/nedb-py/python/nedb/nedbd-v2 || { echo "ERROR: nedbd-v2 missing!"; exit 1; }
+
+      - name: Build wheel (maturin)
+        script: |
+          cd distributions/crypto-database
+          source "$HOME/.cargo/env"
+          cd rust/crates/nedb-py
+          maturin build --release --out ../../../dist --target $RUST_TARGET
+          echo "Wheel:"
+          ls -lh ../../../dist/*.whl
+
+      - name: Publish to PyPI
+        script: |
+          cd distributions/crypto-database
+          TWINE_USERNAME=__token__ \
+          TWINE_PASSWORD=$PYPI_API_TOKEN \
+          twine upload --skip-existing --verbose dist/*.whl
+
+      - name: Build napi addon (x86_64)
+        script: |
+          cd distributions/crypto-database
+          source "$HOME/.cargo/env"
+          npm install
+          npx napi build --platform --release --target $RUST_TARGET \
+            --cargo-cwd rust/crates/nedb-node
+          echo "napi .node files: $(ls *.node 2>/dev/null)"
+
+      - name: Upload Mac x86_64 binaries to GitHub release
+        script: |
+          cd distributions/crypto-database
+          which gh || brew install gh
+          # Hand gh a CLEAN token explicitly. Relying on implicit env pickup was
+          # 401'ing: the same token authenticates fine via an explicit Bearer
+          # header, so the value is valid — the failure is a trailing newline in
+          # the Codemagic secret corrupting the Authorization header. Strip all
+          # whitespace, set GH_TOKEN (gh prefers it over GITHUB_TOKEN), verify.
+          export GH_TOKEN="$(printf '%s' "$GITHUB_TOKEN" | tr -d '[:space:]')"
+          echo "gh token length: ${#GH_TOKEN}  (raw GITHUB_TOKEN length: ${#GITHUB_TOKEN})"
+          gh auth status || true
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          TAG="v$VERSION"
+          echo "Uploading Mac x86_64 artifacts to GitHub release $TAG"
+          # nedbd-v2 server binary
+          cp python/nedb/nedbd-v2 nedbd-v2-darwin-x64
+          gh release upload "$TAG" nedbd-v2-darwin-x64 --repo Eth-Interchained/nedb --clobber
+          # _native extension
+          python3 scripts/extract_native.py "dist/*.whl" native-ext
+          cp native-ext/nedb/_native* . 2>/dev/null || true
+          for f in _native*darwin*x86_64*; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
+          done
+          # napi .node addon
+          for f in *.node; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
+          done
+
+    artifacts:
+      - dist/*.whl
+      - "*.node"
+
+  nitrodb-macos-arm64-wheel:
+    name: "nitroDB wheel — macOS arm64"
+    max_build_duration: 60
+    instance_type: mac_mini_m2   # Apple Silicon — M2 Mac Mini
+    triggering:
+      events:
+        - tag
+      tag_patterns:
+        - pattern: "v*"
+          include: true
+    environment:
+      vars:
+        RUST_TARGET: aarch64-apple-darwin
+        WHEEL_LABEL: macos-arm64
+      groups:
+        - nedb_secrets          # contains PYPI_API_TOKEN + GITHUB_TOKEN
+    scripts:
+      - name: Fetch distro submodule
+        script: git submodule update --init --recursive distributions/aof-db
+
+      - name: Install Rust
+        script: |
+          cd distributions/aof-db
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          source "$HOME/.cargo/env"
+          rustup target add $RUST_TARGET
+          echo "rustc: $(rustc --version)"
+
+      - name: Install Python tools
+        script: pip3 install --upgrade maturin twine
+
+      - name: Build nedbd-v2 binary
+        script: |
+          cd distributions/aof-db
+          set -euo pipefail
+          source "$HOME/.cargo/env"
+          # Build from the workspace root (rust/) so cargo uses the workspace Cargo.lock.
+          # Output lands in rust/target/<triple>/release/nedbd (workspace target dir).
+          cd rust
+          cargo build --release --bin nedbd --package nedb-engine --target $RUST_TARGET
+          cd ..
+          BIN="rust/target/$RUST_TARGET/release/nedbd"
+          echo "Binary built: $(ls -lh $BIN)"
+          cp "$BIN" python/nedb/nedbd-v2
+          chmod +x python/nedb/nedbd-v2
+          echo "Binary staged: $(ls -lh python/nedb/nedbd-v2)"
+
+      - name: Stage Python source + verify binary
+        script: |
+          cd distributions/aof-db
+          rm -rf rust/crates/nedb-py/python
+          mkdir -p rust/crates/nedb-py/python
+          cp -r python/nedb rust/crates/nedb-py/python/nedb
+          find rust/crates/nedb-py/python/nedb -name "nedbd-v2*" -exec chmod +x {} \;
+          echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) .py files"
+          # Fail loudly if binary is missing — maturin include= needs it present
+          ls -lh rust/crates/nedb-py/python/nedb/nedbd-v2 || { echo "ERROR: nedbd-v2 missing!"; exit 1; }
+          echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) py files"
+
+      - name: Build wheel (maturin)
+        script: |
+          cd distributions/aof-db
+          source "$HOME/.cargo/env"
+          cd rust/crates/nedb-py
+          maturin build --release --out ../../../dist --target $RUST_TARGET
+          echo "Wheel:"
+          ls -lh ../../../dist/*.whl
+
+      - name: Publish to PyPI
+        script: |
+          cd distributions/aof-db
+          TWINE_USERNAME=__token__ \
+          TWINE_PASSWORD=$PYPI_API_TOKEN \
+          twine upload --skip-existing --verbose dist/*.whl
+
+      - name: Build napi addon (arm64)
+        script: |
+          cd distributions/aof-db
+          source "$HOME/.cargo/env"
+          npm install
+          npx napi build --platform --release --target $RUST_TARGET \
+            --cargo-cwd rust/crates/nedb-node
+          echo "napi .node files: $(ls *.node 2>/dev/null)"
+
+      - name: Upload Mac arm64 binaries to GitHub release
+        script: |
+          cd distributions/aof-db
+          which gh || brew install gh
+          # Hand gh a CLEAN token explicitly. Relying on implicit env pickup was
+          # 401'ing: the same token authenticates fine via an explicit Bearer
+          # header, so the value is valid — the failure is a trailing newline in
+          # the Codemagic secret corrupting the Authorization header. Strip all
+          # whitespace, set GH_TOKEN (gh prefers it over GITHUB_TOKEN), verify.
+          export GH_TOKEN="$(printf '%s' "$GITHUB_TOKEN" | tr -d '[:space:]')"
+          echo "gh token length: ${#GH_TOKEN}  (raw GITHUB_TOKEN length: ${#GITHUB_TOKEN})"
+          gh auth status || true
+          VERSION=$(node -e "console.log(require('./package.json').version)")
+          TAG="v$VERSION"
+          echo "Uploading Mac arm64 artifacts to GitHub release $TAG"
+          # nedbd-v2 server binary
+          cp python/nedb/nedbd-v2 nedbd-v2-darwin-arm64
+          gh release upload "$TAG" nedbd-v2-darwin-arm64 --repo Eth-Interchained/nedb --clobber
+          # _native extension (so pypi fat-wheel includes it for Mac users)
+          python3 scripts/extract_native.py "dist/*.whl" native-ext
+          cp native-ext/nedb/_native* . 2>/dev/null || true
+          for f in _native*darwin*arm64*; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
+          done
+          # napi .node addon
+          for f in *.node; do
+            [ -f "$f" ] && gh release upload "$TAG" "$f" --repo Eth-Interchained/nedb --clobber || true
+          done
+
+    artifacts:
+      - dist/*.whl
+      - "*.node"
+
+  # ── Intel Mac wheel (x86_64) ──────────────────────────────────────────
+
+  nitrodb-macos-intel-wheel:
+    name: "nitroDB wheel — macOS x86_64"
+    max_build_duration: 60
+    instance_type: mac_mini_m2   # cross-compiles x86_64 from M2
+    triggering:
+      events:
+        - tag
+      tag_patterns:
+        - pattern: "v*"
+          include: true
+    environment:
+      vars:
+        RUST_TARGET: x86_64-apple-darwin
+        WHEEL_LABEL: macos-x86_64
+      groups:
+        - nedb_secrets
+    scripts:
+      - name: Fetch distro submodule
+        script: git submodule update --init --recursive distributions/aof-db
+
+      - name: Install Rust + Intel target
+        script: |
+          cd distributions/aof-db
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          source "$HOME/.cargo/env"
+          rustup target add $RUST_TARGET
+          echo "rustc: $(rustc --version)"
+
+      - name: Install Python tools
+        script: pip3 install --upgrade maturin twine
+
+      - name: Build nedbd-v2 binary (cross-compile x86_64)
+        script: |
+          cd distributions/aof-db
+          set -euo pipefail
+          source "$HOME/.cargo/env"
+          # Cross-compile x86_64 from M2: configure the Xcode clang linker explicitly
+          export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER="$(xcrun --find clang)"
+          export CC_x86_64_apple_darwin="$(xcrun --find clang)"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          rustup target add $RUST_TARGET
+          cd rust
+          cargo build --release --bin nedbd --package nedb-engine --target $RUST_TARGET
+          cd ..
+          BIN="rust/target/$RUST_TARGET/release/nedbd"
+          echo "Binary built: $(ls -lh $BIN)"
+          cp "$BIN" python/nedb/nedbd-v2
+          chmod +x python/nedb/nedbd-v2
+          echo "Binary staged: $(ls -lh python/nedb/nedbd-v2)"
+
+      - name: Stage Python source + verify binary
+        script: |
+          cd distributions/aof-db
+          rm -rf rust/crates/nedb-py/python
+          mkdir -p rust/crates/nedb-py/python
+          cp -r python/nedb rust/crates/nedb-py/python/nedb
+          find rust/crates/nedb-py/python/nedb -name "nedbd-v2*" -exec chmod +x {} \;
+          echo "Staged $(find rust/crates/nedb-py/python/nedb -name '*.py' | wc -l) .py files"
+          # Fail loudly if binary is missing — maturin include= needs it present
+          ls -lh rust/crates/nedb-py/python/nedb/nedbd-v2 || { echo "ERROR: nedbd-v2 missing!"; exit 1; }
+
+      - name: Build wheel (maturin)
+        script: |
+          cd distributions/aof-db
+          source "$HOME/.cargo/env"
+          cd rust/crates/nedb-py
+          maturin build --release --out ../../../dist --target $RUST_TARGET
+          echo "Wheel:"
+          ls -lh ../../../dist/*.whl
+
+      - name: Publish to PyPI
+        script: |
+          cd distributions/aof-db
+          TWINE_USERNAME=__token__ \
+          TWINE_PASSWORD=$PYPI_API_TOKEN \
+          twine upload --skip-existing --verbose dist/*.whl
+
+      - name: Build napi addon (x86_64)
+        script: |
+          cd distributions/aof-db
+          source "$HOME/.cargo/env"
+          npm install
+          npx napi build --platform --release --target $RUST_TARGET \
+            --cargo-cwd rust/crates/nedb-node
+          echo "napi .node files: $(ls *.node 2>/dev/null)"
+
+      - name: Upload Mac x86_64 binaries to GitHub release
+        script: |
+          cd distributions/aof-db
+          which gh || brew install gh
+          # Hand gh a CLEAN token explicitly. Relying on implicit env pickup was
+          # 401'ing: the same token authenticates fine via an explicit Bearer
+          # header, so the value is valid — the failure is a trailing newline in
+          # the Codemagic secret corrupting the Authorization header. Strip all
+          # whitespace, set GH_TOKEN (gh prefers it over GITHUB_TOKEN), verify.
+          export GH_TOKEN="$(printf '%s' "$GITHUB_TOKEN" | tr -d '[:space:]')"
+          echo "gh token length: ${#GH_TOKEN}  (raw GITHUB_TOKEN length: ${#GITHUB_TOKEN})"
+          gh auth status || true
           VERSION=$(node -e "console.log(require('./package.json').version)")
           TAG="v$VERSION"
           echo "Uploading Mac x86_64 artifacts to GitHub release $TAG"

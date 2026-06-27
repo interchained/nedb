@@ -20,13 +20,16 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 
 ---
 
-## NEDB v2.3.3333 — Production Stable
+## NEDB v2.4.3 — Production Stable
 
-**Current stable: 2.3.3333** — Cross-platform native wheels shipping `nedbd-v2` binary inside `pip install nedb-engine`. Linux + Windows wheels built on GitHub Actions; macOS arm64 + x86_64 wheels built on Codemagic (M2 Mac Minis). All four platforms publish from one `v*` tag.
+**Current stable: 2.4.3** — a polish release on the complete cross-platform line. The `nedbd-v2` daemon now does **real CLI parsing** — `--dag-v3`, `--data`, `--fast-fsync`, `--help`, `--version` are recognized flags instead of being silently swallowed as the positional data dir — and `npm test` ships a **cinematic native smoke test** that tours v1→v2 migration, the v2 DAG, the v3 segment store, and a causal-provenance audit. All native wheels (Linux + Windows on GitHub Actions; macOS arm64 + x86_64 on Codemagic M2 Mac Minis) **plus** the universal pure-Python wheel ship from a single `v*` tag, with the `nedbd-v2` binary bundled inside `pip install nedb-engine`.
 
-**New in 2.3.3333:** opt-in **macOS fast-fsync** (`NEDB_FAST_FSYNC`) — the v3 segment store skips macOS's slow `F_FULLFSYNC` for a plain `fsync(2)` (default off; no-op on Linux/Windows), cutting flush latency on Fusion/SATA Macs without touching durability semantics by default. Closes the 3's cycle — next is **2.4.0**.
+**The v3 storage line — consolidated, spec'd, and (as of 2.4.3) cleanly published across every platform.** It makes the NEDB **v3 segment/pack object store** a first-class, fully-documented feature:
 
-**New in 2.3.333:** comprehensive documentation for the **NEDB v3 segment/pack object store** (see the v3 section below) — the opt-in append-only storage substrate that took a real itcd chainstate flush from *minutes* to **under 2 seconds**. Engine code is unchanged from 2.3.33, which shipped durable **flush-on-close** (a `Db` persists buffered writes when dropped, matching sled/RocksDB), a **cross-platform Windows-safe id-index** (percent-encodes filesystem-unsafe document ids — link ids, paths), and idempotent object re-writes.
+- **`--dag-v3`** (opt-in) — append-only segment store: one `fsync` per group-commit, `.idx` sidecars, compaction, non-destructive dual-read. Took a real itcd chainstate flush from *minutes* to **~1.3 s**. Parsed as a real flag by `nedbd-v2` as of v2.4.3 (or set `NEDB_DAG_V3=1`). (See the v3 section below.)
+- **`NEDB_FAST_FSYNC`** — macOS fast-fsync: a plain `fsync(2)` instead of `F_FULLFSYNC` (default off; no-op on Linux/Windows).
+- Durable **flush-on-close**, a **Windows-safe id-index** (percent-encodes filesystem-unsafe ids), and idempotent object re-writes — shipped across the 2.3.3xxx line.
+- **`docs/SPEC.md` §3** now formally specifies the v2 object store, the v3 substrate, and the durability model.
 
 NEDB v2 replaces the append-only log (AOF) with a **content-addressed Merkle DAG**. Every document version is an immutable, BLAKE2b-verified object. Nothing is ever overwritten. As of **v2.2.31**, restarts after the first open are **O(1) warm starts** (driven by a `MANIFEST` of `seq` + Merkle head), the **cold scan is deferred** so the daemon accepts connections immediately, and a new **`GET /events` SSE endpoint** streams scan progress + per-write events live.
 
@@ -357,8 +360,8 @@ v3 batches objects into append-only **segment packs** — `objects/segments/seg-
 ### How to enable
 
 ```bash
-# Engine / nedbd
-nedbd --dag-v3 --data /var/lib/nedb        # or set NEDB_DAG_V3=1
+# Engine / nedbd-v2 (the native daemon from npm / the native wheel)
+nedbd-v2 --dag-v3 --data /var/lib/nedb     # real flag as of v2.4.3 — or set NEDB_DAG_V3=1
 
 # itcd — Bitcoin-fork node embedding NEDB via nedb-ffi
 interchainedd -dagv3                        # puts chainstate AND block index on segments

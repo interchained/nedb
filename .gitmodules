@@ -1,0 +1,8 @@
+[submodule "distributions/crypto-database"]
+	path = distributions/crypto-database
+	url = https://github.com/crypto-datab/cryptoDB
+	branch = master
+[submodule "distributions/aof-db"]
+	path = distributions/aof-db
+	url = https://github.com/nitro-db/aof-DB
+	branch = master

@@ -1,6 +1,6 @@
 # NEDB — Architecture Specification
 
-Status: draft v0.1 · Reference engine implemented & tested · Rust core in progress
+Status: v2.4.2 · Rust v2 content-addressed DAG engine shipped (PyPI · npm · crates.io) · v3 segment/pack substrate opt-in (`--dag-v3`, parsed as a real `nedbd-v2` flag as of v2.4.2)
 
 ---
 
@@ -47,7 +47,7 @@ Op { seq, client, nonce, op, payload, idem, prev_hash, hash }
   (`ReplayError`). This is replay protection in the blockchain sense.
 - **idem** — optional idempotency key. A key seen before returns the original op and does
   **not** append again. Writes become safe under at-least-once delivery and retries.
-- **hash chain** — `hash_n = BLAKE3(hash_{n-1} ‖ canonical(body))`. Any tampering breaks
+- **hash chain** — `hash_n = BLAKE2b(hash_{n-1} ‖ canonical(body))`. Any tampering breaks
   the chain (`verify()`); the head hash commits to the entire history and is **anchorable
   on-chain (ITC)**.
 
@@ -56,14 +56,49 @@ deterministic `rebuild()`, and `AS OF` time-travel with no extra machinery.
 
 ---
 
-## 3. Storage engine
+NEDB v2 makes the log **content-addressed**: every document version is an immutable object
+addressed by `BLAKE2b(content)` and written under `objects/{hash[:2]}/{hash[2:]}`. Nothing is
+ever overwritten — reads re-verify their own bytes, and a partial write is just an
+unreferenced object ignored on startup.
 
-- **MVCC store** — each key → ascending `(seq, value|tombstone)` versions. HEAD read = last;
-  `as_of=N` read = newest with `seq ≤ N` (binary search). Readers never block writers.
-- **Concurrency (production)** — keyspace sharded by key hash; readers pin an epoch/snapshot;
-  writers append. This is how NEDB scales writes across cores where Redis is single-threaded.
-- **Durability (tunable)** — pure in-memory → WAL-buffered → fsync-per-commit. The op log *is*
-  the WAL; periodic snapshots checkpoint for fast recovery.
+- **MVCC / time-travel** — an id-index maps `(collection, id) → current object hash`; each
+  object carries a `prev` link to its prior version, so `AS OF seq` walks the version chain
+  backward to the newest object with `seq ≤ N`. Readers never block writers.
+- **Concurrency (production)** — a group-commit **Sequencer** batches writes (one committer
+  thread, parallel readers); the id-index buffers updates in a lock-free WAL and flushes them
+  to disk in parallel. This is how NEDB scales writes across cores where Redis is single-threaded.
+- **Merkle head** — every write advances a running head
+  `H_n = BLAKE2b(H_{n-1} ‖ seq ‖ object_hash)`, a tamper-evident commitment to all state at the
+  current seq, returned on every response and anchorable on-chain (ITC).
+
+### 3.1 v3 — segment / pack object store (opt-in)
+
+The default one-file-per-object layout is corruption-proof but caps throughput at the
+filesystem's small-file metadata rate (low hundreds of writes/s on real disks) — a hard
+ceiling for high-write workloads (blockchain chainstate, event sourcing). The **v3 substrate**
+(`--dag-v3` / `NEDB_DAG_V3`, **default off**) keeps the v2 logical model byte-for-byte and
+changes only *where the bytes live*:
+
+- **Segment packs** — immutable objects are appended into `objects/segments/seg-NNNNNN.dat` as
+  `[content_len: u32][content]`, addressed by an in-memory `hash → (segment, offset, len)`
+  index. A batch commits with **one `fsync`** instead of one per object, so flush cost scales
+  with **bytes written** (sequential append), not object-count × syscalls. In production
+  (itcd chainstate) this drops a multi-thousand-coin flush from *minutes* to **~1.3 s**.
+- **`.idx` sidecars** — a sealed segment carries a checksummed `hash → (offset, len)` index so
+  cold start loads it instead of rescanning; a missing/corrupt sidecar falls back to scan-and-heal.
+- **Compaction / pruning** — `compact(live)` rewrites the live object set into fresh segments
+  and reclaims superseded/dead versions, bounding on-disk size over long histories.
+- **Dual-read migration** — opening an existing v2 loose store in v3 mode is non-destructive:
+  old objects stay readable; only new writes go to segments. Full format: [`rust/SEGMENTS.md`](../rust/SEGMENTS.md).
+
+### 3.2 Durability
+
+Tunable: pure in-memory → WAL-buffered id-index → per-batch `fsync` (one durability point per
+group-commit). The object store *is* the WAL; a `MANIFEST` of `(seq, head)` checkpoints for
+O(1) **warm restart**, and a `Db` flushes on close (`Drop`) so write-then-drop is durable
+without an explicit flush. On macOS, `NEDB_FAST_FSYNC` (`-dagfastsync`) substitutes a plain
+`fsync(2)` for std's `F_FULLFSYNC` (a full hardware-cache barrier, 10–100× slower on
+Fusion/SATA) — crash-safe, much faster flush, default off. A torn segment tail is truncated on open.
 
 ---
 
@@ -155,10 +190,10 @@ history is cryptographically verifiable against your own chain.
 
 ## 10. Milestones
 
-`M0` spec + scaffold ✓ · `M1` core (log/MVCC/recovery) · `M2` relations + indexes + file layer
-· `M3` NQL + builders + time-travel + commits/branches/diff/merge · `M4` PyO3/napi + CI publish
-+ Cascade pipeline + tiering · `M5` nedbd server + benchmarks + Merkle/ITC anchoring · `M6` docs
-+ WASM.
+`M0` spec + scaffold ✓ · `M1` core (content-addressed DAG / MVCC / recovery) ✓ · `M2` relations
++ indexes + file layer ✓ · `M3` NQL + time-travel + bi-temporal + causal TRACE ✓ · `M4` PyO3/napi
++ CI publish (PyPI · npm · crates.io) ✓ · `M5` nedbd server + RESP2 + benchmarks ✓ · **`M6` v3
+segment/pack store + compaction + macOS fast-fsync ✓ (v2.4.0)** · `M7` WASM + Merkle inclusion proofs.
 
 ---
 

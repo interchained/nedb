@@ -353,10 +353,42 @@ jobs:
             index.d.ts
           if-no-files-found: ignore
 
-  publish-npm:
+  # ---------------------------------------------------- smoke gate -----
+  # Runs the shipped `npm test` (test/smoke.mjs) against the freshly-built
+  # Linux napi .node addon. If any of the five acts fail (non-zero exit, or
+  # the success banner is missing) this job fails and the npm publish below
+  # is skipped — a red smoke means nothing ships.
+  smoke-gate:
+    name: Smoke gate (npm test vs built addon)
     needs: [node-binaries]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') && !cancelled()
+    if: "!cancelled()"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Download freshly-built Linux napi addon (.node + index.js)
+        uses: actions/download-artifact@v4
+        with:
+          name: node-x86_64-unknown-linux-gnu
+          path: .
+      - name: npm test (smoke.mjs) against the built addon — must pass to publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Testing freshly-built artifacts:"; ls -lh *.node index.js test/smoke.mjs
+          # Exit code is the gate; the banner grep is the explicit parse.
+          node test/smoke.mjs | tee smoke-out.txt
+          grep -q "all five acts passed" smoke-out.txt
+          echo "✅ smoke gate passed — clearing npm publish"
+
+  publish-npm:
+    needs: [node-binaries, smoke-gate]
+    runs-on: ubuntu-latest
+    # HARD GATE: publish to npm only if the smoke test passed against the
+    # freshly-built native addon. A red smoke = no publish.
+    if: startsWith(github.ref, 'refs/tags/') && needs.smoke-gate.result == 'success'
     permissions:
       contents: read
     steps:

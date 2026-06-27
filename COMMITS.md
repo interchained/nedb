@@ -2,7 +2,7 @@
 
 Living progress log for the NEDB engine, focused on the **v3 segment/pack object store** and the 2.3.x releases. The engine is the source of truth; downstream consumers (itcd) are tracked where they exercise engine capabilities.
 
-_Last updated: 2026-06-26 — release **v2.3.333** (comprehensive v3 documentation)._
+_Last updated: 2026-06-26 — release **v2.4.2** (nedbd-v2 CLI parsing + cinematic `npm test` smoke demo)._
 
 ---
 
@@ -10,6 +10,9 @@ _Last updated: 2026-06-26 — release **v2.3.333** (comprehensive v3 documentati
 
 | Version | What shipped | Registries |
 |---|---|---|
+| **v2.4.2** | Bugfix/polish on the complete cross-platform line. `nedbd-v2` gains **real CLI parsing** — `--dag-v3`, `--data`, `--fast-fsync`, `--help`, `--version` are recognized flags (were silently swallowed as the positional data dir, so `--dag-v3` never engaged v3). Ships a cinematic `npm test` smoke demo (`test/smoke.mjs`, now in `package.json` `files`) touring v1→v2 migration · v2 DAG · v3 segments · a causal rideshare audit. Docs/SPEC updated; 9 manifests 2.4.1 → 2.4.2. | PyPI · npm · crates.io |
+| **v2.4.1** | CI-fixup re-tag — first **complete** cross-platform publish (all native wheels incl. macOS + the universal wheel) since the Codemagic `GITHUB_TOKEN` fix. Skeleton version bump, no engine change; marked stable in README. | PyPI · npm · crates.io |
+| **v2.4.0** | Cycle-closing minor — the v3 storage line consolidated & formally spec'd (`docs/SPEC.md` §3: v2 object store + v3 segment substrate + durability/fast-fsync). No new engine code; packages bumped 2.3.3333 → 2.4.0. | PyPI · npm · crates.io |
 | **v2.3.3333** | Opt-in macOS fast-fsync for the v3 segment store (`NEDB_FAST_FSYNC`, default off) — plain `fsync(2)` instead of `F_FULLFSYNC`, no-op off-mac. Closes the 3's cycle; next is 2.4.0. | PyPI · npm · crates.io |
 | **v2.3.333** | Comprehensive v3 documentation (README section + this log + ideas.md). Engine code unchanged from 2.3.33. | PyPI · npm · crates.io |
 | **v2.3.33** | Durable flush-on-close (`Db::drop` → `flush_all`), cross-platform Windows-safe id-index (percent-encoded filesystem-unsafe ids), idempotent re-writes; `cargo test -p nedb-engine` green (43/43). | PyPI · npm · crates.io |
@@ -22,6 +25,8 @@ _Last updated: 2026-06-26 — release **v2.3.333** (comprehensive v3 documentati
 
 | Commit | Summary |
 |---|---|
+| _this PR_ | fix(cli): real arg parsing in `nedbd-v2` — `--dag-v3`/`--data`/`--fast-fsync`/`--help`/`--version` (were swallowed as the data dir); test(smoke): cinematic `test/smoke.mjs` for `npm test`, shipped in `files` → tag `v2.4.2` |
+| `d0f5e92` | perf(v3): opt-in macOS fast fsync (`NEDB_FAST_FSYNC`) — plain `fsync(2)` instead of `F_FULLFSYNC` (#16) |
 | `d49dcbe` | fix(engine): cargo-test green — Windows-safe id-index, durable `Drop`, idempotent write (#14) |
 | `4f91bee` | chore(release): bump engine + clients to 2.3.33; refresh README banner |
 | `2eaa0ab` | fix(index): filesystem-safe id-index filenames so link ids persist on Windows |
@@ -59,5 +64,6 @@ Larger batch, less time — v3 cost is one `fsync` per batch, not per object. Th
 |---|---|---|
 | nedb | #10–#13 | NEDB v3 Phases 1–3 (segment store, compaction/pruning, `.idx` sidecars) + benchmark/integration tests |
 | nedb | #14 | cargo-test green: Windows-safe id-index, durable `Drop`, idempotent write → tag `v2.3.33` |
-| nedb | _this PR_ | docs(v3): comprehensive README v3 section + COMMITS.md + ideas.md → tag `v2.3.333` |
+| nedb | #17–#19 | release line: docs/spec consolidation → `v2.4.0` (#17); Codemagic `GITHUB_TOKEN` CI fix (#18); skeleton re-tag marked stable → `v2.4.1` (#19) |
+| nedb | _this PR_ | fix(cli) + test(smoke): `nedbd-v2` flag parsing + cinematic `npm test` demo → tag `v2.4.2` |
 | itcd | #55 | feat(nedb): `-dagv3` — chainstate/block-index on the NEDB v3 segment store via FFI |
