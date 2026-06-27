@@ -113,7 +113,7 @@ jobs:
 
   # ── npm publish per distro (gated on its smoke) ──────────────────────────────
   distro-publish-npm:
-    name: ${{ matrix.distro }} → npm
+    name: ${{ matrix.distro.name }} → npm
     needs: [distro-node, distro-smoke]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/') && needs.distro-smoke.result == 'success'
@@ -128,13 +128,43 @@ jobs:
         with: { submodules: recursive }
       - uses: actions/setup-node@v4
         with: { node-version: "20", registry-url: "https://registry.npmjs.org" }
-      - name: Download this distro's built addons (all platforms present)
+      - name: Download this distro's Linux + Windows addons
         uses: actions/download-artifact@v4
         with:
           pattern: ${{ matrix.distro.name }}-node-*
           merge-multiple: true
           path: ${{ matrix.distro.path }}
-      # (macOS .node arrives from Codemagic via the GitHub release — follow-up.)
+      # macOS .node addons are built on Codemagic and uploaded to the GitHub
+      # release as <napi.name>.darwin-arm64.node / <napi.name>.darwin-x64.node.
+      # Wait for THIS distro's two mac addons (mirrors the flagship publish-npm
+      # assembly), then publish so npm ships full platform coverage. On timeout we
+      # still publish Linux+Windows rather than block — mac can land on a later tag.
+      - name: Wait for this distro's macOS .node from Codemagic (max 35 min)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          VERSION="${{ github.ref_name }}"
+          NAME="${{ matrix.distro.name }}"
+          DIR="${{ matrix.distro.path }}"
+          echo "Polling release $VERSION for ${NAME}.darwin-*.node (Codemagic)…"
+          for i in $(seq 1 35); do
+            ASSETS=$(gh release view "$VERSION" --repo Eth-Interchained/nedb --json assets --jq '[.assets[].name]' 2>/dev/null || echo "[]")
+            ARM=$(echo "$ASSETS" | grep -c "${NAME}.darwin-arm64.node" || true)
+            X86=$(echo "$ASSETS" | grep -c "${NAME}.darwin-x64.node" || true)
+            echo "  attempt $i/35 — ${NAME}: arm64=$ARM x86_64=$X86"
+            if [ "$ARM" -gt 0 ] && [ "$X86" -gt 0 ]; then
+              echo "macOS addons present — downloading into $DIR"
+              gh release download "$VERSION" --repo Eth-Interchained/nedb --pattern "${NAME}.darwin-arm64.node" --dir "$DIR" --clobber
+              gh release download "$VERSION" --repo Eth-Interchained/nedb --pattern "${NAME}.darwin-x64.node" --dir "$DIR" --clobber
+              break
+            fi
+            if [ "$i" -eq 35 ]; then
+              echo "Timeout — publishing ${NAME} with Linux+Windows only; macOS can land on a later tag."
+            fi
+            sleep 60
+          done
+          echo "Final .node in $DIR: $(ls "$DIR"/*.node 2>/dev/null || echo none)"
       - name: Publish
         working-directory: ${{ matrix.distro.path }}
         env:
