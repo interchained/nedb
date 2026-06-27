@@ -22,10 +22,10 @@
 
 # ── DISTRIBUTIONS (cryptoDB / nitroDB) ───────────────────────────────────────
 # The flagship nedb-engine macOS workflows are below. The cryptoDB / nitroDB
-# distro workflows are EXACT COPIES of them with `working_directory` set to the
-# distro submodule (distributions/<distro>) — same proven build, different dir.
-# REQUIRES Codemagic's "fetch submodules" to be enabled so the submodule exists
-# at checkout. They build/publish under the distro's renamed manifests.
+# distro workflows are COPIES of them that (1) init their submodule and (2) cd
+# into distributions/<distro> for every build step — self-contained, no app
+# settings needed. They build/publish under the distro's renamed manifests via
+# the same nedb_secrets tokens.
 
 workflows:
 
@@ -249,7 +249,6 @@ workflows:
 
   cryptodb-macos-arm64-wheel:
     name: "cryptoDB wheel — macOS arm64"
-    working_directory: distributions/cryptoDB
     max_build_duration: 60
     instance_type: mac_mini_m2   # Apple Silicon — M2 Mac Mini
     triggering:
@@ -265,8 +264,12 @@ workflows:
       groups:
         - nedb_secrets          # contains PYPI_API_TOKEN + GITHUB_TOKEN
     scripts:
+      - name: Fetch distro submodule
+        script: git submodule update --init --recursive distributions/cryptoDB
+
       - name: Install Rust
         script: |
+          cd distributions/cryptoDB
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           source "$HOME/.cargo/env"
           rustup target add $RUST_TARGET
@@ -277,6 +280,7 @@ workflows:
 
       - name: Build nedbd-v2 binary
         script: |
+          cd distributions/cryptoDB
           set -euo pipefail
           source "$HOME/.cargo/env"
           # Build from the workspace root (rust/) so cargo uses the workspace Cargo.lock.
@@ -292,6 +296,7 @@ workflows:
 
       - name: Stage Python source + verify binary
         script: |
+          cd distributions/cryptoDB
           rm -rf rust/crates/nedb-py/python
           mkdir -p rust/crates/nedb-py/python
           cp -r python/nedb rust/crates/nedb-py/python/nedb
@@ -303,6 +308,7 @@ workflows:
 
       - name: Build wheel (maturin)
         script: |
+          cd distributions/cryptoDB
           source "$HOME/.cargo/env"
           cd rust/crates/nedb-py
           maturin build --release --out ../../../dist --target $RUST_TARGET
@@ -311,12 +317,14 @@ workflows:
 
       - name: Publish to PyPI
         script: |
+          cd distributions/cryptoDB
           TWINE_USERNAME=__token__ \
           TWINE_PASSWORD=$PYPI_API_TOKEN \
           twine upload --skip-existing --verbose dist/*.whl
 
       - name: Build napi addon (arm64)
         script: |
+          cd distributions/cryptoDB
           source "$HOME/.cargo/env"
           npm install
           npx napi build --platform --release --target $RUST_TARGET \
@@ -325,6 +333,7 @@ workflows:
 
       - name: Upload Mac arm64 binaries to GitHub release
         script: |
+          cd distributions/cryptoDB
           which gh || brew install gh
           # Hand gh a CLEAN token explicitly. Relying on implicit env pickup was
           # 401'ing: the same token authenticates fine via an explicit Bearer
@@ -359,7 +368,6 @@ workflows:
 
   cryptodb-macos-intel-wheel:
     name: "cryptoDB wheel — macOS x86_64"
-    working_directory: distributions/cryptoDB
     max_build_duration: 60
     instance_type: mac_mini_m2   # cross-compiles x86_64 from M2
     triggering:
@@ -375,8 +383,12 @@ workflows:
       groups:
         - nedb_secrets
     scripts:
+      - name: Fetch distro submodule
+        script: git submodule update --init --recursive distributions/cryptoDB
+
       - name: Install Rust + Intel target
         script: |
+          cd distributions/cryptoDB
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           source "$HOME/.cargo/env"
           rustup target add $RUST_TARGET
@@ -387,6 +399,7 @@ workflows:
 
       - name: Build nedbd-v2 binary (cross-compile x86_64)
         script: |
+          cd distributions/cryptoDB
           set -euo pipefail
           source "$HOME/.cargo/env"
           # Cross-compile x86_64 from M2: configure the Xcode clang linker explicitly
@@ -405,6 +418,7 @@ workflows:
 
       - name: Stage Python source + verify binary
         script: |
+          cd distributions/cryptoDB
           rm -rf rust/crates/nedb-py/python
           mkdir -p rust/crates/nedb-py/python
           cp -r python/nedb rust/crates/nedb-py/python/nedb
@@ -415,6 +429,7 @@ workflows:
 
       - name: Build wheel (maturin)
         script: |
+          cd distributions/cryptoDB
           source "$HOME/.cargo/env"
           cd rust/crates/nedb-py
           maturin build --release --out ../../../dist --target $RUST_TARGET
@@ -423,12 +438,14 @@ workflows:
 
       - name: Publish to PyPI
         script: |
+          cd distributions/cryptoDB
           TWINE_USERNAME=__token__ \
           TWINE_PASSWORD=$PYPI_API_TOKEN \
           twine upload --skip-existing --verbose dist/*.whl
 
       - name: Build napi addon (x86_64)
         script: |
+          cd distributions/cryptoDB
           source "$HOME/.cargo/env"
           npm install
           npx napi build --platform --release --target $RUST_TARGET \
@@ -437,6 +454,7 @@ workflows:
 
       - name: Upload Mac x86_64 binaries to GitHub release
         script: |
+          cd distributions/cryptoDB
           which gh || brew install gh
           # Hand gh a CLEAN token explicitly. Relying on implicit env pickup was
           # 401'ing: the same token authenticates fine via an explicit Bearer
@@ -469,7 +487,6 @@ workflows:
 
   nitrodb-macos-arm64-wheel:
     name: "nitroDB wheel — macOS arm64"
-    working_directory: distributions/nitroDB
     max_build_duration: 60
     instance_type: mac_mini_m2   # Apple Silicon — M2 Mac Mini
     triggering:
@@ -485,8 +502,12 @@ workflows:
       groups:
         - nedb_secrets          # contains PYPI_API_TOKEN + GITHUB_TOKEN
     scripts:
+      - name: Fetch distro submodule
+        script: git submodule update --init --recursive distributions/nitroDB
+
       - name: Install Rust
         script: |
+          cd distributions/nitroDB
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           source "$HOME/.cargo/env"
           rustup target add $RUST_TARGET
@@ -497,6 +518,7 @@ workflows:
 
       - name: Build nedbd-v2 binary
         script: |
+          cd distributions/nitroDB
           set -euo pipefail
           source "$HOME/.cargo/env"
           # Build from the workspace root (rust/) so cargo uses the workspace Cargo.lock.
@@ -512,6 +534,7 @@ workflows:
 
       - name: Stage Python source + verify binary
         script: |
+          cd distributions/nitroDB
           rm -rf rust/crates/nedb-py/python
           mkdir -p rust/crates/nedb-py/python
           cp -r python/nedb rust/crates/nedb-py/python/nedb
@@ -523,6 +546,7 @@ workflows:
 
       - name: Build wheel (maturin)
         script: |
+          cd distributions/nitroDB
           source "$HOME/.cargo/env"
           cd rust/crates/nedb-py
           maturin build --release --out ../../../dist --target $RUST_TARGET
@@ -531,12 +555,14 @@ workflows:
 
       - name: Publish to PyPI
         script: |
+          cd distributions/nitroDB
           TWINE_USERNAME=__token__ \
           TWINE_PASSWORD=$PYPI_API_TOKEN \
           twine upload --skip-existing --verbose dist/*.whl
 
       - name: Build napi addon (arm64)
         script: |
+          cd distributions/nitroDB
           source "$HOME/.cargo/env"
           npm install
           npx napi build --platform --release --target $RUST_TARGET \
@@ -545,6 +571,7 @@ workflows:
 
       - name: Upload Mac arm64 binaries to GitHub release
         script: |
+          cd distributions/nitroDB
           which gh || brew install gh
           # Hand gh a CLEAN token explicitly. Relying on implicit env pickup was
           # 401'ing: the same token authenticates fine via an explicit Bearer
@@ -579,7 +606,6 @@ workflows:
 
   nitrodb-macos-intel-wheel:
     name: "nitroDB wheel — macOS x86_64"
-    working_directory: distributions/nitroDB
     max_build_duration: 60
     instance_type: mac_mini_m2   # cross-compiles x86_64 from M2
     triggering:
@@ -595,8 +621,12 @@ workflows:
       groups:
         - nedb_secrets
     scripts:
+      - name: Fetch distro submodule
+        script: git submodule update --init --recursive distributions/nitroDB
+
       - name: Install Rust + Intel target
         script: |
+          cd distributions/nitroDB
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           source "$HOME/.cargo/env"
           rustup target add $RUST_TARGET
@@ -607,6 +637,7 @@ workflows:
 
       - name: Build nedbd-v2 binary (cross-compile x86_64)
         script: |
+          cd distributions/nitroDB
           set -euo pipefail
           source "$HOME/.cargo/env"
           # Cross-compile x86_64 from M2: configure the Xcode clang linker explicitly
@@ -625,6 +656,7 @@ workflows:
 
       - name: Stage Python source + verify binary
         script: |
+          cd distributions/nitroDB
           rm -rf rust/crates/nedb-py/python
           mkdir -p rust/crates/nedb-py/python
           cp -r python/nedb rust/crates/nedb-py/python/nedb
@@ -635,6 +667,7 @@ workflows:
 
       - name: Build wheel (maturin)
         script: |
+          cd distributions/nitroDB
           source "$HOME/.cargo/env"
           cd rust/crates/nedb-py
           maturin build --release --out ../../../dist --target $RUST_TARGET
@@ -643,12 +676,14 @@ workflows:
 
       - name: Publish to PyPI
         script: |
+          cd distributions/nitroDB
           TWINE_USERNAME=__token__ \
           TWINE_PASSWORD=$PYPI_API_TOKEN \
           twine upload --skip-existing --verbose dist/*.whl
 
       - name: Build napi addon (x86_64)
         script: |
+          cd distributions/nitroDB
           source "$HOME/.cargo/env"
           npm install
           npx napi build --platform --release --target $RUST_TARGET \
@@ -657,6 +692,7 @@ workflows:
 
       - name: Upload Mac x86_64 binaries to GitHub release
         script: |
+          cd distributions/nitroDB
           which gh || brew install gh
           # Hand gh a CLEAN token explicitly. Relying on implicit env pickup was
           # 401'ing: the same token authenticates fine via an explicit Bearer
