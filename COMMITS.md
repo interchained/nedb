@@ -1,8 +1,8 @@
 # NEDB — Commit & Release Log
 
-Living progress log for the NEDB engine, focused on the **v3 segment/pack object store** and the 2.3.x releases. The engine is the source of truth; downstream consumers (itcd) are tracked where they exercise engine capabilities.
+Living progress log for the NEDB engine and its published **distributions**. The engine is the source of truth; the distributions (`crypto-database`, `aof-db`) and downstream consumers (itcd) are tracked where they exercise engine capabilities.
 
-_Last updated: 2026-06-26 — release **v2.4.2** (nedbd-v2 CLI parsing + cinematic `npm test` smoke demo)._
+_Last updated: 2026-06-27 — release **v2.4.468** (3-distribution split live: nedb-engine + crypto-database + aof-db on one tag; one-command `scripts/release.py`; distro npm now bundles macOS addons)._
 
 ---
 
@@ -10,6 +10,9 @@ _Last updated: 2026-06-26 — release **v2.4.2** (nedbd-v2 CLI parsing + cinemat
 
 | Version | What shipped | Registries |
 |---|---|---|
+| **v2.4.468** | Distro **npm packages now bundle macOS native addons** — `release-distros` waits for Codemagic's `<distro>.darwin-arm64/-x64.node` and assembles them before `npm publish` (mirrors the flagship), so crypto-database/aof-db ship full **mac + linux + windows**. Adds the committed **`scripts/release.py "vFROM" "vTO"`** — a one-command, idempotent tri-distribution release tool. `nedb-engine` default realigns everywhere (2.4.468 > 2.4.444). | npm · PyPI · crates.io |
+| **v2.4.68** | First **fully-green 3-distribution release**: **nedb-engine** (flagship) + **crypto-database** (verifiable v2/v3 DAG) + **aof-db** (fast append-only) all ship on one tag across npm/PyPI/crates. Two fixes brought it green: the engine crate `rust/nedb-v2` was stranded at `2.4.3` while each wrapper required `^2.4.x` (broke the napi/cargo build) — every version line aligned; and the `release-distros` **startup_failure** caused by double-quoted `"refs/tags/"` in three `if:` conditions (GitHub Actions expressions require single quotes). | npm · PyPI · crates.io |
+| **v2.4.3** | **3-distribution split introduced.** Distros live in org forks (`crypto-datab/cryptoDB` → crypto-database, `nitro-db/aof-DB` → aof-db), submoduled under `distributions/`; the central `codemagic.yaml` builds all 6 macOS wheels and `release-distros.yml` publishes the distros — no workflows in the forks. Each distro carries a distinct README + napi/crate/PyPI identity. (Flagship shipped; distro naming + CI iterated to green at v2.4.68.) | PyPI · npm · crates.io (flagship) |
 | **v2.4.2** | Bugfix/polish on the complete cross-platform line. `nedbd-v2` gains **real CLI parsing** — `--dag-v3`, `--data`, `--fast-fsync`, `--help`, `--version` are recognized flags (were silently swallowed as the positional data dir, so `--dag-v3` never engaged v3). Ships a cinematic `npm test` smoke demo (`test/smoke.mjs`, now in `package.json` `files`) touring v1→v2 migration · v2 DAG · v3 segments · a causal rideshare audit. Docs/SPEC updated; 9 manifests 2.4.1 → 2.4.2. | PyPI · npm · crates.io |
 | **v2.4.1** | CI-fixup re-tag — first **complete** cross-platform publish (all native wheels incl. macOS + the universal wheel) since the Codemagic `GITHUB_TOKEN` fix. Skeleton version bump, no engine change; marked stable in README. | PyPI · npm · crates.io |
 | **v2.4.0** | Cycle-closing minor — the v3 storage line consolidated & formally spec'd (`docs/SPEC.md` §3: v2 object store + v3 segment substrate + durability/fast-fsync). No new engine code; packages bumped 2.3.3333 → 2.4.0. | PyPI · npm · crates.io |
@@ -21,18 +24,33 @@ _Last updated: 2026-06-26 — release **v2.4.2** (nedbd-v2 CLI parsing + cinemat
 
 ---
 
+## The three distributions
+
+All three are built from this one repo and ship the **same version** on every tag.
+
+| Product | Identity | npm | PyPI | crates.io | Fork (distro layer) |
+|---|---|---|---|---|---|
+| **nedb-engine** | flagship — the full engine | `nedb-engine` | `nedb-engine` | `nedb-engine` | _(this repo)_ |
+| **crypto-database** | verifiable v2/v3 — content-addressed Merkle DAG, AS OF / TRACE, BLAKE2b | `crypto-database` | `cryptodb` ¹ | `crypto-database` | `crypto-datab/cryptoDB` → `distributions/crypto-database` |
+| **aof-db** | fast/lightweight — append-only op-log, minimal footprint | `aof-db` | `aof-db` | `aof-db` | `nitro-db/aof-DB` → `distributions/aof-db` |
+
+¹ `crypto-database` is taken on PyPI by a third party, so the verifiable distro publishes its wheel as `cryptodb` (which we own). npm + crates.io use `crypto-database`.
+
+---
+
 ## NEDB engine — recent commits (newest first)
 
-| Commit | Summary |
+| Commit / PR | Summary |
 |---|---|
-| _this PR_ | fix(cli): real arg parsing in `nedbd-v2` — `--dag-v3`/`--data`/`--fast-fsync`/`--help`/`--version` (were swallowed as the data dir); test(smoke): cinematic `test/smoke.mjs` for `npm test`, shipped in `files` → tag `v2.4.2` |
+| nedb #27 | feat(ci): `distro-publish-npm` waits for Codemagic's `<distro>.darwin-*.node` and assembles full platform coverage before publish; add **`scripts/release.py`** (idempotent `vFROM`→`vTO`) → tag `v2.4.468` |
+| nedb #26 | release: align the engine crate + every manifest to one version (fix stranded `rust/nedb-v2` @ 2.4.3 vs wrapper `^2.4.x`), repoint submodules → tag `v2.4.68` |
+| nedb #25 | fix(ci): `release-distros` startup_failure — single-quote `'refs/tags/'` in three `if:` expressions (valid YAML, invalid workflow) |
+| nedb #24 | fix(ci): point codemagic distro builds at `distributions/crypto-database` + `distributions/aof-db` (post-rename) |
+| nedb #22 | feat(distros): submodule crypto-database + aof-db under `distributions/`; central `release-distros.yml` + 6-build `codemagic.yaml` → tag `v2.4.3` |
 | `d0f5e92` | perf(v3): opt-in macOS fast fsync (`NEDB_FAST_FSYNC`) — plain `fsync(2)` instead of `F_FULLFSYNC` (#16) |
 | `d49dcbe` | fix(engine): cargo-test green — Windows-safe id-index, durable `Drop`, idempotent write (#14) |
-| `4f91bee` | chore(release): bump engine + clients to 2.3.33; refresh README banner |
 | `2eaa0ab` | fix(index): filesystem-safe id-index filenames so link ids persist on Windows |
 | `5fa3794` | fix(engine): durable flush-on-close + idempotent re-write; fix nql test-harness temp-dir lifetime |
-| `2b09e97` | fix(test): v3 integration test + bench treated `verify()`'s `Vec<bad_hashes>` as a count |
-| `d1e55ff` | test(v3): segment benchmark example + Db-level integration tests |
 | `cfdd6c9` | feat(store): NEDB v3 Phase 2 (compaction/pruning) + Phase 3 (`.idx`); bump to 2.3.3 |
 | `3888267` | feat(store): NEDB v3 segment/pack ObjectStore behind `--dag-v3` (default off) |
 
@@ -40,21 +58,14 @@ _Last updated: 2026-06-26 — release **v2.4.2** (nedbd-v2 CLI parsing + cinemat
 
 ## v3 in the wild — itcd integration (downstream)
 
-itcd (Bitcoin Core 0.21 fork; NEDB replaces LevelDB for chainstate + block index via `nedb-ffi`) now runs on the v3 segment store via a new `-dagv3` flag.
+itcd (Bitcoin Core 0.21 fork; NEDB replaces LevelDB for chainstate + block index via `nedb-ffi`) runs on the v3 segment store via a `-dagv3` flag, with `-dagfastsync` for the macOS fast-fsync path. A warm boot ~500k blocks deep resumed the chainstate from NEDB in seconds and verified its canonical prefix against a peer (Proof-of-Prefix) before syncing forward.
 
 | Commit / PR | Summary |
 |---|---|
 | `52684625` (itcd #55) | feat(nedb): itcd `-dagv3` — v3 segment store via FFI |
-| `ea2c178` | nedb-ffi: pin `nedb-engine` @ `v2.3.33`; add `nedb_set_dag_v3()`; `dbwrapper_nedb.cpp` flips it before `nedb_open`; register `-dagv3` in `init.cpp` |
+| `ea2c178` | nedb-ffi: pin `nedb-engine`; add `nedb_set_dag_v3()`; `dbwrapper_nedb.cpp` flips it before `nedb_open`; register `-dagv3` in `init.cpp` |
 
-**Measured win** (real chainstate `FlushStateToDisk`, Windows node, `-dagv3`):
-
-| Flush | v3 segments | v2 loose |
-|---|---|---|
-| 2,002 coins / 275 kB | **1.93 s** | _minutes_ |
-| 2,549 coins / 366 kB | **1.71 s** | _minutes_ |
-
-Larger batch, less time — v3 cost is one `fsync` per batch, not per object. The old loose store's ~185 writes/s metadata ceiling is gone.
+**Measured win** (real chainstate `FlushStateToDisk`, `-dagv3`): 2,002 coins / 275 kB in **1.93 s**, 2,549 coins / 366 kB in **1.71 s** — one `fsync` per batch, not per object. The old loose store's ~185 writes/s metadata ceiling is gone.
 
 ---
 
@@ -62,8 +73,10 @@ Larger batch, less time — v3 cost is one `fsync` per batch, not per object. Th
 
 | Repo | PR | Title |
 |---|---|---|
-| nedb | #10–#13 | NEDB v3 Phases 1–3 (segment store, compaction/pruning, `.idx` sidecars) + benchmark/integration tests |
-| nedb | #14 | cargo-test green: Windows-safe id-index, durable `Drop`, idempotent write → tag `v2.3.33` |
-| nedb | #17–#19 | release line: docs/spec consolidation → `v2.4.0` (#17); Codemagic `GITHUB_TOKEN` CI fix (#18); skeleton re-tag marked stable → `v2.4.1` (#19) |
-| nedb | _this PR_ | fix(cli) + test(smoke): `nedbd-v2` flag parsing + cinematic `npm test` demo → tag `v2.4.2` |
+| nedb | #10–#14 | NEDB v3 Phases 1–3 (segment store, compaction/pruning, `.idx`) + cargo-test green → tag `v2.3.33` |
+| nedb | #17–#21 | release line: docs/spec → `v2.4.0`; Codemagic `GITHUB_TOKEN` CI fix; stable re-tag `v2.4.1`; `nedbd-v2` CLI + smoke demo → `v2.4.2`; smoke pre-publish gate |
+| nedb | #22 | 3-distribution split: submodule crypto-database + aof-db, central `release-distros.yml` + 6-build `codemagic.yaml` → tag `v2.4.3` |
+| nedb | #24–#27 | distro CI fixes (codemagic paths, `release-distros` startup_failure), full version alignment, distro-npm macOS mac-wait + `scripts/release.py` → tags `v2.4.68`, `v2.4.468` |
+| crypto-datab/cryptoDB | #1–#8 | distro layer + distinct README + version alignments (→ `crypto-database`) |
+| nitro-db/aof-DB | #1–#8 | distro layer + distinct README + version alignments (→ `aof-db`) |
 | itcd | #55 | feat(nedb): `-dagv3` — chainstate/block-index on the NEDB v3 segment store via FFI |
