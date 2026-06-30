@@ -733,12 +733,16 @@ async fn since_database(
         Some(db) => db,
     };
     let after = q.after_seq.unwrap_or(0);
-    let mut writes: Vec<Value> = db.since(after).iter()
+    let b = db.since(after, q.limit.unwrap_or(0));
+    let nodes: Vec<Value> = b.nodes.iter()
         .map(|n| serde_json::to_value(n).unwrap_or(Value::Null))
         .collect();
-    if let Some(lim) = q.limit { writes.truncate(lim); }
     let (seq, head) = db_seq_head(&db);
-    ok(json!({"after_seq": after, "count": writes.len(), "writes": writes, "seq": seq, "head": head}))
+    ok(json!({
+        "nodes": nodes, "count": nodes.len(),
+        "from_seq": b.from_seq, "to_seq": b.to_seq, "head_seq": b.head_seq, "has_more": b.has_more,
+        "seq": seq, "head": head
+    }))
 }
 
 // ── Live query subscriptions — POST /v1/databases/:name/subscribe ─────────────

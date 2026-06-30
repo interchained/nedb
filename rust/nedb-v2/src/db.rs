@@ -23,6 +23,30 @@ struct Manifest {
     head: String,
 }
 
+/// Default cap for `since()` when the caller passes `limit == 0`. Bounds the
+/// engine primitive itself so a stale/offline consumer can never force an
+/// unbounded materialization — the safety lives in the core, not the HTTP layer.
+pub const DEFAULT_SINCE_LIMIT: usize = 10_000;
+
+/// One page of the changefeed returned by `since()`. The replication contract:
+/// apply `nodes` in ascending seq order, advance your cursor to `to_seq`, and keep
+/// paging while `has_more` is true; then attach to the live `subscribe` edge.
+/// `head_seq` tells the consumer how far the log currently extends (how far behind
+/// it is).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SinceBatch {
+    /// Writes in (`from_seq`, `to_seq`], ascending by seq.
+    pub nodes:    Vec<Node>,
+    /// The exclusive cursor this page started from (echoes the request).
+    pub from_seq: u64,
+    /// Seq of the last node in this page — the consumer's next cursor.
+    pub to_seq:   u64,
+    /// Current head seq of the log (latest committed write).
+    pub head_seq: u64,
+    /// True when more writes remain past `to_seq` (the page hit `limit`).
+    pub has_more: bool,
+}
+
 pub struct Db {
     pub objects:        ObjectStore,
     pub id_index:       IdIndex,
@@ -539,26 +563,35 @@ impl Db {
         self.get_by_hash(&hash)
     }
 
-    /// Changefeed: every node written AFTER `after_seq`, in ascending seq order.
-    /// `after_seq` is EXCLUSIVE — pass the seq you last saw (e.g. the seq from a
-    /// prior `tip()`) to stream only what is new. The append-only log IS the
-    /// changefeed, so this is an O(k) walk over the new range with no scan of the
-    /// whole store. Bounded by seq_index coverage (current session + cold scan),
-    /// exactly like `get_hash_by_seq`; unresolved seqs are skipped rather than
-    /// faked. Pair with `tip()` as head + tail of the chain.
-    pub fn since(&self, after_seq: u64) -> Vec<Node> {
-        let next = self.seq.load(Ordering::SeqCst);
-        let mut out = Vec::new();
+    /// Changefeed page: up to `limit` nodes written AFTER `after_seq` (EXCLUSIVE),
+    /// ascending by seq, wrapped in a `SinceBatch` cursor envelope. `after_seq` is
+    /// the cursor you last applied (a prior `tip()` seq or `to_seq`). `limit` bounds
+    /// the page — `0` means DEFAULT_SINCE_LIMIT, so the engine primitive can never
+    /// materialize an unbounded batch even when embedders call it directly (the
+    /// safety is here, not only in the HTTP layer). Drain by paging while
+    /// `has_more`, advancing your cursor to `to_seq`, then hand off to the live
+    /// `subscribe` edge. The append-only log IS the changefeed, so this is an
+    /// O(page) walk; unresolved seqs (outside seq_index coverage — see
+    /// `scan_status()`) are skipped rather than faked.
+    pub fn since(&self, after_seq: u64, limit: usize) -> SinceBatch {
+        let next = self.seq.load(Ordering::SeqCst);          // head + 1
+        let head_seq = next.saturating_sub(1);
+        let cap = if limit == 0 { DEFAULT_SINCE_LIMIT } else { limit };
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut to_seq = after_seq;
+        let mut hit_limit = false;
         let mut s = after_seq.saturating_add(1);
         while s < next {
+            if nodes.len() >= cap { hit_limit = true; break; }
             if let Some(hash) = self.get_hash_by_seq(s) {
                 if let Some(node) = self.get_by_hash(&hash) {
-                    out.push(node);
+                    to_seq = node.seq;
+                    nodes.push(node);
                 }
             }
             s += 1;
         }
-        out
+        SinceBatch { nodes, from_seq: after_seq, to_seq, head_seq, has_more: hit_limit }
     }
 
     /// Add an explicit named relation edge between two documents.
@@ -798,7 +831,7 @@ mod tests_v2 {
         let db = Db::in_memory();
         // Empty db: no tip, empty changefeed.
         assert!(db.tip().is_none());
-        assert!(db.since(0).is_empty());
+        assert!(db.since(0, 0).nodes.is_empty());
 
         let a = db.put("item", "a", serde_json::json!({"x": 1}), vec![], None, None).unwrap();
         let b = db.put("item", "b", serde_json::json!({"x": 2}), vec![], None, None).unwrap();
@@ -809,13 +842,30 @@ mod tests_v2 {
         assert_eq!(t.id, "b");
         assert_eq!(t.hash, b.hash);
 
-        // since(after_seq) is an EXCLUSIVE cursor: everything written after it.
-        let after_a = db.since(a.seq);
-        assert_eq!(after_a.len(), 1);
-        assert_eq!(after_a[0].id, "b");
+        // since(after_seq, limit) — EXCLUSIVE cursor, bounded page + envelope.
+        let after_a = db.since(a.seq, 0);
+        assert_eq!(after_a.nodes.len(), 1);
+        assert_eq!(after_a.nodes[0].id, "b");
+        assert_eq!(after_a.from_seq, a.seq);
+        assert_eq!(after_a.to_seq, b.seq);
+        assert_eq!(after_a.head_seq, b.seq);
+        assert!(!after_a.has_more);
 
         // Nothing written after the tip.
-        assert!(db.since(b.seq).is_empty());
+        assert!(db.since(b.seq, 0).nodes.is_empty());
+
+        // `limit` bounds the page and sets has_more; resume from to_seq.
+        let c = db.put("item", "c", serde_json::json!({"x": 3}), vec![], None, None).unwrap();
+        let page = db.since(a.seq, 1);             // (a..] capped at 1 -> [b], more pending
+        assert_eq!(page.nodes.len(), 1);
+        assert_eq!(page.nodes[0].id, "b");
+        assert_eq!(page.to_seq, b.seq);
+        assert!(page.has_more);
+        let page2 = db.since(page.to_seq, 1);      // resume from b -> [c], done
+        assert_eq!(page2.nodes.len(), 1);
+        assert_eq!(page2.nodes[0].id, "c");
+        assert_eq!(page2.to_seq, c.seq);
+        assert!(!page2.has_more);
     }
 
     #[test]

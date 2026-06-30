@@ -214,11 +214,20 @@ impl NedbCore {
         self.inner.tip().as_ref().map(node_to_json_str)
     }
 
-    /// Changefeed: every write AFTER `after_seq` (exclusive), ascending, each as a
-    /// JSON string. Pass the seq you last saw to stream only new writes.
+    /// Changefeed page after `after_seq` (exclusive), up to `limit` nodes (0 = the
+    /// engine default cap), as a JSON envelope string:
+    /// `{nodes, from_seq, to_seq, head_seq, has_more}`. Page while `has_more`,
+    /// advancing your cursor to `to_seq`, then attach to the live subscribe edge.
     #[napi]
-    pub fn since(&self, after_seq: BigInt) -> Vec<String> {
+    pub fn since(&self, after_seq: BigInt, limit: i64) -> String {
         let (_, after, _) = after_seq.get_u64();
-        self.inner.since(after).iter().map(node_to_json_str).collect()
+        let b = self.inner.since(after, limit.max(0) as usize);
+        let nodes: Vec<Value> = b.nodes.iter()
+            .filter_map(|n| serde_json::from_str::<Value>(&node_to_json_str(n)).ok())
+            .collect();
+        serde_json::json!({
+            "nodes": nodes, "from_seq": b.from_seq, "to_seq": b.to_seq,
+            "head_seq": b.head_seq, "has_more": b.has_more
+        }).to_string()
     }
 }
