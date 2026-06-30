@@ -47,6 +47,26 @@ pub struct SinceBatch {
     pub has_more: bool,
 }
 
+/// Replication readiness snapshot. `scan_complete` is the correctness gate: until
+/// the cold-scan finishes rebuilding the seq index, an old cursor passed to
+/// `since()` can return a PARTIAL page and look (wrongly) like "caught up". A
+/// correctness-critical consumer MUST wait for `scan_complete == true` before
+/// trusting historical catch-up. `indexed_seq_min/max` report the currently
+/// resolvable seq range; `tip_seq` is the log head.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScanStatus {
+    /// Cold-scan finished — historical seqs fully resolvable; catch-up is safe.
+    pub scan_complete:   bool,
+    /// Head seq of the log (latest committed write).
+    pub tip_seq:         u64,
+    /// Lowest seq currently in the seq index (0 if empty).
+    pub indexed_seq_min: u64,
+    /// Highest seq currently in the seq index.
+    pub indexed_seq_max: u64,
+    /// Number of seqs currently resolvable via the index.
+    pub indexed_count:   usize,
+}
+
 pub struct Db {
     pub objects:        ObjectStore,
     pub id_index:       IdIndex,
@@ -592,6 +612,33 @@ impl Db {
             s += 1;
         }
         SinceBatch { nodes, from_seq: after_seq, to_seq, head_seq, has_more: hit_limit }
+    }
+
+    /// Replication readiness — see `ScanStatus`. `scan_complete` gates safe
+    /// historical catch-up: a consumer pulling an old cursor right after a cold
+    /// start must wait for it, or `since()` may hand back a partial page that looks
+    /// like "caught up". Computes the indexed range by scanning the in-memory seq
+    /// index (O(index)) — intended for periodic status polls, not the per-write
+    /// hot path.
+    pub fn scan_status(&self) -> ScanStatus {
+        let next = self.seq.load(Ordering::SeqCst);
+        let mut min = u64::MAX;
+        let mut max = 0u64;
+        let mut count = 0usize;
+        for kv in self.seq_index.iter() {
+            let s = *kv.key();
+            if s < min { min = s; }
+            if s > max { max = s; }
+            count += 1;
+        }
+        if count == 0 { min = 0; }
+        ScanStatus {
+            scan_complete:   self.startup_ready.load(Ordering::SeqCst),
+            tip_seq:         next.saturating_sub(1),
+            indexed_seq_min: min,
+            indexed_seq_max: max,
+            indexed_count:   count,
+        }
     }
 
     /// Add an explicit named relation edge between two documents.

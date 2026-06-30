@@ -745,6 +745,29 @@ async fn since_database(
     }))
 }
 
+// Replication readiness — GET /v1/databases/:name/status. scan_complete is the
+// hard gate for correctness-critical catch-up (see Db::scan_status).
+async fn status_database(
+    State(mgr): State<Manager>,
+    headers: HeaderMap,
+    AxPath(name): AxPath<String>,
+) -> Response {
+    if !mgr.check_auth(&headers) { return err(StatusCode::UNAUTHORIZED, "unauthorized"); }
+    let db = match mgr.get_db(&name).await {
+        None => return err(StatusCode::NOT_FOUND, &format!("database not found: {}", name)),
+        Some(db) => db,
+    };
+    let s = db.scan_status();
+    ok(json!({
+        "ok": true,
+        "scan_complete":   s.scan_complete,
+        "tip_seq":         s.tip_seq,
+        "indexed_seq_min": s.indexed_seq_min,
+        "indexed_seq_max": s.indexed_seq_max,
+        "indexed_count":   s.indexed_count
+    }))
+}
+
 // ── Live query subscriptions — POST /v1/databases/:name/subscribe ─────────────
 
 #[derive(Deserialize)]
@@ -840,6 +863,7 @@ pub fn router(mgr: Manager) -> Router {
         .route("/v1/databases/:name/log",                        get(get_log))
         .route("/v1/databases/:name/tip",                        get(tip_database))
         .route("/v1/databases/:name/since",                      get(since_database))
+        .route("/v1/databases/:name/status",                     get(status_database))
         .route("/v1/databases/:name/subscribe",                  post(subscribe_query))
         .route("/v1/databases/:name/subscribe/:sub_id",          delete(unsubscribe_query))
         .with_state(mgr)

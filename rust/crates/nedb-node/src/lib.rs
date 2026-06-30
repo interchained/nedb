@@ -230,4 +230,17 @@ impl NedbCore {
             "head_seq": b.head_seq, "has_more": b.has_more
         }).to_string()
     }
+
+    /// Replication readiness as a JSON string: `{scan_complete, tip_seq,
+    /// indexed_seq_min, indexed_seq_max, indexed_count}`. Wait for
+    /// `scan_complete == true` before trusting historical `since()` catch-up.
+    #[napi]
+    pub fn scan_status(&self) -> String {
+        let s = self.inner.scan_status();
+        serde_json::json!({
+            "scan_complete": s.scan_complete, "tip_seq": s.tip_seq,
+            "indexed_seq_min": s.indexed_seq_min, "indexed_seq_max": s.indexed_seq_max,
+            "indexed_count": s.indexed_count
+        }).to_string()
+    }
 }
