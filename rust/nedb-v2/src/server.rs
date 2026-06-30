@@ -698,6 +698,49 @@ async fn get_log(
     ok(json!({"log": log_entries, "seq": seq, "head": head}))
 }
 
+// ── tip / since — GET /v1/databases/:name/{tip,since} ─────────────────────────
+// tip()   = the most recent write (head of the log), O(1).
+// since() = the changefeed: every write after ?after_seq (exclusive), ascending.
+// Both return full nodes (Node: Serialize), alongside the current seq + head.
+
+async fn tip_database(
+    State(mgr): State<Manager>,
+    headers: HeaderMap,
+    AxPath(name): AxPath<String>,
+) -> Response {
+    if !mgr.check_auth(&headers) { return err(StatusCode::UNAUTHORIZED, "unauthorized"); }
+    let db = match mgr.get_db(&name).await {
+        None => return err(StatusCode::NOT_FOUND, &format!("database not found: {}", name)),
+        Some(db) => db,
+    };
+    let (seq, head) = db_seq_head(&db);
+    let tip = db.tip().map(|n| serde_json::to_value(&n).unwrap_or(Value::Null));
+    ok(json!({"tip": tip, "seq": seq, "head": head}))
+}
+
+#[derive(Deserialize)]
+struct SinceQuery { after_seq: Option<u64>, limit: Option<usize> }
+
+async fn since_database(
+    State(mgr): State<Manager>,
+    headers: HeaderMap,
+    AxPath(name): AxPath<String>,
+    AxQuery(q): AxQuery<SinceQuery>,
+) -> Response {
+    if !mgr.check_auth(&headers) { return err(StatusCode::UNAUTHORIZED, "unauthorized"); }
+    let db = match mgr.get_db(&name).await {
+        None => return err(StatusCode::NOT_FOUND, &format!("database not found: {}", name)),
+        Some(db) => db,
+    };
+    let after = q.after_seq.unwrap_or(0);
+    let mut writes: Vec<Value> = db.since(after).iter()
+        .map(|n| serde_json::to_value(n).unwrap_or(Value::Null))
+        .collect();
+    if let Some(lim) = q.limit { writes.truncate(lim); }
+    let (seq, head) = db_seq_head(&db);
+    ok(json!({"after_seq": after, "count": writes.len(), "writes": writes, "seq": seq, "head": head}))
+}
+
 // ── Live query subscriptions — POST /v1/databases/:name/subscribe ─────────────
 
 #[derive(Deserialize)]
@@ -791,6 +834,8 @@ pub fn router(mgr: Manager) -> Router {
         .route("/v1/databases/:name/verify",                     get(verify_database))
         .route("/v1/databases/:name/checkpoint",                 post(checkpoint))
         .route("/v1/databases/:name/log",                        get(get_log))
+        .route("/v1/databases/:name/tip",                        get(tip_database))
+        .route("/v1/databases/:name/since",                      get(since_database))
         .route("/v1/databases/:name/subscribe",                  post(subscribe_query))
         .route("/v1/databases/:name/subscribe/:sub_id",          delete(unsubscribe_query))
         .with_state(mgr)

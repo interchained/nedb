@@ -157,6 +157,21 @@ impl NedbCore {
     }
 
     fn flush(&self) { self.inner.flush_all(); }
+
+    // ── tip / changefeed ─────────────────────────────────────────────────────────
+
+    /// The tip — the most recent write (latest node) as a JSON string, or None if
+    /// the database is empty. The cheap "give me the latest write" primitive.
+    fn tip(&self) -> Option<String> {
+        self.inner.tip().as_ref().map(node_to_json_str)
+    }
+
+    /// Changefeed: every write AFTER `after_seq` (exclusive), in ascending seq
+    /// order, each as a JSON string. Pass the seq you last saw to stream only new
+    /// writes — the append-only log IS the changefeed.
+    fn since(&self, after_seq: u64) -> Vec<String> {
+        self.inner.since(after_seq).iter().map(node_to_json_str).collect()
+    }
 }
 
 /// Flush index WAL and MANIFEST when the Python object is freed.

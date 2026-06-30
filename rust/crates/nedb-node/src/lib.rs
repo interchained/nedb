@@ -206,4 +206,19 @@ impl NedbCore {
     /// Flush WAL and MANIFEST — v2 equivalent of v1 flush().
     #[napi]
     pub fn flush(&self) { self.inner.flush_all(); }
+
+    /// The tip — the most recent write (latest node) as a JSON string, or null if
+    /// the database is empty. The cheap "give me the latest write" primitive.
+    #[napi]
+    pub fn tip(&self) -> Option<String> {
+        self.inner.tip().as_ref().map(node_to_json_str)
+    }
+
+    /// Changefeed: every write AFTER `after_seq` (exclusive), ascending, each as a
+    /// JSON string. Pass the seq you last saw to stream only new writes.
+    #[napi]
+    pub fn since(&self, after_seq: BigInt) -> Vec<String> {
+        let (_, after, _) = after_seq.get_u64();
+        self.inner.since(after).iter().map(node_to_json_str).collect()
+    }
 }

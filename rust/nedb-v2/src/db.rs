@@ -523,6 +523,44 @@ impl Db {
         self.seq_index.get(&seq).map(|r| r.clone())
     }
 
+    /// The tip — the most recently written node (highest seq), or `None` if the
+    /// database is empty. O(1): `self.seq` is the next-to-assign counter, so the
+    /// latest write sits at `seq - 1`; we resolve it through the same
+    /// seq_index → object-store path a normal read uses, so the returned Node is
+    /// byte-identical to one fetched by id or hash (it carries its own seq, hash,
+    /// causal links, and valid-time). This is the cheap "give me the latest write"
+    /// primitive — the head of the log, not an aggregate.
+    pub fn tip(&self) -> Option<Node> {
+        let next = self.seq.load(Ordering::SeqCst);
+        if next == 0 {
+            return None; // nothing written yet
+        }
+        let hash = self.get_hash_by_seq(next - 1)?;
+        self.get_by_hash(&hash)
+    }
+
+    /// Changefeed: every node written AFTER `after_seq`, in ascending seq order.
+    /// `after_seq` is EXCLUSIVE — pass the seq you last saw (e.g. the seq from a
+    /// prior `tip()`) to stream only what is new. The append-only log IS the
+    /// changefeed, so this is an O(k) walk over the new range with no scan of the
+    /// whole store. Bounded by seq_index coverage (current session + cold scan),
+    /// exactly like `get_hash_by_seq`; unresolved seqs are skipped rather than
+    /// faked. Pair with `tip()` as head + tail of the chain.
+    pub fn since(&self, after_seq: u64) -> Vec<Node> {
+        let next = self.seq.load(Ordering::SeqCst);
+        let mut out = Vec::new();
+        let mut s = after_seq.saturating_add(1);
+        while s < next {
+            if let Some(hash) = self.get_hash_by_seq(s) {
+                if let Some(node) = self.get_by_hash(&hash) {
+                    out.push(node);
+                }
+            }
+            s += 1;
+        }
+        out
+    }
+
     /// Add an explicit named relation edge between two documents.
     /// Add an explicit named relation between two "coll:id" nodes.
     /// Relations stored as __links__ documents — NQL-queryable, time-travelable,
@@ -753,6 +791,31 @@ mod tests_v2 {
         assert_eq!(db.get_hash_by_seq(a.seq), Some(a.hash.clone()));
         assert_eq!(db.get_hash_by_seq(b.seq), Some(b.hash.clone()));
         assert_eq!(db.get_hash_by_seq(9999), None);
+    }
+
+    #[test]
+    fn tip_and_since() {
+        let db = Db::in_memory();
+        // Empty db: no tip, empty changefeed.
+        assert!(db.tip().is_none());
+        assert!(db.since(0).is_empty());
+
+        let a = db.put("item", "a", serde_json::json!({"x": 1}), vec![], None, None).unwrap();
+        let b = db.put("item", "b", serde_json::json!({"x": 2}), vec![], None, None).unwrap();
+
+        // tip() = the most recent write (highest seq), returned as a full node.
+        let t = db.tip().expect("tip after writes");
+        assert_eq!(t.seq, b.seq);
+        assert_eq!(t.id, "b");
+        assert_eq!(t.hash, b.hash);
+
+        // since(after_seq) is an EXCLUSIVE cursor: everything written after it.
+        let after_a = db.since(a.seq);
+        assert_eq!(after_a.len(), 1);
+        assert_eq!(after_a[0].id, "b");
+
+        // Nothing written after the tip.
+        assert!(db.since(b.seq).is_empty());
     }
 
     #[test]

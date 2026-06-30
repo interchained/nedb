@@ -781,3 +781,28 @@ class NEDB:
     @property
     def seq(self) -> int:
         return len(self.log) - 1
+
+    def tip(self, coll: Optional[str] = None) -> Optional[dict]:
+        """The tip — the most recent write (head of the log) as a dict, or None if
+        nothing has been written yet. With ``coll``, the latest write into that
+        collection. Returned exactly as sealed in the chain (seq, hash, ts, op,
+        payload, plus any causal + valid-time fields). O(1) for the global tip.
+
+        Reference-engine parity of the Rust v2 core's Db::tip()."""
+        ops = self.log.ops
+        if not ops:
+            return None
+        if coll is None:
+            return ops[-1].to_dict()
+        for rec in reversed(ops):
+            if rec.payload.get("coll") == coll:
+                return rec.to_dict()
+        return None
+
+    def since(self, after_seq: int) -> List[dict]:
+        """Changefeed: every op written AFTER ``after_seq`` (exclusive), in
+        ascending seq order. Pass the seq you last saw (e.g. tip()["seq"]) to
+        stream only new writes — the append-only log IS the changefeed.
+
+        Reference-engine parity of the Rust v2 core's Db::since()."""
+        return [op.to_dict() for op in self.log.ops if op.seq > after_seq]
