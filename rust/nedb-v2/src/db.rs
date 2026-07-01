@@ -792,6 +792,7 @@ fn cold_scan_background_arc(db: Arc<Db>) {
     let head           = &db.head;
     let seq_atomic     = &db.seq;
     let sorted_indexes = &db.sorted_indexes;
+    let seq_index      = &db.seq_index;
     let root           = db.root.clone();
     let ready_flag     = Arc::clone(&db.startup_ready);
 
@@ -807,6 +808,15 @@ fn cold_scan_background_arc(db: Arc<Db>) {
     let t0 = std::time::Instant::now();
     let step = (total / 10).max(1000);
 
+    // Populate the seq index AS objects are read here, not in a second pass
+    // afterward: this loop is the slow, disk-I/O-bound phase (verifying and
+    // parsing every object), and it can run for minutes on a multi-million
+    // object store. `scan_status().indexed_count` reads `seq_index`'s size, so
+    // inserting here — not after `.collect()` — is what makes that a real, live
+    // progress signal through the phase that actually takes the time, instead
+    // of reporting a flat 0 until this whole pass finishes. Safe: DashMap
+    // supports concurrent inserts, and every parallel worker here inserts a
+    // disjoint key (each object has its own seq).
     let nodes: Vec<Node> = hashes.par_iter()
         .enumerate()
         .filter_map(|(i, h)| {
@@ -818,7 +828,9 @@ fn cold_scan_background_arc(db: Arc<Db>) {
                 eprint!("\r  [nedbd]   {:>3}%  {:>8} / {:>8}  ({:>8.0}/s  eta {:.0}s)   ",
                     pct, i, total, rate, eta);
             }
-            objects.read(h).ok()
+            let node = objects.read(h).ok()?;
+            seq_index.insert(node.seq, node.hash.clone());
+            Some(node)
         })
         .collect();
 
@@ -835,7 +847,7 @@ fn cold_scan_background_arc(db: Arc<Db>) {
     let mut coll_max: std::collections::HashMap<String, (u64, String)> = std::collections::HashMap::new();
 
     for node in &nodes {
-        db.seq_index.insert(node.seq, node.hash.clone());
+        // seq_index was already populated above, during the read pass.
         coll_max.entry(node.coll.clone())
             .and_modify(|(s, h)| if node.seq > *s { *s = node.seq; *h = node.hash.clone(); })
             .or_insert_with(|| (node.seq, node.hash.clone()));
@@ -1158,5 +1170,49 @@ mod tests_v2 {
         let tx_tip = db2.tip_collection("tx").expect("tx tip must also survive");
         assert_eq!(tx_tip.id, "t1");
         assert!(db2.tip_collection("absent").is_none());
+    }
+
+    #[test]
+    fn cold_scan_indexes_every_object_and_reports_completion() {
+        // Regression guard for the cold-scan refactor: seq_index is now populated
+        // DURING the parallel read pass (for live scan_status().indexed_count
+        // progress — see cold_scan_background_arc), not in a second pass
+        // afterward. This asserts the end state is unchanged: every written
+        // object is indexed, tip()/tip_collection() are correct, and
+        // scan_complete eventually reports true.
+        let dir = tempdir().unwrap();
+        let n = 25u64;
+        {
+            let db = Db::open(dir.path(), None).unwrap();
+            for i in 0..n {
+                db.put("things", &i.to_string(), serde_json::json!({"i": i}), vec![], None, None).unwrap();
+            }
+            db.flush_all();
+        }
+        // Force a COLD start regardless of the MANIFEST nedb-v2 itself would
+        // have written: delete it so startup_rebuild() takes the cold path and
+        // start_cold_scan() actually spawns the background scan this test needs
+        // to exercise.
+        std::fs::remove_file(dir.path().join("MANIFEST")).unwrap();
+
+        let db = Db::open(dir.path(), None).unwrap();
+        assert!(!db.scan_status().scan_complete, "should be cold immediately after open");
+        let db = std::sync::Arc::new(db);
+        Db::start_cold_scan(std::sync::Arc::clone(&db));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !db.scan_status().scan_complete {
+            assert!(std::time::Instant::now() < deadline, "cold scan did not complete in time");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let status = db.scan_status();
+        assert_eq!(status.indexed_count, n as usize, "every written object must be indexed");
+        assert!(status.scan_complete);
+
+        let tip = db.tip().expect("tip resolves after cold scan");
+        assert_eq!(tip.data.get("i").and_then(|v| v.as_u64()), Some(n - 1));
+        let coll_tip = db.tip_collection("things").expect("tip_collection resolves after cold scan");
+        assert_eq!(coll_tip.id, tip.id);
     }
 }
