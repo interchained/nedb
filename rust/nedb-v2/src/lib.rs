@@ -20,6 +20,7 @@ pub mod index;
 pub mod graph;
 pub mod migrate;
 pub mod db;
+pub mod exit;
 pub mod nql;
 pub mod server;
 
