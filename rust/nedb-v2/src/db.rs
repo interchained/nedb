@@ -21,6 +21,18 @@ use crate::migrate;
 struct Manifest {
     seq:  u64,
     head: String,
+    /// Object hash of the highest-seq node at flush time. Lets `tip()` resolve the
+    /// last write O(1) on a warm boot — before any scan repopulates the in-memory
+    /// seq index. `#[serde(default)]` so pre-2.5.43 MANIFESTs (no field) still parse.
+    #[serde(default)]
+    tip_hash: String,
+    /// Per-collection tip: `coll -> object hash of the highest-seq node in that
+    /// collection`. Lets `tip_collection()` resolve O(1) on a warm boot, same
+    /// contract as `tip_hash` for the global head. `#[serde(default)]` so
+    /// pre-this-field MANIFESTs still parse (empty map — self-heals on next write
+    /// or cold scan).
+    #[serde(default)]
+    coll_tips: std::collections::HashMap<String, String>,
 }
 
 /// Default cap for `since()` when the caller passes `limit == 0`. Bounds the
@@ -80,6 +92,15 @@ pub struct Db {
     pub seq:            AtomicU64,
     /// Cached Merkle head — updated incrementally on every write (O(1)).
     head:               RwLock<String>,
+    /// Object hash of the most recent write (highest seq). Mirrors `head` but holds
+    /// the tip's content hash, so `tip()` can resolve the last node O(1) on a warm
+    /// boot when the in-memory `seq_index` is still cold. Persisted in MANIFEST.
+    tip_hash:           RwLock<String>,
+    /// Per-collection tip: `coll -> object hash of the highest-seq node in that
+    /// collection`. Kept current on every write (`update_head`), restored from
+    /// MANIFEST on warm boot, rebuilt by the cold scan — so `tip_collection()` is
+    /// O(1) and durable across restarts in every startup regime, by construction.
+    coll_tip_hash:      Arc<DashMap<String, String>>,
     /// True once startup is fully ready (MANIFEST loaded or cold scan complete).
     /// Warm starts set this true before returning from open().
     /// Cold starts set this true in the background thread when scan completes.
@@ -104,6 +125,8 @@ impl Db {
             root:           std::path::PathBuf::from(":memory:"),
             seq:            AtomicU64::new(0),
             head:           RwLock::new(String::new()),
+            tip_hash:       RwLock::new(String::new()),
+            coll_tip_hash:  Arc::new(DashMap::new()),
             startup_ready:  Arc::new(AtomicBool::new(true)),  // always ready
             manifest_dirty: Arc::new(AtomicBool::new(false)),
             seq_index:      Arc::new(DashMap::new()),
@@ -127,6 +150,8 @@ impl Db {
             root: db_root.to_path_buf(),
             seq:  AtomicU64::new(0),
             head: RwLock::new(String::new()),
+            tip_hash: RwLock::new(String::new()),
+            coll_tip_hash: Arc::new(DashMap::new()),
             startup_ready:  Arc::new(AtomicBool::new(false)),
             manifest_dirty: Arc::new(AtomicBool::new(false)),
             seq_index:      Arc::new(DashMap::new()),
@@ -167,11 +192,21 @@ impl Db {
                 // Fall through to cold scan so the head is rebuilt correctly from objects.
                 if m.head.len() < 8 {
                     eprintln!("  [nedbd] MANIFEST head invalid (len={}), self-healing via cold scan", m.head.len());
+                } else if m.tip_hash.is_empty() {
+                    // Pre-2.5.43 MANIFEST (no persisted tip). Cold-scan once to rebuild
+                    // the seq index and rewrite MANIFEST with tip_hash — warm + tip()-
+                    // durable on every boot thereafter.
+                    eprintln!("  [nedbd] MANIFEST predates durable tip() — cold scan once to upgrade");
                 } else {
                     self.seq.store(m.seq, Ordering::SeqCst); // m.seq is already the next-to-assign counter
                     *self.head.write() = m.head.clone();
+                    *self.tip_hash.write() = m.tip_hash.clone();
+                    for (coll, hash) in &m.coll_tips {
+                        self.coll_tip_hash.insert(coll.clone(), hash.clone());
+                    }
                     self.startup_ready.store(true, Ordering::SeqCst);
-                    println!("  [nedbd] warm start — seq={} head={}...", m.seq, &m.head[..8]);
+                    println!("  [nedbd] warm start — seq={} head={}... tip={}...",
+                        m.seq, &m.head[..8], &m.tip_hash[..8.min(m.tip_hash.len())]);
                     return Ok(());
                 }
             } else {
@@ -269,7 +304,7 @@ impl Db {
 
         // Update running Merkle head: O(1) chain, no full recompute.
         // new_head = BLAKE2b(prev_head || seq_bytes || new_object_hash)
-        self.update_head(seq, &hash);
+        self.update_head(coll, seq, &hash);
 
         Ok(node)
     }
@@ -333,7 +368,7 @@ impl Db {
 
         // Single Merkle head update for the whole batch (chain all hashes)
         for node in &nodes {
-            self.update_head(node.seq, &node.hash);
+            self.update_head(&node.coll, node.seq, &node.hash);
         }
 
         Ok(nodes)
@@ -342,7 +377,7 @@ impl Db {
     /// Update the running Merkle head with a new write. O(1), lock-free on the flush path.
     /// Sets dirty flag — the background ticker calls flush_manifest periodically.
     /// This removes 2× file I/O ops from the hot write path, unblocking concurrent writes.
-    fn update_head(&self, seq: u64, new_hash: &str) {
+    fn update_head(&self, coll: &str, seq: u64, new_hash: &str) {
         use blake2::{Blake2b512, Digest};
         let prev = self.head.read().clone();
         let mut h = Blake2b512::new();
@@ -350,6 +385,14 @@ impl Db {
         h.update(seq.to_le_bytes());
         h.update(new_hash.as_bytes());
         *self.head.write() = hex::encode(&h.finalize()[..32]);
+        // Track the tip's object hash. update_head arrives in ascending seq order
+        // (put in seq order; put_batch loops the batch in order), so the last call
+        // wins → the highest-seq node's hash. Persisted in MANIFEST for warm-boot tip().
+        *self.tip_hash.write() = new_hash.to_string();
+        // Same contract, per-collection: last call for this coll wins → that
+        // collection's highest-seq hash. Persisted in MANIFEST for warm-boot
+        // tip_collection().
+        self.coll_tip_hash.insert(coll.to_string(), new_hash.to_string());
         // Mark dirty — background ticker will flush to MANIFEST (no I/O on write path)
         self.manifest_dirty.store(true, Ordering::Release);
     }
@@ -401,7 +444,12 @@ impl Db {
         if self.root == std::path::PathBuf::from(":memory:") { return; }
         let seq  = self.seq.load(Ordering::SeqCst);
         let head = self.head.read().clone();
-        let m = Manifest { seq, head };
+        let tip_hash = self.tip_hash.read().clone();
+        let coll_tips: std::collections::HashMap<String, String> = self.coll_tip_hash
+            .iter()
+            .map(|kv| (kv.key().clone(), kv.value().clone()))
+            .collect();
+        let m = Manifest { seq, head, tip_hash, coll_tips };
         if let Ok(json) = serde_json::to_string(&m) {
             let path = self.root.join("MANIFEST");
             let tmp  = self.root.join("MANIFEST.tmp");
@@ -452,7 +500,7 @@ impl Db {
             hash:       String::new(),
         };
         let hash = self.objects.write(&mut tombstone)?;
-        self.update_head(seq, &hash);
+        self.update_head(coll, seq, &hash);
         // Remove the live id pointer — doc is now invisible to queries and list()
         self.id_index.remove(coll, id)?;
         Ok(true)
@@ -579,32 +627,34 @@ impl Db {
         if next == 0 {
             return None; // nothing written yet
         }
-        let hash = self.get_hash_by_seq(next - 1)?;
-        self.get_by_hash(&hash)
+        // Fast path: resolve the head seq through the in-memory seq index
+        // (populated by this session's writes or by the cold scan).
+        if let Some(hash) = self.get_hash_by_seq(next - 1) {
+            return self.get_by_hash(&hash);
+        }
+        // Warm-boot fallback: the seq index is still cold (warm start skips the
+        // scan), but the tip's object hash was persisted in MANIFEST and restored
+        // on open. O(1), no scan — this is what makes tip() survive a restart.
+        let th = self.tip_hash.read().clone();
+        if !th.is_empty() {
+            return self.get_by_hash(&th);
+        }
+        None
     }
 
     /// The collection-local tip — the most recent write into `coll` (highest seq in
-    /// that collection), or `None` if the collection has no writes. Scans the seq
-    /// index backward from the head until a node in `coll` is found, resolving
-    /// through the same seq_index → object-store path as a normal read; bounded by
-    /// how recently `coll` was written. Conceptually a different index than the
-    /// global `tip()` (global head vs collection head), kept as a separate method
-    /// so each is explicit — parity with the Python reference's `tip(coll)`. Lets a
-    /// consumer resume one chain (e.g. blocks / tx / utxo) without pulling global
-    /// tip and filtering.
+    /// that collection), or `None` if the collection has no writes. O(1): resolves
+    /// through `coll_tip_hash`, a dedicated per-collection map kept current on every
+    /// write (`update_head`), restored from MANIFEST on warm boot, and rebuilt by the
+    /// cold scan — durable across restarts by construction, same contract as `tip()`
+    /// for the global head. Conceptually a different index than the global `tip()`
+    /// (global head vs collection head), kept as a separate method so each is
+    /// explicit — parity with the Python reference's `tip(coll)`. Lets a consumer
+    /// resume one chain (e.g. blocks / tx / utxo) without pulling global tip and
+    /// filtering.
     pub fn tip_collection(&self, coll: &str) -> Option<Node> {
-        let mut s = self.seq.load(Ordering::SeqCst); // exclusive upper bound (head + 1)
-        while s > 0 {
-            s -= 1;
-            if let Some(hash) = self.get_hash_by_seq(s) {
-                if let Some(node) = self.get_by_hash(&hash) {
-                    if node.coll.as_str() == coll {
-                        return Some(node);
-                    }
-                }
-            }
-        }
-        None
+        let hash = self.coll_tip_hash.get(coll)?.clone();
+        self.get_by_hash(&hash)
     }
 
     /// Changefeed page: up to `limit` nodes written AFTER `after_seq` (EXCLUSIVE),
@@ -742,6 +792,7 @@ fn cold_scan_background_arc(db: Arc<Db>) {
     let head           = &db.head;
     let seq_atomic     = &db.seq;
     let sorted_indexes = &db.sorted_indexes;
+    let seq_index      = &db.seq_index;
     let root           = db.root.clone();
     let ready_flag     = Arc::clone(&db.startup_ready);
 
@@ -757,6 +808,15 @@ fn cold_scan_background_arc(db: Arc<Db>) {
     let t0 = std::time::Instant::now();
     let step = (total / 10).max(1000);
 
+    // Populate the seq index AS objects are read here, not in a second pass
+    // afterward: this loop is the slow, disk-I/O-bound phase (verifying and
+    // parsing every object), and it can run for minutes on a multi-million
+    // object store. `scan_status().indexed_count` reads `seq_index`'s size, so
+    // inserting here — not after `.collect()` — is what makes that a real, live
+    // progress signal through the phase that actually takes the time, instead
+    // of reporting a flat 0 until this whole pass finishes. Safe: DashMap
+    // supports concurrent inserts, and every parallel worker here inserts a
+    // disjoint key (each object has its own seq).
     let nodes: Vec<Node> = hashes.par_iter()
         .enumerate()
         .filter_map(|(i, h)| {
@@ -768,7 +828,9 @@ fn cold_scan_background_arc(db: Arc<Db>) {
                 eprint!("\r  [nedbd]   {:>3}%  {:>8} / {:>8}  ({:>8.0}/s  eta {:.0}s)   ",
                     pct, i, total, rate, eta);
             }
-            objects.read(h).ok()
+            let node = objects.read(h).ok()?;
+            seq_index.insert(node.seq, node.hash.clone());
+            Some(node)
         })
         .collect();
 
@@ -778,8 +840,17 @@ fn cold_scan_background_arc(db: Arc<Db>) {
     let max_seq = nodes.iter().map(|n| n.seq).max().unwrap_or(0);
     seq_atomic.store(max_seq + 1, Ordering::SeqCst);
 
+    // Per-collection tip: highest-seq node's hash, per coll. `nodes` is NOT
+    // seq-ordered here (it comes from an unordered object-hash scan), so this
+    // must track the max explicitly — unlike the live write path's "last call
+    // wins" (which relies on ascending call order that a scan doesn't have).
+    let mut coll_max: std::collections::HashMap<String, (u64, String)> = std::collections::HashMap::new();
+
     for node in &nodes {
-        db.seq_index.insert(node.seq, node.hash.clone());
+        // seq_index was already populated above, during the read pass.
+        coll_max.entry(node.coll.clone())
+            .and_modify(|(s, h)| if node.seq > *s { *s = node.seq; *h = node.hash.clone(); })
+            .or_insert_with(|| (node.seq, node.hash.clone()));
         if let Value::Object(ref obj) = node.data {
             for (field, value) in obj {
                 if sorted_indexes.has(&node.coll, field) {
@@ -788,6 +859,13 @@ fn cold_scan_background_arc(db: Arc<Db>) {
             }
         }
     }
+
+    let coll_tips: std::collections::HashMap<String, String> = coll_max.into_iter()
+        .map(|(coll, (_seq, hash))| {
+            db.coll_tip_hash.insert(coll.clone(), hash.clone());
+            (coll, hash)
+        })
+        .collect();
 
     // Compute Merkle head from sorted hashes
     let mut sorted_hashes = hashes;
@@ -800,8 +878,16 @@ fn cold_scan_background_arc(db: Arc<Db>) {
     let new_head = hex::encode(&h.finalize()[..32]);
     *head.write() = new_head.clone();
 
+    // Tip = the highest-seq object we indexed. Persist its hash so tip() resolves
+    // O(1) on the next warm boot, before any scan repopulates the seq index.
+    let tip_hash = db.seq_index.iter()
+        .max_by_key(|kv| *kv.key())
+        .map(|kv| kv.value().clone())
+        .unwrap_or_default();
+    *db.tip_hash.write() = tip_hash.clone();
+
     // Write MANIFEST atomically
-    let m     = Manifest { seq: max_seq, head: new_head };
+    let m     = Manifest { seq: max_seq, head: new_head, tip_hash, coll_tips };
     let json  = serde_json::to_string(&m).unwrap_or_default();
     let path  = root.join("MANIFEST");
     let tmp   = root.join("MANIFEST.tmp");
@@ -1037,5 +1123,96 @@ mod tests_v2 {
         let trips = db2.neighbors("driver:d1", "handles");
         assert_eq!(trips.len(), 1);
         assert_eq!(trips[0].id, "t1");
+    }
+
+    #[test]
+    fn tip_survives_warm_restart() {
+        // v2.5.43: tip() returns the last written object AND survives a warm restart.
+        // On reopen the seq_index is cold (warm start skips the scan), so tip() must
+        // resolve the last write via the MANIFEST tip_hash fallback — no scan.
+        let dir = tempdir().unwrap();
+        {
+            let db = Db::open(dir.path(), None).unwrap();
+            db.put("blocks", "b1", serde_json::json!({"h": 1}), vec![], None, None).unwrap();
+            db.put("blocks", "b2", serde_json::json!({"h": 2}), vec![], None, None).unwrap();
+            db.flush_all(); // persists MANIFEST incl. tip_hash
+            assert_eq!(db.tip().expect("tip in-session").id, "b2");
+        }
+        // Warm reopen: MANIFEST present -> no cold scan -> seq_index cold.
+        let db2 = Db::open(dir.path(), None).unwrap();
+        assert!(db2.get_hash_by_seq(1).is_none(), "seq_index is cold on a warm boot");
+        let tip = db2.tip().expect("tip() must survive a warm restart");
+        assert_eq!(tip.id, "b2");
+        assert_eq!(tip.data.get("h").and_then(|v| v.as_i64()), Some(2));
+    }
+
+    #[test]
+    fn tip_collection_survives_warm_restart() {
+        // Same contract as tip(), per collection: itc-node-rs resumes headers /
+        // blocks / l2_receipts independently, so each must be its own durable
+        // resume point — not just the global tip.
+        let dir = tempdir().unwrap();
+        {
+            let db = Db::open(dir.path(), None).unwrap();
+            db.put("blocks", "b1", serde_json::json!({"h": 1}), vec![], None, None).unwrap();
+            db.put("tx",     "t1", serde_json::json!({"v": 1}), vec![], None, None).unwrap();
+            let b2 = db.put("blocks", "b2", serde_json::json!({"h": 2}), vec![], None, None).unwrap();
+            db.flush_all(); // persists MANIFEST incl. coll_tips
+            assert_eq!(db.tip_collection("blocks").unwrap().id, "b2");
+            assert_eq!(db.tip_collection("blocks").unwrap().seq, b2.seq);
+        }
+        // Warm reopen: MANIFEST present -> no cold scan -> seq_index cold.
+        let db2 = Db::open(dir.path(), None).unwrap();
+        assert!(db2.get_hash_by_seq(0).is_none(), "seq_index is cold on a warm boot");
+        let blocks_tip = db2.tip_collection("blocks").expect("tip_collection must survive a warm restart");
+        assert_eq!(blocks_tip.id, "b2");
+        assert_eq!(blocks_tip.data.get("h").and_then(|v| v.as_i64()), Some(2));
+        let tx_tip = db2.tip_collection("tx").expect("tx tip must also survive");
+        assert_eq!(tx_tip.id, "t1");
+        assert!(db2.tip_collection("absent").is_none());
+    }
+
+    #[test]
+    fn cold_scan_indexes_every_object_and_reports_completion() {
+        // Regression guard for the cold-scan refactor: seq_index is now populated
+        // DURING the parallel read pass (for live scan_status().indexed_count
+        // progress — see cold_scan_background_arc), not in a second pass
+        // afterward. This asserts the end state is unchanged: every written
+        // object is indexed, tip()/tip_collection() are correct, and
+        // scan_complete eventually reports true.
+        let dir = tempdir().unwrap();
+        let n = 25u64;
+        {
+            let db = Db::open(dir.path(), None).unwrap();
+            for i in 0..n {
+                db.put("things", &i.to_string(), serde_json::json!({"i": i}), vec![], None, None).unwrap();
+            }
+            db.flush_all();
+        }
+        // Force a COLD start regardless of the MANIFEST nedb-v2 itself would
+        // have written: delete it so startup_rebuild() takes the cold path and
+        // start_cold_scan() actually spawns the background scan this test needs
+        // to exercise.
+        std::fs::remove_file(dir.path().join("MANIFEST")).unwrap();
+
+        let db = Db::open(dir.path(), None).unwrap();
+        assert!(!db.scan_status().scan_complete, "should be cold immediately after open");
+        let db = std::sync::Arc::new(db);
+        Db::start_cold_scan(std::sync::Arc::clone(&db));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !db.scan_status().scan_complete {
+            assert!(std::time::Instant::now() < deadline, "cold scan did not complete in time");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let status = db.scan_status();
+        assert_eq!(status.indexed_count, n as usize, "every written object must be indexed");
+        assert!(status.scan_complete);
+
+        let tip = db.tip().expect("tip resolves after cold scan");
+        assert_eq!(tip.data.get("i").and_then(|v| v.as_u64()), Some(n - 1));
+        let coll_tip = db.tip_collection("things").expect("tip_collection resolves after cold scan");
+        assert_eq!(coll_tip.id, tip.id);
     }
 }

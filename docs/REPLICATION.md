@@ -75,6 +75,27 @@ before trusting historical catch-up.**
 
 ---
 
+### `tip()` and `tip_collection()` survive restarts (v2.5.43)
+
+`tip()` and `tip_collection(coll)` are the primitives that do **not** depend on the
+seq index being warm. Each write's object hash is tracked globally (`tip_hash`) and
+per-collection (`coll_tip_hash`), both persisted in `MANIFEST` on every flush. So
+after a restart, `tip()` and `tip_collection(coll)` resolve the last written object
+**O(1), with no scan** — even on a warm boot, before the background scan
+repopulates the seq index. That makes both a safe, durable **resume point**: a
+consumer can persist nothing of its own and still answer *"where was I?"* — for the
+whole log, or for one collection — across restarts. A node tracking independent
+chains in separate collections (headers / blocks / receipts) resumes each with its
+own `tip_collection(coll)`, no global-tip filtering required.
+
+`since()` is different: paging *history* still resolves through the seq index, so a
+historical `since(old_cursor)` right after a cold boot is gated by `scan_complete`
+(above). The safe resume shape is therefore: **`tip()` (or `tip_collection()`) for
+the durable head, then `since(tip().seq − window)` once `scan_complete`** — the head
+is always available, the history catches up behind the gate.
+
+---
+
 ## The blessed loop — catch-up, then live
 
 Every serious consumer should use exactly this pattern. Drain history with
