@@ -11,6 +11,8 @@
   "files": [
     "index.js",
     "index.d.ts",
+    "native.js",
+    "native.d.ts",
     "nedbd-v2.js",
     "*.node",
     "nedbd-v2*",
@@ -53,8 +55,8 @@
     }
   },
   "scripts": {
-    "build": "napi build --release --platform --cargo-cwd rust/crates/nedb-node",
-    "build:debug": "napi build --platform --cargo-cwd rust/crates/nedb-node",
+    "build": "napi build --release --platform --cargo-cwd rust/crates/nedb-node --js native.js --dts native.d.ts",
+    "build:debug": "napi build --platform --cargo-cwd rust/crates/nedb-node --js native.js --dts native.d.ts",
     "test": "node test/smoke.mjs"
   },
   "devDependencies": {

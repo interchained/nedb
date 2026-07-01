@@ -43,6 +43,11 @@ impl NedbCore {
 
     /// Open a durable v2 DAG database at `path`.
     /// Automatically migrates v1 AOF → v2 DAG on first open.
+    ///
+    /// Durable-mode auto-flush-on-exit is wired in the JS wrapper via
+    /// `process.on('SIGTERM'|'SIGINT'|'beforeExit', () => db.flush())` — the
+    /// libuv-cooperative hook — NOT a C-level signal handler here, which would
+    /// clobber libuv's own signal machinery.
     #[napi(factory)]
     pub fn open(path: String) -> Result<Self> {
         Db::open(std::path::Path::new(&path), None)
