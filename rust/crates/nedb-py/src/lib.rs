@@ -166,11 +166,38 @@ impl NedbCore {
         self.inner.tip().as_ref().map(node_to_json_str)
     }
 
-    /// Changefeed: every write AFTER `after_seq` (exclusive), in ascending seq
-    /// order, each as a JSON string. Pass the seq you last saw to stream only new
-    /// writes — the append-only log IS the changefeed.
-    fn since(&self, after_seq: u64) -> Vec<String> {
-        self.inner.since(after_seq).iter().map(node_to_json_str).collect()
+    /// Collection-local tip — the most recent write into `coll`, or None. Lets a
+    /// consumer resume one chain (blocks / tx / utxo) without filtering global tip.
+    fn tip_collection(&self, coll: &str) -> Option<String> {
+        self.inner.tip_collection(coll).as_ref().map(node_to_json_str)
+    }
+
+    /// Changefeed page after `after_seq` (exclusive), up to `limit` nodes (0 = the
+    /// engine default cap), as a JSON envelope string:
+    /// `{nodes, from_seq, to_seq, head_seq, has_more}`. Page while `has_more`,
+    /// advancing your cursor to `to_seq`, then attach to the live subscribe edge.
+    #[pyo3(signature = (after_seq, limit=0))]
+    fn since(&self, after_seq: u64, limit: usize) -> String {
+        let b = self.inner.since(after_seq, limit);
+        let nodes: Vec<Value> = b.nodes.iter()
+            .filter_map(|n| serde_json::from_str::<Value>(&node_to_json_str(n)).ok())
+            .collect();
+        serde_json::json!({
+            "nodes": nodes, "from_seq": b.from_seq, "to_seq": b.to_seq,
+            "head_seq": b.head_seq, "has_more": b.has_more
+        }).to_string()
+    }
+
+    /// Replication readiness as a JSON string: `{scan_complete, tip_seq,
+    /// indexed_seq_min, indexed_seq_max, indexed_count}`. Wait for
+    /// `scan_complete == true` before trusting historical `since()` catch-up.
+    fn scan_status(&self) -> String {
+        let s = self.inner.scan_status();
+        serde_json::json!({
+            "scan_complete": s.scan_complete, "tip_seq": s.tip_seq,
+            "indexed_seq_min": s.indexed_seq_min, "indexed_seq_max": s.indexed_seq_max,
+            "indexed_count": s.indexed_count
+        }).to_string()
     }
 }
 
