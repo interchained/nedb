@@ -7,9 +7,29 @@
 // pyo3::prelude::* must come first so proc-macro attributes are in scope.
 use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
-use std::sync::Arc;
+use pyo3::types::PyCFunction;
+use std::sync::{Arc, Weak};
 use nedb_engine::{Db, nql};
 use serde_json::Value;
+
+/// Register a Python `atexit` hook that flushes this durable database on
+/// interpreter shutdown — durable-mode auto-flush-on-exit for the native module.
+///
+/// Cooperative with CPython: `atexit` runs on normal exit AND on Ctrl+C (SIGINT →
+/// `KeyboardInterrupt` → interpreter exit), so no C-level `sigaction` is needed —
+/// which is exactly what we want, since seizing SIGINT would break
+/// `KeyboardInterrupt`. Holds only a `Weak<Db>`, so it never keeps the database
+/// alive. Best-effort: the caller ignores registration errors so a hook hiccup
+/// never fails `open()` (a clean shutdown still flushes via `Drop`).
+fn register_atexit_flush(py: Python<'_>, weak: Weak<Db>) -> PyResult<()> {
+    let flush = PyCFunction::new_closure_bound(py, None, None, move |_args, _kwargs| {
+        if let Some(db) = weak.upgrade() {
+            db.flush_all();
+        }
+    })?;
+    py.import_bound("atexit")?.call_method1("register", (flush,))?;
+    Ok(())
+}
 
 fn jerr(e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
@@ -39,11 +59,19 @@ impl NedbCore {
     }
 
     /// Open a durable v2 DAG database at `path`.
+    ///
+    /// Durable-mode auto-flush-on-exit is armed here by registering a Python
+    /// `atexit` hook (see `register_atexit_flush`) — the CPython-cooperative path,
+    /// NOT a C-level signal handler, which would seize `SIGINT` and break
+    /// `KeyboardInterrupt`. The in-memory constructor never arms it.
     #[staticmethod]
-    fn open(path: &str) -> PyResult<Self> {
-        Db::open(std::path::Path::new(path), None)
-            .map(|db| Self { inner: Arc::new(db) })
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    fn open(py: Python<'_>, path: &str) -> PyResult<Self> {
+        let db = Db::open(std::path::Path::new(path), None)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let inner = Arc::new(db);
+        // Best-effort: a hook-registration hiccup must not fail open().
+        let _ = register_atexit_flush(py, Arc::downgrade(&inner));
+        Ok(Self { inner })
     }
 
     // ── Indexes ────────────────────────────────────────────────────────────────
