@@ -75,6 +75,23 @@ before trusting historical catch-up.**
 
 ---
 
+### `tip()` survives restarts (v2.5.43)
+
+`tip()` is the one primitive that does **not** depend on the seq index being warm.
+The tip's object hash is persisted in `MANIFEST` on every flush, so after a restart
+`tip()` resolves the last written object **O(1), with no scan** — even on a warm
+boot, before the background scan repopulates the seq index. That makes `tip()` a
+safe, durable **resume point**: a consumer can persist nothing of its own and still
+answer *"where was I?"* from the engine across restarts.
+
+`since()` is different: paging *history* still resolves through the seq index, so a
+historical `since(old_cursor)` right after a cold boot is gated by `scan_complete`
+(above). The safe resume shape is therefore: **`tip()` for the durable head, then
+`since(tip().seq − window)` once `scan_complete`** — the head is always available,
+the history catches up behind the gate.
+
+---
+
 ## The blessed loop — catch-up, then live
 
 Every serious consumer should use exactly this pattern. Drain history with
