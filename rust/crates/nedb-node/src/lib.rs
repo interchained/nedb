@@ -43,6 +43,11 @@ impl NedbCore {
 
     /// Open a durable v2 DAG database at `path`.
     /// Automatically migrates v1 AOF → v2 DAG on first open.
+    ///
+    /// Durable-mode auto-flush-on-exit is wired in the JS wrapper via
+    /// `process.on('SIGTERM'|'SIGINT'|'beforeExit', () => db.flush())` — the
+    /// libuv-cooperative hook — NOT a C-level signal handler here, which would
+    /// clobber libuv's own signal machinery.
     #[napi(factory)]
     pub fn open(path: String) -> Result<Self> {
         Db::open(std::path::Path::new(&path), None)
@@ -214,11 +219,40 @@ impl NedbCore {
         self.inner.tip().as_ref().map(node_to_json_str)
     }
 
-    /// Changefeed: every write AFTER `after_seq` (exclusive), ascending, each as a
-    /// JSON string. Pass the seq you last saw to stream only new writes.
+    /// Collection-local tip — the most recent write into `coll` as a JSON string,
+    /// or null if the collection has no writes. Resume one chain without filtering.
     #[napi]
-    pub fn since(&self, after_seq: BigInt) -> Vec<String> {
+    pub fn tip_collection(&self, coll: String) -> Option<String> {
+        self.inner.tip_collection(&coll).as_ref().map(node_to_json_str)
+    }
+
+    /// Changefeed page after `after_seq` (exclusive), up to `limit` nodes (0 = the
+    /// engine default cap), as a JSON envelope string:
+    /// `{nodes, from_seq, to_seq, head_seq, has_more}`. Page while `has_more`,
+    /// advancing your cursor to `to_seq`, then attach to the live subscribe edge.
+    #[napi]
+    pub fn since(&self, after_seq: BigInt, limit: i64) -> String {
         let (_, after, _) = after_seq.get_u64();
-        self.inner.since(after).iter().map(node_to_json_str).collect()
+        let b = self.inner.since(after, limit.max(0) as usize);
+        let nodes: Vec<Value> = b.nodes.iter()
+            .filter_map(|n| serde_json::from_str::<Value>(&node_to_json_str(n)).ok())
+            .collect();
+        serde_json::json!({
+            "nodes": nodes, "from_seq": b.from_seq, "to_seq": b.to_seq,
+            "head_seq": b.head_seq, "has_more": b.has_more
+        }).to_string()
+    }
+
+    /// Replication readiness as a JSON string: `{scan_complete, tip_seq,
+    /// indexed_seq_min, indexed_seq_max, indexed_count}`. Wait for
+    /// `scan_complete == true` before trusting historical `since()` catch-up.
+    #[napi]
+    pub fn scan_status(&self) -> String {
+        let s = self.inner.scan_status();
+        serde_json::json!({
+            "scan_complete": s.scan_complete, "tip_seq": s.tip_seq,
+            "indexed_seq_min": s.indexed_seq_min, "indexed_seq_max": s.indexed_seq_max,
+            "indexed_count": s.indexed_count
+        }).to_string()
     }
 }

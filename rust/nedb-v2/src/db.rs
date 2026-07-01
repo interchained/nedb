@@ -23,6 +23,50 @@ struct Manifest {
     head: String,
 }
 
+/// Default cap for `since()` when the caller passes `limit == 0`. Bounds the
+/// engine primitive itself so a stale/offline consumer can never force an
+/// unbounded materialization — the safety lives in the core, not the HTTP layer.
+pub const DEFAULT_SINCE_LIMIT: usize = 10_000;
+
+/// One page of the changefeed returned by `since()`. The replication contract:
+/// apply `nodes` in ascending seq order, advance your cursor to `to_seq`, and keep
+/// paging while `has_more` is true; then attach to the live `subscribe` edge.
+/// `head_seq` tells the consumer how far the log currently extends (how far behind
+/// it is).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SinceBatch {
+    /// Writes in (`from_seq`, `to_seq`], ascending by seq.
+    pub nodes:    Vec<Node>,
+    /// The exclusive cursor this page started from (echoes the request).
+    pub from_seq: u64,
+    /// Seq of the last node in this page — the consumer's next cursor.
+    pub to_seq:   u64,
+    /// Current head seq of the log (latest committed write).
+    pub head_seq: u64,
+    /// True when more writes remain past `to_seq` (the page hit `limit`).
+    pub has_more: bool,
+}
+
+/// Replication readiness snapshot. `scan_complete` is the correctness gate: until
+/// the cold-scan finishes rebuilding the seq index, an old cursor passed to
+/// `since()` can return a PARTIAL page and look (wrongly) like "caught up". A
+/// correctness-critical consumer MUST wait for `scan_complete == true` before
+/// trusting historical catch-up. `indexed_seq_min/max` report the currently
+/// resolvable seq range; `tip_seq` is the log head.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScanStatus {
+    /// Cold-scan finished — historical seqs fully resolvable; catch-up is safe.
+    pub scan_complete:   bool,
+    /// Head seq of the log (latest committed write).
+    pub tip_seq:         u64,
+    /// Lowest seq currently in the seq index (0 if empty).
+    pub indexed_seq_min: u64,
+    /// Highest seq currently in the seq index.
+    pub indexed_seq_max: u64,
+    /// Number of seqs currently resolvable via the index.
+    pub indexed_count:   usize,
+}
+
 pub struct Db {
     pub objects:        ObjectStore,
     pub id_index:       IdIndex,
@@ -539,26 +583,86 @@ impl Db {
         self.get_by_hash(&hash)
     }
 
-    /// Changefeed: every node written AFTER `after_seq`, in ascending seq order.
-    /// `after_seq` is EXCLUSIVE — pass the seq you last saw (e.g. the seq from a
-    /// prior `tip()`) to stream only what is new. The append-only log IS the
-    /// changefeed, so this is an O(k) walk over the new range with no scan of the
-    /// whole store. Bounded by seq_index coverage (current session + cold scan),
-    /// exactly like `get_hash_by_seq`; unresolved seqs are skipped rather than
-    /// faked. Pair with `tip()` as head + tail of the chain.
-    pub fn since(&self, after_seq: u64) -> Vec<Node> {
-        let next = self.seq.load(Ordering::SeqCst);
-        let mut out = Vec::new();
-        let mut s = after_seq.saturating_add(1);
-        while s < next {
+    /// The collection-local tip — the most recent write into `coll` (highest seq in
+    /// that collection), or `None` if the collection has no writes. Scans the seq
+    /// index backward from the head until a node in `coll` is found, resolving
+    /// through the same seq_index → object-store path as a normal read; bounded by
+    /// how recently `coll` was written. Conceptually a different index than the
+    /// global `tip()` (global head vs collection head), kept as a separate method
+    /// so each is explicit — parity with the Python reference's `tip(coll)`. Lets a
+    /// consumer resume one chain (e.g. blocks / tx / utxo) without pulling global
+    /// tip and filtering.
+    pub fn tip_collection(&self, coll: &str) -> Option<Node> {
+        let mut s = self.seq.load(Ordering::SeqCst); // exclusive upper bound (head + 1)
+        while s > 0 {
+            s -= 1;
             if let Some(hash) = self.get_hash_by_seq(s) {
                 if let Some(node) = self.get_by_hash(&hash) {
-                    out.push(node);
+                    if node.coll.as_str() == coll {
+                        return Some(node);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Changefeed page: up to `limit` nodes written AFTER `after_seq` (EXCLUSIVE),
+    /// ascending by seq, wrapped in a `SinceBatch` cursor envelope. `after_seq` is
+    /// the cursor you last applied (a prior `tip()` seq or `to_seq`). `limit` bounds
+    /// the page — `0` means DEFAULT_SINCE_LIMIT, so the engine primitive can never
+    /// materialize an unbounded batch even when embedders call it directly (the
+    /// safety is here, not only in the HTTP layer). Drain by paging while
+    /// `has_more`, advancing your cursor to `to_seq`, then hand off to the live
+    /// `subscribe` edge. The append-only log IS the changefeed, so this is an
+    /// O(page) walk; unresolved seqs (outside seq_index coverage — see
+    /// `scan_status()`) are skipped rather than faked.
+    pub fn since(&self, after_seq: u64, limit: usize) -> SinceBatch {
+        let next = self.seq.load(Ordering::SeqCst);          // head + 1
+        let head_seq = next.saturating_sub(1);
+        let cap = if limit == 0 { DEFAULT_SINCE_LIMIT } else { limit };
+        let mut nodes: Vec<Node> = Vec::new();
+        let mut to_seq = after_seq;
+        let mut hit_limit = false;
+        let mut s = after_seq.saturating_add(1);
+        while s < next {
+            if nodes.len() >= cap { hit_limit = true; break; }
+            if let Some(hash) = self.get_hash_by_seq(s) {
+                if let Some(node) = self.get_by_hash(&hash) {
+                    to_seq = node.seq;
+                    nodes.push(node);
                 }
             }
             s += 1;
         }
-        out
+        SinceBatch { nodes, from_seq: after_seq, to_seq, head_seq, has_more: hit_limit }
+    }
+
+    /// Replication readiness — see `ScanStatus`. `scan_complete` gates safe
+    /// historical catch-up: a consumer pulling an old cursor right after a cold
+    /// start must wait for it, or `since()` may hand back a partial page that looks
+    /// like "caught up". Computes the indexed range by scanning the in-memory seq
+    /// index (O(index)) — intended for periodic status polls, not the per-write
+    /// hot path.
+    pub fn scan_status(&self) -> ScanStatus {
+        let next = self.seq.load(Ordering::SeqCst);
+        let mut min = u64::MAX;
+        let mut max = 0u64;
+        let mut count = 0usize;
+        for kv in self.seq_index.iter() {
+            let s = *kv.key();
+            if s < min { min = s; }
+            if s > max { max = s; }
+            count += 1;
+        }
+        if count == 0 { min = 0; }
+        ScanStatus {
+            scan_complete:   self.startup_ready.load(Ordering::SeqCst),
+            tip_seq:         next.saturating_sub(1),
+            indexed_seq_min: min,
+            indexed_seq_max: max,
+            indexed_count:   count,
+        }
     }
 
     /// Add an explicit named relation edge between two documents.
@@ -798,7 +902,7 @@ mod tests_v2 {
         let db = Db::in_memory();
         // Empty db: no tip, empty changefeed.
         assert!(db.tip().is_none());
-        assert!(db.since(0).is_empty());
+        assert!(db.since(0, 0).nodes.is_empty());
 
         let a = db.put("item", "a", serde_json::json!({"x": 1}), vec![], None, None).unwrap();
         let b = db.put("item", "b", serde_json::json!({"x": 2}), vec![], None, None).unwrap();
@@ -809,13 +913,52 @@ mod tests_v2 {
         assert_eq!(t.id, "b");
         assert_eq!(t.hash, b.hash);
 
-        // since(after_seq) is an EXCLUSIVE cursor: everything written after it.
-        let after_a = db.since(a.seq);
-        assert_eq!(after_a.len(), 1);
-        assert_eq!(after_a[0].id, "b");
+        // since(after_seq, limit) — EXCLUSIVE cursor, bounded page + envelope.
+        let after_a = db.since(a.seq, 0);
+        assert_eq!(after_a.nodes.len(), 1);
+        assert_eq!(after_a.nodes[0].id, "b");
+        assert_eq!(after_a.from_seq, a.seq);
+        assert_eq!(after_a.to_seq, b.seq);
+        assert_eq!(after_a.head_seq, b.seq);
+        assert!(!after_a.has_more);
 
         // Nothing written after the tip.
-        assert!(db.since(b.seq).is_empty());
+        assert!(db.since(b.seq, 0).nodes.is_empty());
+
+        // `limit` bounds the page and sets has_more; resume from to_seq.
+        let c = db.put("item", "c", serde_json::json!({"x": 3}), vec![], None, None).unwrap();
+        let page = db.since(a.seq, 1);             // (a..] capped at 1 -> [b], more pending
+        assert_eq!(page.nodes.len(), 1);
+        assert_eq!(page.nodes[0].id, "b");
+        assert_eq!(page.to_seq, b.seq);
+        assert!(page.has_more);
+        let page2 = db.since(page.to_seq, 1);      // resume from b -> [c], done
+        assert_eq!(page2.nodes.len(), 1);
+        assert_eq!(page2.nodes[0].id, "c");
+        assert_eq!(page2.to_seq, c.seq);
+        assert!(!page2.has_more);
+    }
+
+    #[test]
+    fn tip_collection_per_chain() {
+        // The ITC sync-client case: separate chains in separate collections; a
+        // consumer resumes ONE without pulling global tip and filtering.
+        let db = Db::in_memory();
+        assert!(db.tip_collection("blocks").is_none());
+
+        db.put("blocks", "b0", serde_json::json!({"h": 0}), vec![], None, None).unwrap();
+        db.put("tx",     "t0", serde_json::json!({"v": 1}), vec![], None, None).unwrap();
+        let b1 = db.put("blocks", "b1", serde_json::json!({"h": 1}), vec![], None, None).unwrap();
+        let t1 = db.put("tx",     "t1", serde_json::json!({"v": 2}), vec![], None, None).unwrap();
+
+        // global tip = latest write overall (t1)
+        assert_eq!(db.tip().unwrap().id, "t1");
+        // collection-local tips = latest write in each collection
+        let bt = db.tip_collection("blocks").expect("blocks tip");
+        assert_eq!(bt.id, "b1");
+        assert_eq!(bt.seq, b1.seq);
+        assert_eq!(db.tip_collection("tx").unwrap().seq, t1.seq);
+        assert!(db.tip_collection("absent").is_none());
     }
 
     #[test]

@@ -1,17 +1,21 @@
 {
   "name": "nedb-engine",
-  "version": "2.5.2",
+  "version": "2.5.34",
   "description": "NEDB — hash-chained, time-traveling, bi-temporal embedded database with Rust native core. SQL, Redis, MongoDB adapters. Causal Write Provenance. RESP2 wire protocol.",
   "main": "index.js",
   "types": "index.d.ts",
   "bin": {
     "nedbd-v2": "./nedbd-v2.js",
-    "nedbdv2": "./nedbd-v2.js"
+    "nedbdv2": "./nedbd-v2.js",
+    "nedb-inspector": "./nedb-inspector.mjs"
   },
   "files": [
     "index.js",
     "index.d.ts",
+    "native.js",
+    "native.d.ts",
     "nedbd-v2.js",
+    "nedb-inspector.mjs",
     "*.node",
     "nedbd-v2*",
     "test/smoke.mjs",
@@ -53,8 +57,8 @@
     }
   },
   "scripts": {
-    "build": "napi build --release --platform --cargo-cwd rust/crates/nedb-node",
-    "build:debug": "napi build --platform --cargo-cwd rust/crates/nedb-node",
+    "build": "napi build --release --platform --cargo-cwd rust/crates/nedb-node --js native.js --dts native.d.ts",
+    "build:debug": "napi build --platform --cargo-cwd rust/crates/nedb-node --js native.js --dts native.d.ts",
     "test": "node test/smoke.mjs"
   },
   "devDependencies": {

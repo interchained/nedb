@@ -7,9 +7,29 @@
 // pyo3::prelude::* must come first so proc-macro attributes are in scope.
 use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
-use std::sync::Arc;
+use pyo3::types::PyCFunction;
+use std::sync::{Arc, Weak};
 use nedb_engine::{Db, nql};
 use serde_json::Value;
+
+/// Register a Python `atexit` hook that flushes this durable database on
+/// interpreter shutdown — durable-mode auto-flush-on-exit for the native module.
+///
+/// Cooperative with CPython: `atexit` runs on normal exit AND on Ctrl+C (SIGINT →
+/// `KeyboardInterrupt` → interpreter exit), so no C-level `sigaction` is needed —
+/// which is exactly what we want, since seizing SIGINT would break
+/// `KeyboardInterrupt`. Holds only a `Weak<Db>`, so it never keeps the database
+/// alive. Best-effort: the caller ignores registration errors so a hook hiccup
+/// never fails `open()` (a clean shutdown still flushes via `Drop`).
+fn register_atexit_flush(py: Python<'_>, weak: Weak<Db>) -> PyResult<()> {
+    let flush = PyCFunction::new_closure_bound(py, None, None, move |_args, _kwargs| {
+        if let Some(db) = weak.upgrade() {
+            db.flush_all();
+        }
+    })?;
+    py.import_bound("atexit")?.call_method1("register", (flush,))?;
+    Ok(())
+}
 
 fn jerr(e: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
@@ -39,11 +59,19 @@ impl NedbCore {
     }
 
     /// Open a durable v2 DAG database at `path`.
+    ///
+    /// Durable-mode auto-flush-on-exit is armed here by registering a Python
+    /// `atexit` hook (see `register_atexit_flush`) — the CPython-cooperative path,
+    /// NOT a C-level signal handler, which would seize `SIGINT` and break
+    /// `KeyboardInterrupt`. The in-memory constructor never arms it.
     #[staticmethod]
-    fn open(path: &str) -> PyResult<Self> {
-        Db::open(std::path::Path::new(path), None)
-            .map(|db| Self { inner: Arc::new(db) })
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    fn open(py: Python<'_>, path: &str) -> PyResult<Self> {
+        let db = Db::open(std::path::Path::new(path), None)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        let inner = Arc::new(db);
+        // Best-effort: a hook-registration hiccup must not fail open().
+        let _ = register_atexit_flush(py, Arc::downgrade(&inner));
+        Ok(Self { inner })
     }
 
     // ── Indexes ────────────────────────────────────────────────────────────────
@@ -166,11 +194,38 @@ impl NedbCore {
         self.inner.tip().as_ref().map(node_to_json_str)
     }
 
-    /// Changefeed: every write AFTER `after_seq` (exclusive), in ascending seq
-    /// order, each as a JSON string. Pass the seq you last saw to stream only new
-    /// writes — the append-only log IS the changefeed.
-    fn since(&self, after_seq: u64) -> Vec<String> {
-        self.inner.since(after_seq).iter().map(node_to_json_str).collect()
+    /// Collection-local tip — the most recent write into `coll`, or None. Lets a
+    /// consumer resume one chain (blocks / tx / utxo) without filtering global tip.
+    fn tip_collection(&self, coll: &str) -> Option<String> {
+        self.inner.tip_collection(coll).as_ref().map(node_to_json_str)
+    }
+
+    /// Changefeed page after `after_seq` (exclusive), up to `limit` nodes (0 = the
+    /// engine default cap), as a JSON envelope string:
+    /// `{nodes, from_seq, to_seq, head_seq, has_more}`. Page while `has_more`,
+    /// advancing your cursor to `to_seq`, then attach to the live subscribe edge.
+    #[pyo3(signature = (after_seq, limit=0))]
+    fn since(&self, after_seq: u64, limit: usize) -> String {
+        let b = self.inner.since(after_seq, limit);
+        let nodes: Vec<Value> = b.nodes.iter()
+            .filter_map(|n| serde_json::from_str::<Value>(&node_to_json_str(n)).ok())
+            .collect();
+        serde_json::json!({
+            "nodes": nodes, "from_seq": b.from_seq, "to_seq": b.to_seq,
+            "head_seq": b.head_seq, "has_more": b.has_more
+        }).to_string()
+    }
+
+    /// Replication readiness as a JSON string: `{scan_complete, tip_seq,
+    /// indexed_seq_min, indexed_seq_max, indexed_count}`. Wait for
+    /// `scan_complete == true` before trusting historical `since()` catch-up.
+    fn scan_status(&self) -> String {
+        let s = self.inner.scan_status();
+        serde_json::json!({
+            "scan_complete": s.scan_complete, "tip_seq": s.tip_seq,
+            "indexed_seq_min": s.indexed_seq_min, "indexed_seq_max": s.indexed_seq_max,
+            "indexed_count": s.indexed_count
+        }).to_string()
     }
 }
 

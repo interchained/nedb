@@ -20,15 +20,21 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 
 ---
 
-## NEDB v2.4.468 — Production Stable
+## NEDB v2.5.34 — Production Stable
 
-**Current stable: 2.4.468** — NEDB now ships as **three version-aligned distributions** on one tag — `nedb-engine` (flagship), `crypto-database` (verifiable v2/v3 DAG), and `aof-db` (fast append-only) — across npm / PyPI / crates.io with full mac + linux + windows native addons (see [**Releasing**](#releasing) below). On the engine side it remains a polish release on the complete cross-platform line. The `nedbd-v2` daemon now does **real CLI parsing** — `--dag-v3`, `--data`, `--fast-fsync`, `--help`, `--version` are recognized flags instead of being silently swallowed as the positional data dir — and `npm test` ships a **cinematic native smoke test** that tours v1→v2 migration, the v2 DAG, the v3 segment store, and a causal-provenance audit. All native wheels (Linux + Windows on GitHub Actions; macOS arm64 + x86_64 on Codemagic M2 Mac Minis) **plus** the universal pure-Python wheel ship from a single `v*` tag, with the `nedbd-v2` binary bundled inside `pip install nedb-engine`.
+**Current stable: 2.5.34** — NEDB ships as **three version-aligned distributions** on one tag — `nedb-engine` (flagship), `crypto-database` (verifiable v2/v3 DAG), and `aof-db` (fast append-only) — across npm / PyPI / crates.io with full mac + linux + windows native addons (see [**Releasing**](#releasing) below). On the engine side it remains a polish release on the complete cross-platform line. The `nedbd-v2` daemon now does **real CLI parsing** — `--dag-v3`, `--data`, `--fast-fsync`, `--help`, `--version` are recognized flags instead of being silently swallowed as the positional data dir — and `npm test` ships a **cinematic native smoke test** that tours v1→v2 migration, the v2 DAG, the v3 segment store, and a causal-provenance audit. All native wheels (Linux + Windows on GitHub Actions; macOS arm64 + x86_64 on Codemagic M2 Mac Minis) **plus** the universal pure-Python wheel ship from a single `v*` tag, with the `nedbd-v2` binary bundled inside `pip install nedb-engine`.
+
+**New in 2.5.x:**
+
+- **Durable-mode auto-flush-on-exit** — a durable store flushes buffered writes on `Ctrl+C` / `SIGTERM`, not just on a clean `Drop`. Automatic in the Node and Python bindings; `Db::install_exit_flush(Arc<Db>)` for standalone Rust binaries. See [**docs/DURABILITY.md**](docs/DURABILITY.md).
+- **`nedb-cli`** — operate on a store directory offline (`head` · `status` · `verify` · `get` · `scan` · `flush` · `repair` · `export`), and **`nedb-inspector`** — a deterministic (no-regex, no-LLM) checker that warns when a durable open lacks flush-on-exit wiring. See [**docs/CLI.md**](docs/CLI.md).
+- **Replication contract** — `tip()` (the latest write), a bounded `since()` changefeed, and a `scan_status()` readiness gate. See [**docs/REPLICATION.md**](docs/REPLICATION.md).
 
 **The v3 storage line — consolidated, spec'd, and (as of 2.4.3) cleanly published across every platform.** It makes the NEDB **v3 segment/pack object store** a first-class, fully-documented feature:
 
 - **`--dag-v3`** (opt-in) — append-only segment store: one `fsync` per group-commit, `.idx` sidecars, compaction, non-destructive dual-read. Took a real itcd chainstate flush from *minutes* to **~1.3 s**. Parsed as a real flag by `nedbd-v2` as of v2.4.3 (or set `NEDB_DAG_V3=1`). (See the v3 section below.)
 - **`NEDB_FAST_FSYNC`** — macOS fast-fsync: a plain `fsync(2)` instead of `F_FULLFSYNC` (default off; no-op on Linux/Windows).
-- Durable **flush-on-close**, a **Windows-safe id-index** (percent-encodes filesystem-unsafe ids), and idempotent object re-writes — shipped across the 2.3.3xxx line.
+- Durable **flush-on-close** — and, as of 2.5.x, **flush-on-exit** on `Ctrl+C` / `SIGTERM` (see [**docs/DURABILITY.md**](docs/DURABILITY.md)) — a **Windows-safe id-index** (percent-encodes filesystem-unsafe ids), and idempotent object re-writes.
 - **`docs/SPEC.md` §3** now formally specifies the v2 object store, the v3 substrate, and the durability model.
 
 NEDB v2 replaces the append-only log (AOF) with a **content-addressed Merkle DAG**. Every document version is an immutable, BLAKE2b-verified object. Nothing is ever overwritten. As of **v2.2.31**, restarts after the first open are **O(1) warm starts** (driven by a `MANIFEST` of `seq` + Merkle head), the **cold scan is deferred** so the daemon accepts connections immediately, and a new **`GET /events` SSE endpoint** streams scan progress + per-write events live.
@@ -234,6 +240,10 @@ nedbd --log-level 2                       # 0=errors 1=requests 2=deploy 3=verbo
 # Live event stream (new in v2.2.31) — SSE: scan progress, ready, per-write head
 curl http://127.0.0.1:7070/events
 ```
+
+### Companion CLIs
+
+Alongside the daemon, `cargo install nedb-engine` ships **`nedb-cli`** — operate on a store directory offline (`head`/`status`/`verify`/`get`/`scan`/`flush`/`repair`/`export`) — and **`nedb-inspector`**, a deterministic checker that warns when a durable open lacks flush-on-exit wiring. Full reference: [**docs/CLI.md**](docs/CLI.md).
 
 ### Startup modes (v2.2.31)
 
