@@ -412,8 +412,23 @@ pub fn execute(db: &Db, nql: &str) -> Result<Vec<Value>> {
             .filter_map(|id| db.get_as_of(&q.coll, &id, seq_target))
             .collect()
     } else if let Some(ref order_field) = q.order_by {
-        // ORDER BY with optional sorted index — get candidates in order
-        let limit = q.limit.unwrap_or(9_999_999);
+        // ORDER BY with optional sorted index — get candidates in order.
+        //
+        // Push LIMIT down into the index scan ONLY when nothing filters rows
+        // after candidate generation. WHERE / SEARCH / VALID AS OF all run on
+        // the candidate set below, so truncating to the top-k FIRST returns
+        // incomplete results: `WHERE n_tx > 100 ORDER BY height LIMIT 10`
+        // would fetch the 10 lowest blocks by height and then filter — losing
+        // matches past the top-k window. The Python reference filters → sorts
+        // → limits (engine.py execute()); this keeps the engines in agreement.
+        let has_post_filters = !q.wheres.is_empty()
+            || q.search.is_some()
+            || q.valid_as_of.is_some();
+        let limit = if has_post_filters {
+            9_999_999
+        } else {
+            q.limit.unwrap_or(9_999_999)
+        };
         if q.order_desc {
             db.order_by_desc(&q.coll, order_field, limit)
         } else {
@@ -590,6 +605,29 @@ mod tests {
         let (_tmp, db) = setup();
         let (rows, _) = query(&db, "FROM blocks WHERE height > 3").unwrap();
         assert_eq!(rows.len(), 2);
+    }
+
+    /// Regression: WHERE + ORDER BY + LIMIT must not truncate candidates
+    /// before the filter runs. setup() gives heights 1..=5 with n_tx = h*2;
+    /// the predicate matches ONLY the two highest heights (4, 5). The old
+    /// code passed LIMIT into the sorted-index top-k first: it fetched
+    /// heights [1, 2], filtered on n_tx >= 8, and returned ZERO rows even
+    /// though two matches exist. Python reference returns [4, 5].
+    #[test]
+    fn where_order_limit_does_not_truncate_before_filter() {
+        let (_tmp, db) = setup();
+        let (rows, count) =
+            query(&db, "FROM blocks WHERE n_tx >= 8 ORDER BY height LIMIT 2").unwrap();
+        assert_eq!(count, 2, "both matching rows must survive the limit");
+        let heights: Vec<u64> = rows.iter()
+            .filter_map(|r| r["height"].as_u64())
+            .collect();
+        assert_eq!(heights, vec![4, 5]);
+        // And the same shape DESC — top match first.
+        let (rows_d, _) =
+            query(&db, "FROM blocks WHERE n_tx >= 8 ORDER BY height DESC LIMIT 1").unwrap();
+        assert_eq!(rows_d.len(), 1);
+        assert_eq!(rows_d[0]["height"], 5);
     }
 
     #[test]
