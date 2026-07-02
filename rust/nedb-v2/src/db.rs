@@ -505,8 +505,27 @@ impl Db {
         if let Ok(json) = serde_json::to_string(&m) {
             let path = self.root.join("MANIFEST");
             let tmp  = self.root.join("MANIFEST.tmp");
-            let _ = fs::write(&tmp, &json);
-            let _ = fs::rename(&tmp, &path);
+            // fsync the tmp file BEFORE the rename: rename-without-fsync can
+            // leave a zero-length/partial MANIFEST at the final path after
+            // power loss (ext4 delayed allocation). The startup self-heal
+            // (invalid head -> cold scan) catches that, but a full rescan is
+            // exactly the cost MANIFEST exists to avoid. One fsync per flush,
+            // and flushes are already off the hot write path (ticker-driven).
+            let wrote = (|| -> std::io::Result<()> {
+                use std::io::Write;
+                let mut f = fs::File::create(&tmp)?;
+                f.write_all(json.as_bytes())?;
+                f.sync_all()
+            })();
+            if wrote.is_ok() && fs::rename(&tmp, &path).is_ok() {
+                // Make the rename itself durable (directory entry). Unix-only;
+                // on Windows directory handles don't support this and the
+                // rename is already journaled by NTFS.
+                #[cfg(unix)]
+                if let Ok(dir) = fs::File::open(&self.root) {
+                    let _ = dir.sync_all();
+                }
+            }
         }
     }
 
@@ -520,8 +539,21 @@ impl Db {
                 std::thread::sleep(std::time::Duration::from_millis(interval_ms));
                 // Flush id-index WAL to disk (parallel Rayon writes)
                 db.id_index.flush_write_buf();
-                // Then flush MANIFEST
-                db.flush_manifest_if_dirty();
+                // Segment bytes must be durable BEFORE a MANIFEST that
+                // references them: otherwise power loss can leave MANIFEST
+                // pointing at a tip whose object bytes were still in the page
+                // cache — the torn tail is truncated on reopen and the warm
+                // boot resolves a tip that no longer exists, with the seq
+                // counter ahead of durable data. Order: sync segments, then
+                // MANIFEST. Gated on the dirty flag so an idle database pays
+                // no per-tick fsync. (flush_all already used this order; the
+                // ticker now matches it.)
+                if db.manifest_dirty.load(Ordering::Acquire) {
+                    if let Err(e) = db.objects.sync() {
+                        eprintln!("nedb: segment sync failed: {}", e);
+                    }
+                    db.flush_manifest_if_dirty();
+                }
             }
         });
     }
