@@ -183,8 +183,10 @@ fn main() {
     let speedup = v3.writes_per_sec / v2.writes_per_sec.max(1e-9);
     let cold_speedup = v2.cold_start_ms / v3.cold_start_ms.max(1e-9);
 
-    println!("\n{:<24}{:>18}{:>18}", "metric", "v2 (loose)", "v3 (segments)");
+    println!("\n{:<24}{:>18}{:>18}", "metric", v2.label, v3.label);
     println!("{}", "-".repeat(60));
+    println!("{:<24}{:>18}{:>18}", "objects written", v2.objects, v3.objects);
+    println!("{:<24}{:>18}{:>18}", "point reads", v2.reads, v3.reads);
     println!("{:<24}{:>18.0}{:>18.0}", "writes / sec", v2.writes_per_sec, v3.writes_per_sec);
     println!("{:<24}{:>18.2}{:>18.2}", "write total (s)", v2.write_secs, v3.write_secs);
     println!("{:<24}{:>18.0}{:>18.0}", "reads / sec", v2.reads_per_sec, v3.reads_per_sec);

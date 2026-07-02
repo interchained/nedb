@@ -212,9 +212,15 @@ impl IdIndex {
                 }
             }
         });
-        // Clear flushed entries
-        for ((coll, id), _) in &entries {
-            self.write_buf.remove(&(coll.clone(), id.clone()));
+        // Clear flushed entries — but ONLY when the buffered value is still the
+        // exact value we flushed. An unconditional remove() here would delete a
+        // NEWER value written between the snapshot above and this point: that
+        // write would never reach disk (the file holds the stale hash we just
+        // wrote) and get() would serve the old version once the buffer check
+        // misses — a silent lost update. remove_if closes the race; a newer
+        // value simply stays buffered and flushes on the next tick.
+        for (key, flushed_val) in &entries {
+            self.write_buf.remove_if(key, |_, current| current == flushed_val);
         }
     }
 
@@ -505,5 +511,69 @@ mod tests {
         assert_eq!(asc, vec!["hash1", "hash2"]);
         let desc = idx.top_k_desc("blocks", "height", 2);
         assert_eq!(desc, vec!["hash3", "hash2"]);
+    }
+
+    /// Regression stress test for the flush_write_buf lost-update race.
+    ///
+    /// Old behavior: flush snapshotted the buffer, wrote files in parallel, then
+    /// UNCONDITIONALLY removed each snapshotted key. A set() landing between the
+    /// snapshot and the remove was deleted from the buffer without ever being
+    /// flushed — disk kept the stale hash and (with no later write to re-insert
+    /// the key) the newer value was lost forever.
+    ///
+    /// Shape: every key is written exactly twice (v1 then v2) while a flusher
+    /// thread spins. Under the old code, keys whose v1 was snapshotted and whose
+    /// v2 arrived during the parallel disk-write phase get their v2 dropped by
+    /// the unconditional remove — the final assert catches them on disk at v1.
+    /// With remove_if, a superseded snapshot entry leaves the newer value
+    /// buffered for the next flush, so every key must read v2 at the end.
+    /// (Probabilistic by nature, but the race window — thousands of parallel
+    /// file writes — is wide; with 2000 keys the old code fails reliably.)
+    #[test]
+    fn flush_never_drops_a_concurrent_newer_write() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempdir().unwrap();
+        let idx = Arc::new(IdIndex::new(dir.path()).unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        const N: usize = 2000;
+
+        let flusher = {
+            let idx = Arc::clone(&idx);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    idx.flush_write_buf();
+                }
+            })
+        };
+
+        // v1 for every key, then v2 for every key — the flusher races both passes.
+        for i in 0..N {
+            idx.set("c", &format!("k{}", i), "v1").unwrap();
+        }
+        for i in 0..N {
+            idx.set("c", &format!("k{}", i), "v2").unwrap();
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        flusher.join().unwrap();
+        // Drain anything still buffered (remove_if leaves superseded entries in).
+        idx.flush_write_buf();
+        idx.flush_write_buf();
+
+        // Every key must be v2 — from this handle AND from a cold reopen (disk).
+        for i in 0..N {
+            let k = format!("k{}", i);
+            assert_eq!(idx.get("c", &k), Some("v2".to_string()),
+                       "key {} lost its newer write (buffer path)", k);
+        }
+        let cold = IdIndex::new(dir.path()).unwrap();
+        for i in 0..N {
+            let k = format!("k{}", i);
+            assert_eq!(cold.get("c", &k), Some("v2".to_string()),
+                       "key {} lost its newer write (disk path)", k);
+        }
     }
 }

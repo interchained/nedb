@@ -28,7 +28,7 @@ use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use blake2::{Blake2b512, Digest};
@@ -83,6 +83,37 @@ fn blake2b(data: &[u8]) -> String {
     hex::encode(blake2b_raw(data))
 }
 
+/// Positional read at an explicit offset — no shared-cursor state, so one
+/// handle serves any number of concurrent readers without locking.
+#[cfg(unix)]
+fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    f.read_exact_at(buf, offset)
+}
+
+/// Windows: `seek_read` takes an explicit offset per call (ReadFile with an
+/// OVERLAPPED offset). It may return short reads, so loop to fill the buffer.
+/// It does move that handle's file pointer — harmless here, because cached
+/// read handles are used exclusively through this function (every call passes
+/// its own absolute offset) and the appender writes through a different
+/// handle with its own cursor.
+#[cfg(windows)]
+fn read_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0usize;
+    while done < buf.len() {
+        let n = f.seek_read(&mut buf[done..], offset + done as u64)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "eof mid-record in segment read",
+            ));
+        }
+        done += n;
+    }
+    Ok(())
+}
+
 /// The currently-appended-to segment.
 struct Active {
     id: u32,
@@ -101,6 +132,17 @@ pub struct SegmentStore {
     /// points use a plain `fsync(2)` instead of std's `sync_all` (= F_FULLFSYNC
     /// on macOS). Off by default → identical, full-durability behavior.
     fast_fsync: bool,
+    /// Read-handle cache: one shared, read-only `File` per segment. Reads go
+    /// through positional I/O (`pread` on Unix, `seek_read` on Windows) with an
+    /// explicit offset per call, so a single handle serves any number of threads
+    /// with no cursor state and no lock. Before this cache every `get()` paid
+    /// `open + seek + read + close` — 3-4 syscalls and fd churn per point read,
+    /// on the path itcd's -dagv3 chainstate reads live on (and `CreateFile` is
+    /// the expensive one on Windows). These handles are NEVER used for writes:
+    /// the active segment's writer keeps its own separate handle (own cursor)
+    /// behind the `active` mutex. Cleared on `compact()` — old segment ids are
+    /// never referenced again after the index swap.
+    read_handles: DashMap<u32, Arc<File>>,
 }
 
 /// Durability point for a segment file.
@@ -229,6 +271,7 @@ impl SegmentStore {
             active: Mutex::new(Active { id: active_id, file, offset: active_end }),
             max_segment_bytes,
             fast_fsync,
+            read_handles: DashMap::new(),
         })
     }
 
@@ -267,13 +310,28 @@ impl SegmentStore {
         Ok((pos, entries))
     }
 
-    /// Read+verify the raw content at a location. Errors on tamper.
-    fn read_content(dir: &Path, loc: &SegmentLocation, expect_hash: &str) -> Result<Vec<u8>> {
-        let path = Self::seg_path(dir, loc.segment_id);
-        let mut f = File::open(&path).with_context(|| format!("open segment {:?}", path))?;
-        f.seek(SeekFrom::Start(loc.offset))?;
+    /// Get (or open and cache) the shared read-only handle for a segment.
+    /// A double-open race between two missing threads is harmless: `or_insert`
+    /// keeps the first handle and the loser's `File` is simply dropped (closed).
+    fn read_handle(&self, id: u32) -> Result<Arc<File>> {
+        if let Some(h) = self.read_handles.get(&id) {
+            return Ok(Arc::clone(h.value()));
+        }
+        let path = Self::seg_path(&self.dir, id);
+        let f = Arc::new(File::open(&path).with_context(|| format!("open segment {:?}", path))?);
+        Ok(Arc::clone(self.read_handles.entry(id).or_insert(f).value()))
+    }
+
+    /// Read+verify the raw content at a location through the shared handle
+    /// cache. Positional reads only — no seek, no cursor, no per-read open.
+    /// Errors on tamper. Safe against a concurrent appender on the active
+    /// segment: index entries are inserted only AFTER `write_all` returns, and
+    /// read-after-write through a second handle of the same file is coherent
+    /// through the page cache on both Unix and Windows.
+    fn read_content(&self, loc: &SegmentLocation, expect_hash: &str) -> Result<Vec<u8>> {
+        let f = self.read_handle(loc.segment_id)?;
         let mut content = vec![0u8; loc.len as usize];
-        f.read_exact(&mut content)
+        read_at(&f, &mut content, loc.offset)
             .with_context(|| format!("read record from segment {}", loc.segment_id))?;
         let actual = blake2b(&content);
         if actual != expect_hash {
@@ -419,7 +477,7 @@ impl SegmentStore {
             Some(entry) => *entry.value(),
             None => return Ok(None),
         };
-        Ok(Some(Self::read_content(&self.dir, &loc, hash)?))
+        Ok(Some(self.read_content(&loc, hash)?))
     }
 
     /// All hashes currently stored in segments.
@@ -482,7 +540,7 @@ impl SegmentStore {
         let mut cur_off: u64 = 0;
 
         for (hash, loc) in &to_copy {
-            let content = Self::read_content(&self.dir, loc, hash)?;
+            let content = self.read_content(loc, hash)?;
             let len = content.len() as u32;
             let record_size = 4u64 + content.len() as u64;
 
@@ -527,6 +585,15 @@ impl SegmentStore {
             self.index.insert(e.key().clone(), *e.value());
         }
         *active = Active { id: cur_id, file: cur_file, offset: cur_off };
+
+        // Drop every cached read handle: old segment ids are never referenced
+        // again after the index swap (ids strictly increase), and releasing the
+        // handles frees their fds before the files are deleted below. (Deletion
+        // would succeed even with handles open — Unix unlink semantics; Rust's
+        // std opens with FILE_SHARE_DELETE on Windows — this is hygiene, not
+        // correctness.) Fresh handles for the new segments open lazily on the
+        // next read.
+        self.read_handles.clear();
 
         // Delete every old segment (id < new_base) + its .idx, after the new
         // ones are durable. Re-list so we only touch files that actually exist.
@@ -750,6 +817,52 @@ mod tests {
             } else {
                 assert!(got.is_none(), "dead object {} must be pruned", i);
             }
+        }
+    }
+
+    /// The read-handle cache serves many threads through ONE shared handle per
+    /// segment via positional reads — no cursor, no lock, no per-read open.
+    /// Small rollover size forces multiple segments so the cache holds several
+    /// handles, and reads cover both sealed segments and the active one
+    /// (read-after-write coherence through a second handle of the same file).
+    #[test]
+    fn concurrent_reads_share_cached_handles() {
+        let dir = tempdir().unwrap();
+        let s = Arc::new(SegmentStore::open_with_max(dir.path(), 256).unwrap());
+        let mut hashes = Vec::new();
+        for i in 0..64u32 {
+            hashes.push(put_get_hash(&s, format!("concurrent-record-{:04}", i).as_bytes()));
+        }
+        s.sync().unwrap();
+
+        let hashes = Arc::new(hashes);
+        let mut joins = vec![];
+        for t in 0..4 {
+            let s2 = Arc::clone(&s);
+            let hs = Arc::clone(&hashes);
+            joins.push(std::thread::spawn(move || {
+                // Every thread reads every record, twice — the second pass runs
+                // entirely on warm cached handles.
+                for pass in 0..2 {
+                    for (i, h) in hs.iter().enumerate() {
+                        let got = s2.get(h).unwrap()
+                            .unwrap_or_else(|| panic!("thread {} pass {} record {}: missing", t, pass, i));
+                        assert_eq!(got, format!("concurrent-record-{:04}", i).as_bytes(),
+                                   "thread {} pass {} record {}: wrong bytes", t, pass, i);
+                    }
+                }
+            }));
+        }
+        for j in joins { j.join().unwrap(); }
+
+        // And the cache must not survive a compaction (old ids never return).
+        let live: HashSet<String> = hashes.iter().cloned().collect();
+        let stats = s.compact(&live).unwrap();
+        assert_eq!(stats.live_objects, 64);
+        for (i, h) in hashes.iter().enumerate() {
+            assert_eq!(s.get(h).unwrap().unwrap(),
+                       format!("concurrent-record-{:04}", i).as_bytes(),
+                       "record {} must read correctly through fresh post-compact handles", i);
         }
     }
 }
