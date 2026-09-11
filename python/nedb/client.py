@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+# NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 """
 NedbClient — the official Python client for nedbd's HTTP API.
 
@@ -53,6 +57,7 @@ import json
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, TypeVar
 
@@ -74,6 +79,16 @@ CAS_BACKOFF_CAP_S = 0.2    # … capped here
 
 
 # ── errors ───────────────────────────────────────────────────────────────────
+
+def _seg(value: str) -> str:
+    """Percent-encode one URL path segment.
+
+    `/` MUST be encoded (hence ``safe=""``): an id containing a slash used to
+    split the path so the route matched a different id, and ``delete_doc``
+    returned "did not exist" for a document that did.
+    """
+    return urllib.parse.quote(str(value), safe="")
+
 
 class NedbError(RuntimeError):
     """Base error for daemon interactions. ``status`` is the HTTP status
@@ -283,12 +298,47 @@ class NedbClient:
         """Run NQL, return the full envelope ``{rows, count, seq, head}``."""
         return self.request("POST", self._dbp("query"), {"nql": nql})
 
-    def get_doc(self, coll: str, doc_id: str) -> Optional[dict]:
+    def get_doc(self, coll: str, doc_id: str,
+                as_of: Optional[int] = None) -> Optional[dict]:
         """Fetch one doc by id (returns ``None`` when absent). Docs carry
-        ``_id`` and ``_seq`` — feed ``_seq`` to ``op_put(if_seq=…)``."""
+        ``_id`` and ``_seq`` — feed ``_seq`` to ``op_put(if_seq=…)``.
+
+        With ``as_of``, returns the version at or before that sequence number.
+
+        Uses ``GET …/rows/{coll}/{id}``, which takes the id from the URL path.
+        This used to build ``FROM coll WHERE _id = "…"`` and interpolate the id
+        into it — so an id containing a double quote was REJECTED outright
+        (``unquotable identifier``) even though ``put`` accepts it, ``FROM
+        coll`` returns it and the engine stores it fine. The guard was there
+        because the interpolation was unsafe; taking the id from the path
+        removes the interpolation, so the id no longer needs guarding and
+        legitimate ids with quotes now work.
+
+        Injection is impossible by construction here: nothing is concatenated
+        into a query, so a crafted id can only ever name a document.
+
+        Falls back to the query path against a server predating the route
+        (nedb-engine < 3.3.0 answers 405 there, having registered only DELETE),
+        where the historical ``unquotable identifier`` guard still applies
+        because the interpolation is back.
+        """
+        path = self._dbp(f"rows/{_seg(coll)}/{_seg(doc_id)}")
+        if as_of is not None:
+            path = f"{path}?as_of={int(as_of)}"
+        try:
+            # The route answers 200 with `row: null` for a missing document,
+            # precisely so this cannot be confused with "no such route".
+            return self.request("GET", path).get("row")
+        except NedbError as e:
+            # 404/405 => the server predates this route (the Rust daemon
+            # registered only DELETE on this path; the Python AOF server had
+            # no such path at all). Anything else is a real error.
+            if getattr(e, "status", None) not in (404, 405):
+                raise
         if '"' in coll or '"' in str(doc_id):
             raise NedbBadRequest(f"unquotable identifier: {coll}:{doc_id}")
-        rows = self.query(f'FROM {coll} WHERE _id = "{doc_id}"')
+        as_of_clause = f" AS OF {int(as_of)}" if as_of is not None else ""
+        rows = self.query(f'FROM {coll}{as_of_clause} WHERE _id = "{doc_id}"')
         return rows[0] if rows else None
 
     def count(self, coll: str) -> int:
@@ -326,7 +376,7 @@ class NedbClient:
     def delete(self, coll: str, doc_id: str) -> dict:
         """``DELETE …/rows/{coll}/{id}`` → ``{ok, seq, head}``."""
         return self.request(
-            "DELETE", self._dbp(f"rows/{coll}/{doc_id}"))
+            "DELETE", self._dbp(f"rows/{_seg(coll)}/{_seg(doc_id)}"))
 
     def tx(self, ops: List[Dict[str, Any]], *,
            client: Optional[str] = None) -> dict:

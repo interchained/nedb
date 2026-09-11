@@ -1,9 +1,9 @@
 [package]
 name        = "nedb-engine"
-version     = "3.2.2"
+version     = "4.0.0"
 edition     = "2021"
 description = "NEDB v2 — content-addressed DAG storage engine with NQL and HTTP server (nedbd binary)"
-license     = "MIT"
+license     = "BUSL-1.1"
 repository  = "https://github.com/aiassistsecure/nedb"
 homepage    = "https://github.com/aiassistsecure/nedb"
 keywords    = ["database", "dag", "embedded", "time-travel", "graph"]

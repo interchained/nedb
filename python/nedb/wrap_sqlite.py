@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+# NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 """
 nedb.wrap_sqlite — wrap an existing SQLite database with NEDB's layer-2.
 
@@ -45,7 +49,8 @@ import json
 import sqlite3
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .wrap_core import WrapSurface, open_engine
+from .wrap_core import (ShadowCursor, WrapSurface, open_engine, target_table,
+                        write_op)
 
 
 # ── The .nedb surface for SQLite ─────────────────────────────────────────────
@@ -65,6 +70,44 @@ class SqliteSurface(WrapSurface):
         self._conn = conn
 
     # ── host hooks ───────────────────────────────────────────────────────────
+
+    def register(self, pattern: str, collection: str,              # type: ignore[override]
+                 id_extractor=None, value_parser=None, value_type: str = "string",
+                 pk: Optional[str] = None):
+        """register(table, collection) — `pk` accepted for symmetry with Postgres.
+
+        SQLite addresses rows by `rowid`, which every ordinary table has, so
+        the primary key is not needed to shadow a write. It is accepted so
+        automatic discovery can offer it uniformly across the SQL adapters.
+        """
+        return super().register(pattern, collection,
+                                id_extractor, value_parser, value_type)
+
+    def _discover_tables(self):
+        """Every ordinary table in the database, with its declared PK.
+
+        Read from `sqlite_master`, so turning shadowing on covers the whole
+        database without the caller naming a single table. Internal
+        `sqlite_*` tables and views are skipped: a view is not writable, so
+        mirroring one would only ever produce an empty mapping.
+        """
+        try:
+            names = [r[0] for r in self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        except sqlite3.Error:
+            return
+        for table in names:
+            pk = None
+            try:
+                for r in self._conn.execute(f'PRAGMA table_info("{table}")'):
+                    # (cid, name, type, notnull, dflt_value, pk)
+                    if r[5]:
+                        pk = r[1]
+                        break
+            except sqlite3.Error:
+                pass
+            yield table, pk
 
     def _host_scan(self, mapping, batch_size: int):
         """Yield (rowid, row_dict) for every row of the mapped table."""
@@ -150,6 +193,10 @@ class WrappedSqlite:
 
         if name == "execute":
             return self._execute
+        if name == "executemany":
+            return self._executemany
+        if name == "cursor":
+            return self._cursor
         if not callable(attr):
             return attr
 
@@ -157,8 +204,73 @@ class WrappedSqlite:
             return attr(*a, **kw)
         return _passthrough
 
+    # ── the cursor path ─────────────────────────────────────────────────────
+    #
+    # `conn.cursor().execute(...)` is the canonical DB-API idiom — and it used
+    # to bypass shadowing completely, because only `conn.execute` was
+    # intercepted. The host got the row, NEDB did not, and nothing said so.
+    # Every path a write can take has to go through the same door.
+
+    def _cursor(self, *a, **kw):
+        conn = object.__getattribute__(self, "_conn")
+        return ShadowCursor(conn.cursor(*a, **kw), self._cursor_execute)
+
+    def _cursor_execute(self, cur, proxy, sql, params, a, kw):
+        """`ShadowCursor.execute` → run on the real cursor, then shadow."""
+        nedb = object.__getattribute__(self, "nedb")
+        params = () if params is None else params
+        pre_rowids, shadowing = self._before_write(nedb, sql, params)
+        result = cur.execute(sql, params, *a, **kw)
+        self._after_write(nedb, sql, cur, pre_rowids, shadowing)
+        # sqlite3 returns the cursor itself; hand back the PROXY so a chained
+        # `.execute(...).fetchone()` still goes through the shadow layer.
+        return proxy if result is cur else result
+
+    def _before_write(self, nedb, sql: str, params):
+        """Resolve affected rowids before the statement runs, if needed."""
+        head = sql.lstrip().upper()
+        shadowing = head.startswith(self._WRITE_PREFIXES) and nedb.shadow_writes
+        if not shadowing:
+            # A write to a table nobody is mirroring is a visible gap, not a
+            # silent one — but only while shadowing is meant to be on.
+            if nedb.shadow_writes and write_op(sql) and \
+                    nedb.mapping_for_table(target_table(sql)) is None:
+                nedb.note_unmirrored(target_table(sql))
+            return None, False
+        if nedb.mapping_for_table(target_table(sql)) is None:
+            nedb.note_unmirrored(target_table(sql))
+            return None, False
+        if head.startswith("INSERT"):
+            return None, True
+        try:
+            return self._affected_rowids(nedb, sql, params), True
+        except Exception as e:
+            nedb.note_shadow_error(e)
+            return None, True
+
+    def _after_write(self, nedb, sql: str, cur, pre_rowids, shadowing) -> None:
+        if not shadowing:
+            return
+        try:
+            self._shadow_sql(nedb, sql, cur, pre_rowids)
+        except Exception as e:
+            # Must never break the host call — but must never be invisible
+            # either. Counted on nedb.shadow_errors, reported through
+            # nedb.on_shadow_error, and re-raised when strict_shadow is set.
+            nedb.note_shadow_error(e)
+
+    def _executemany(self, sql: str, seq_of_params):
+        last = None
+        for params in seq_of_params:
+            last = self._execute(sql, params)
+        return last
+
     def _execute(self, sql: str, params: tuple = ()):
-        """execute() with post-write shadowing of registered-table writes.
+        """`conn.execute()` — the sqlite3 convenience path.
+
+        Shares `_before_write`/`_after_write` with the cursor path, so the two
+        cannot drift: the reason the cursor path was broken for so long is that
+        it was a SEPARATE path with no shadowing at all.
 
         UPDATE and DELETE need the affected rowids captured BEFORE the
         statement runs -- see _affected_rowids for why cursor.lastrowid
@@ -166,28 +278,9 @@ class WrappedSqlite:
         """
         conn = object.__getattribute__(self, "_conn")
         nedb = object.__getattribute__(self, "nedb")
-
-        head = sql.lstrip().upper()
-        shadowing = head.startswith(self._WRITE_PREFIXES) and nedb.shadow_writes
-
-        pre_rowids = None
-        if shadowing and not head.startswith("INSERT"):
-            try:
-                pre_rowids = self._affected_rowids(nedb, sql, params)
-            except Exception as e:
-                nedb.note_shadow_error(e)
-                pre_rowids = None
-
+        pre_rowids, shadowing = self._before_write(nedb, sql, params)
         cur = conn.execute(sql, params)
-
-        try:
-            if shadowing:
-                self._shadow_sql(nedb, sql, cur, pre_rowids)
-        except Exception as e:
-            # Must never break the host call — but must never be invisible
-            # either. Counted on nedb.shadow_errors, reported through
-            # nedb.on_shadow_error, and re-raised when strict_shadow is set.
-            nedb.note_shadow_error(e)
+        self._after_write(nedb, sql, cur, pre_rowids, shadowing)
         return cur
 
     def _affected_rowids(self, nedb, sql: str, params: tuple):
@@ -236,10 +329,18 @@ class WrappedSqlite:
 
     @staticmethod
     def _mapping_for_sql(nedb, sql: str):
-        for m in nedb._mappings:
-            if m.pattern.lower() in sql.lower():
-                return m
-        return None
+        """The mapping for the table this statement WRITES TO.
+
+        Was: "does any registered table name appear anywhere in this SQL?" —
+        a substring test. With one table registered that mostly worked. With
+        every table registered, which is what automatic discovery does, a
+        write to `drivers_archive` matched the mapping for `drivers` and was
+        shadowed into the wrong collection under the wrong row's id.
+        FALSE PROVENANCE: a record that looks authoritative and describes
+        something that never happened. The target is now parsed out of the
+        statement.
+        """
+        return nedb.mapping_for_table(target_table(sql))
 
     def _shadow_sql(self, nedb: SqliteSurface, sql: str, cur: sqlite3.Cursor,
                     pre_rowids=None) -> None:

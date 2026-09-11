@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+// NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 //! NEDB v3 integration tests — Db-level behavior of the segment substrate.
 //!
 //! These exercise the public `Db` API end to end: v3 write/read/reopen,
@@ -28,6 +32,57 @@ fn put_one(db: &Db, coll: &str, id: &str, v: &str) {
 fn value(db: &Db, coll: &str, id: &str) -> Option<String> {
     db.get(coll, id)
         .and_then(|n| n.data.get("v").and_then(|x| x.as_str().map(|s| s.to_string())))
+}
+
+/// Compaction prunes history — and must degrade gracefully, not lie.
+///
+/// `compact()` deliberately keeps only CURRENT versions, so it drops every
+/// superseded version and every tombstone. That is the documented trade: an
+/// operator explicitly exchanges the audit trail for disk space, and nothing
+/// invokes it automatically.
+///
+/// The requirement is therefore not that history survives — the operator asked
+/// for it to go. It is that afterwards a graveyard entry pointing at a pruned
+/// tombstone reads as ABSENT rather than erroring, panicking, or resurrecting a
+/// stale value. A dangling pointer that produces a confident wrong answer would
+/// be far worse than one that produces nothing.
+///
+/// Lives here rather than in a `#[cfg(test)]` unit test because it needs
+/// `NEDB_DAG_V3`, and `set_var` is process-global while cargo runs lib tests in
+/// parallel threads — setting it there leaked into an unrelated test and broke
+/// it, which is its own small lesson.
+#[test]
+fn compaction_prunes_history_and_degrades_gracefully() {
+    std::env::set_var("NEDB_DAG_V3", "1");
+    let tmp = std::env::temp_dir().join(format!("nedb_compact_hist_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let db = Db::open(&tmp, None).unwrap();
+
+    put_one(&db, "o", "a", "first");
+    put_one(&db, "o", "live", "stays");
+    let v1_seq = db.get("o", "a").expect("just written").seq;
+    assert!(db.delete("o", "a").unwrap());
+
+    // Reachable BEFORE compaction — a delete is a tombstone, not an erasure.
+    assert_eq!(
+        db.get_as_of("o", "a", v1_seq).map(|n| n.data["v"].clone()),
+        Some(json!("first")),
+        "a deleted document's history must be readable before compaction",
+    );
+
+    db.compact().expect("compact");
+
+    // AFTER: absent, not wrong.
+    assert!(db.get_as_of("o", "a", v1_seq).is_none(),
+            "a pruned version must read as absent, never as a stale value");
+    assert!(db.get("o", "a").is_none(), "and it is still deleted");
+    assert_eq!(value(&db, "o", "live").as_deref(), Some("stays"),
+               "the living are untouched by compaction");
+
+    let (_ok, bad) = db.verify();
+    assert!(bad.is_empty(), "verify stays clean after compaction: {:?}", bad);
+
+    let _ = fs::remove_dir_all(&tmp);
 }
 
 #[test]

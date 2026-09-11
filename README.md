@@ -13,16 +13,254 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 [![CI](https://img.shields.io/github/actions/workflow/status/Eth-Interchained/nedb/release.yml?label=CI&color=34d399)](https://github.com/Eth-Interchained/nedb/actions)
 [![nedb-engine-client PyPI](https://img.shields.io/pypi/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://pypi.org/project/nedb-engine-client/)
 [![nedb-engine-client npm](https://img.shields.io/npm/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://www.npmjs.com/package/nedb-engine-client)
-[![License: MIT](https://img.shields.io/badge/license-MIT-22c55e?logo=opensourceinitiative&logoColor=white)](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE)
+[![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-f59e0b)](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE) [![Free under $1M revenue](https://img.shields.io/badge/free%20under%20%241M%20revenue-22c55e)](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE)
 
 **[Studio → studio.interchained.org](https://studio.interchained.org)**  ·  **[nedb.aiassist.net](https://nedb.aiassist.net)**
 
-> ## 🟢 MIT Licensed — free for any use, including commercial & production
-> NEDB is licensed under the **MIT License** — use it in production, embed it in commercial
-> products, ship it in closed-source software, fork it, sell it. No restrictions, no royalties,
-> no copyleft. See [`LICENSE`](LICENSE). The database is free; the moat is what you build on it.
+> ## 🟢 Free in production under $1M revenue
+> NEDB 4.0.0 is licensed under the **Business Source License 1.1**. If your organisation's annual
+> revenue is **under USD $1,000,000**, you may use it in production — commercially, embedded, in
+> closed-source software — with **no permission needed and no royalty**. At **$1M or more**, you
+> need an additional use grant from Interchained LLC: **licensing@interchained.org**.
+>
+> Non-production use is unrestricted for everyone, at any revenue: development, testing, CI,
+> evaluation, research, teaching. On **2030-09-11** this version converts to **Apache 2.0**
+> automatically and permanently. See [`LICENSE`](LICENSE).
 
 </div>
+
+---
+
+## New in 3.3.0 — the query language grew up
+
+`WHERE` was six operators wide (`= != > < >= <=`) joined by an implicit `AND`.
+It now takes a full boolean expression, in **both** engines, and the clauses
+around it run in SQL's order.
+
+```sql
+FROM jobs
+WHERE (status IN ("open", "pending") OR fee > 100)
+  AND miner IS NOT NULL
+  AND NOT (region LIKE "eu-%")
+GROUP BY region SUM fee
+HAVING sum_fee > 10000
+ORDER BY sum_fee DESC
+LIMIT 20 OFFSET 40
+```
+
+| added | |
+| --- | --- |
+| `IN (…)` / `NOT IN (…)` | set membership |
+| `BETWEEN a AND b` / `NOT BETWEEN` | inclusive both ends, as in SQL |
+| `LIKE` / `NOT LIKE` / `ILIKE` | `%` any run, `_` any one char |
+| `IS NULL` / `IS NOT NULL` | matches absent **and** explicitly-null |
+| `AND` / `OR` / `NOT` / `(…)` | `AND` binds tighter; parens nest to any depth |
+| `OFFSET n` | pagination; pairs with `LIMIT` |
+| `ORDER BY a, b DESC` | multi-key, per-key direction |
+| `HAVING <predicate>` | filters the aggregated rows |
+| `COUNT` / `SUM f` / `AVG f` / `MIN f` / `MAX f` | whole-result aggregate, one row |
+
+**Indexed range scans.** `=`, `IN`, `BETWEEN` and the inequalities are served
+from a sorted index when one covers the field — a point lookup on 20,000 rows
+goes from 137 ms to 0.01 ms, a 1%-selective `BETWEEN` from 186 ms to 1.1 ms.
+See [**Indexes**](#indexes) for the measured table and the three cases that
+deliberately decline the index.
+
+**Nine silent defects fixed.** None of them crashed; they all returned a
+confident wrong answer with HTTP 200. The worst:
+
+- `GROUP BY status MAX fee` aggregated the *group* field, not the target —
+  answering `1.0` where the real maxima were 40 and 30.
+- `LIMIT 2 GROUP BY status COUNT` truncated the aggregate's **input**, so
+  twelve rows across three statuses reported counts summing to 2.
+- `ORDER BY count DESC` on grouped rows sorted the raw documents on a field
+  that only exists after grouping — silently inert.
+- `FROM jobs OFFSET 2` and a misspelled `ORDRE BY fee` were silently **dropped**
+  and a different query answered. Unknown clauses are now a parse error.
+- `SUM` ran through `f64`, losing integer precision above 2^53 — a real problem
+  for satoshi amounts and block heights. Integer inputs now stay in `i64`.
+- An ordering comparison against a missing field was true in the Rust engine
+  (`WHERE fee < 5` returned rows with no `fee` at all) and false in the Python
+  reference. Now false in both, matching SQL.
+- A field named like a keyword (`count`, `min`, `value`, `status`) was
+  unaddressable, because both lexers canonicalised case at field positions.
+
+**Compatibility.** Verified by building a `nedbd` from the released v3.2.2 tag
+and diffing every answer: **40 of 45 legacy queries byte-identical, zero
+regressions.** The differences are the three bug fixes above, each documented
+in `tests/test_backcompat.py`. `scripts/compare_engine_answers.py` reproduces
+the comparison against any released binary.
+
+**The DAG is untouched.** `tests/test_dag_preserved.py` runs the entire new
+query surface against a live chain and asserts head, seq and `verify()` are
+unchanged afterwards — and that `verify()` still returns *false* when the log
+is tampered with. Reads are reads.
+
+**Cross-engine parity is now gated.** Nothing previously checked that the
+Python reference and the Rust core agreed, which is how they had drifted apart
+in five places. Two suites now run the same battery through both and assert
+identical answers.
+
+---
+
+## Postgres wire protocol — run your SQL, get history for free
+
+`nedbd --pg-port 5433` opens a **PostgreSQL wire-protocol endpoint** — reads
+*and* writes. `psql`, DBeaver, Metabase, Grafana, psycopg — anything that
+speaks pgwire can use a tamper-evident NEDB store with ordinary SQL, with no
+bespoke client.
+
+**The reason the write path matters** is that SQL's write semantics and NEDB's
+append-only model already line up:
+
+| SQL | NEDB | and therefore |
+| --- | --- | --- |
+| `INSERT` | a put | — |
+| `UPDATE … WHERE` | a **new version** of each match | the prior value stays readable |
+| `DELETE … WHERE` | a **tombstone** | the deleted row stays in history |
+
+So this is not a compromise of the append-only design — it *is* the design,
+reached through a protocol every tool already speaks:
+
+```sql
+UPDATE orders SET total = 999 WHERE _id = 'o1';
+SELECT total FROM orders WHERE _id = 'o1';                       -- 999
+SELECT total FROM orders AS OF SYSTEM TIME 0 WHERE _id = 'o1';   -- 120
+```
+
+Run the SQL you would run against Postgres, and the tamper-evident audit trail
+is free. No triggers, no shadow table, no application code. `verify()` still
+passes afterwards, because a SQL write is an ordinary engine write and not a
+side door around the hash chain.
+
+Writes are **on by default**. `NEDBD_PG_READ_ONLY=1` gives the deployment where
+this door must never mutate anything.
+
+```console
+$ nedbd --data ./data --pg-port 5433
+  pgwire   postgres endpoint on 127.0.0.1:5433 — psql / DBeaver / psycopg (SELECT + INSERT/UPDATE/DELETE)
+
+$ psql -h 127.0.0.1 -p 5433 -d shop
+shop=> SELECT status, total FROM orders WHERE status IN ('paid','open') ORDER BY total DESC;
+ status | total
+--------+-------
+ paid   |   300
+ paid   |   120
+ open   |    40
+
+shop=> SELECT SUM(total) FROM orders WHERE region = 'eu';
+ sum
+-----
+ 420
+
+shop=> SELECT * FROM orders AS OF SYSTEM TIME 1;     -- time travel, in SQL
+```
+
+**`AS OF SYSTEM TIME` is the bridge worth knowing about.** It is the spelling
+Postgres and CockroachDB use, and here it reaches NEDB's permanent,
+never-garbage-collected history rather than a few hours of MVCC.[^compact] A wall-clock
+timestamp is refused with the reason: NEDB's history is sequence-addressed, so
+a seq is exact where a time would be approximate.
+
+[^compact]: One caveat, stated rather than buried. `Db::compact()` reclaims disk
+    space by rewriting the object segments with only each document's **current**
+    version — so it prunes superseded versions and tombstones, and `AS OF` can
+    no longer reach them. Nothing invokes it automatically: it is not on the
+    HTTP surface, not in the CLI, and not on any timer. It exists for the
+    operator who has explicitly chosen to trade the audit trail for space. A
+    compacted store answers "not available at that sequence" rather than
+    returning a stale value, and `verify()` stays clean.
+
+Provenance is selectable like any other column:
+
+```sql
+SELECT _id, _hash, _seq FROM audit ORDER BY _seq;
+```
+
+**This is not "NEDB speaks SQL", and the endpoint is careful to say so.** It is
+a documented subset of `SELECT` translated to NQL:
+
+| Supported | Refused, with the reason |
+| --- | --- |
+| `*`, a column list, `COUNT(*)`, `SUM`/`AVG`/`MIN`/`MAX(col)` | `JOIN` — NQL is single-collection |
+| `WHERE` — the whole NQL predicate surface | subqueries, `UNION`, window functions |
+| `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET` | expressions in the select list |
+| `AS OF SYSTEM TIME <seq>` | DDL, `TRUNCATE`, `GRANT`/`REVOKE` |
+| `INSERT` / `UPDATE` / `DELETE`, all with `RETURNING` | an `INSERT` with no column list |
+| `_caused_by` / `_valid_from` / `_valid_to` as INSERT columns | values that are expressions, not literals |
+
+Every refusal names the boundary instead of saying "syntax error", and a
+grouped query that projects a column SQL would reject gets Postgres's own
+message rather than a silent `NULL`.
+
+**Provenance is settable from SQL**, so the causal chain does not require the
+HTTP API:
+
+```sql
+INSERT INTO audit (_id, _caused_by, kind) VALUES ('leaf', '<parent-hash>', 'reprice');
+SELECT _id FROM audit TRACE caused_by;
+```
+
+An `INSERT` requires an explicit column list, because NEDB is schemaless and
+there is no declared column order to infer. Values must be literals — a number,
+a quoted string, `TRUE`/`FALSE`/`NULL` — since storing an unevaluated
+expression as text would be worse than refusing it.
+
+### Your driver, not just `psql`
+
+**Both wire protocols are implemented**, which is the difference between "psql
+works" and "your application framework works":
+
+| Protocol | Used by | Status |
+| --- | --- | --- |
+| simple (`Q`) | `psql`, libpq/`PQexec`, **psycopg2** | ✅ |
+| extended (`Parse`/`Bind`/`Describe`/`Execute`) | **psycopg3**, **asyncpg**, **JDBC** | ✅ |
+
+Those last three send `Parse`/`Bind` for every parameterised statement, so
+until the extended protocol landed they could not run a *single* query — not
+slower, not degraded: psycopg3 hung and asyncpg refused outright.
+
+```python
+# psycopg3 — parameters are bound server-side
+cur.execute("SELECT _id, total FROM orders WHERE status = %s AND total > %s",
+            ("paid", 100))
+
+# asyncpg — same statement, same endpoint
+await conn.fetch("SELECT _id, total FROM orders WHERE status = $1 AND total > $2",
+                 "paid", 100)
+```
+
+Parameters arrive in text **and binary** format (psycopg3 sends a small `int`
+as binary int2, a float as binary float8), and a row-capped `Execute` suspends
+its portal, so a JDBC `setFetchSize` pages a large result instead of stalling.
+
+**Typing parameters in a store with no schema** is the interesting part. A
+relational server reads `$1`'s type out of its catalogue; NEDB has no
+catalogue, so the type is sampled from the documents already stored — the
+stored data *is* the schema. Where a placeholder sits in a clause rather than
+beside a column (`AS OF SYSTEM TIME $1`, `LIMIT $1`) the grammar supplies the
+type, and an aggregate is typed from what it means: a `COUNT` is an integer, an
+`AVG` fractional, a `MAX` whatever the field it ranges over is.
+
+A driver that declares its own parameter types is believed, and only its
+unspecified slots are inferred.
+
+### Limits, stated plainly
+
+SQL-level cursors (`DECLARE`/`FETCH`) and `pg_catalog` introspection are not
+implemented, so `\dt` and DBeaver's schema browser come back empty — both are
+refused by name rather than hanging. A column whose stored values disagree
+about their type across documents is advertised as `text`, and cannot be sent
+in binary format.
+
+And the connection is **cleartext**, which is why the endpoint is off unless
+you pass `--pg-port` and binds to loopback by default. Put it behind a tunnel
+to go further.
+
+Verified in CI by `tests/test_pgwire.py` — **64 checks driven through psycopg2,
+which is libpq**. Unit tests can prove the translation; only a real client
+proves the protocol. One of those checks is the one that matters: after a plain
+SQL `UPDATE`, the prior value is still readable at its original sequence.
 
 ---
 
@@ -31,40 +269,95 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 NEDB adds **tamper-evident causal provenance to a database you already have**, in one line, without
 rip-and-replace. Five adapters, one surface:
 
+**One flag. No table list, no registration, no per-write calls.**
+
 ```python
-from nedb import wrap_redis, wrap_sqlite, wrap_mysql, wrap_mongo, wrap_postgresql
+from nedb import wrap_postgresql
+import psycopg2
 
-r = wrap_redis(redis.Redis())        # or wrap_sqlite(sqlite3.connect("app.db")), ...
-r.nedb.register("driver:*", "driver")   # teach NEDB the host's shape
-r.nedb.backfill()                       # import what is already there
-r.nedb.shadow_writes = True             # every future write is chained
+conn = wrap_postgresql(psycopg2.connect("dbname=app"), db_name="app")
+conn.nedb.shadow_writes = True          # ← that is the whole setup
 
-r.set("driver:d1", json.dumps({"name": "Bob", "status": "active"}))
+# Your app runs UNCHANGED.
+cur = conn.cursor()
+cur.execute("INSERT INTO drivers (name, status) VALUES (%s, %s)", ("Bob", "active"))
+cur.execute("UPDATE drivers SET status = %s WHERE name = %s", ("off", "Bob"))
+conn.commit()
 
-r.nedb.query('FROM driver WHERE status = "active"')   # NQL over your Redis data
-r.nedb.query('FROM driver AS OF 41')                  # what it looked like at seq 41
-r.nedb.verify()                                       # True — BLAKE2b chain intact
+conn.nedb.query('FROM drivers WHERE status = "off"')   # NQL over your Postgres data
+conn.nedb.query('FROM drivers AS OF 0')                # → status "active", the prior value
+conn.nedb.verify()                                     # True — BLAKE2b chain intact
 ```
+
+Setting the flag reads the host's own catalogue and mirrors **every table**, with its
+real primary key. Coverage is **opt-out**, because opt-in auditing has a worse failure
+mode than none: three tables registered out of twelve looks exactly like a complete
+audit trail until the day you need it.
+
+```python
+conn.nedb.exclude = {"sessions", "audit_log_*"}        # tables to leave alone
+conn.nedb.exclude_columns = {"password_hash", "ssn"}   # columns that must NEVER be mirrored
+assert not conn.nedb.unmirrored_tables                 # a real check, not a hope
+```
+
+`exclude_columns` is the one setting that is about correctness rather than convenience.
+**NEDB cannot forget** — that is the product, and it is exactly wrong for a secret or for
+a row somebody has a right to erase. Nothing is excluded by default; guessing which of
+your columns are sensitive would be its own silent wrong answer.
 
 | wrapper | host | shadowing |
 |---|---|---|
-| `wrap_redis` | `redis.Redis` / compatible | automatic — every write command intercepted |
-| `wrap_sqlite` | `sqlite3.Connection` | automatic — `execute()` intercepted post-write |
+| `wrap_redis` | `redis.Redis` / compatible | **automatic** — every write command intercepted |
+| `wrap_sqlite` | `sqlite3.Connection` | **automatic** — `conn.execute`, `cursor.execute`, `executemany` |
+| `wrap_postgresql` | DB-API 2.0 (psycopg2, psycopg 3) | **automatic** — every cursor write, via `RETURNING` |
 | `wrap_mysql` | DB-API 2.0 (mysql-connector, PyMySQL) | explicit `shadow_row()` |
 | `wrap_mongo` | `pymongo.MongoClient` | explicit `shadow_row()` |
-| `wrap_postgresql` | DB-API 2.0 (psycopg2, psycopg 3) | explicit `shadow_row()` |
 
 **NEDB never writes into the host database's namespace.** Shadow data lives only in the NEDB engine.
+
+### The limit, stated plainly
+
+Interception sees writes made **through this connection**. Your production Postgres is
+also written by `psql`, cron jobs, migration tools, and other services — and none of
+those pass through here. For whole-database coverage independent of the client, the right
+mechanism is Postgres **logical replication** (a replication slot decoded with the
+built-in `pgoutput`), which observes every committed change whatever made it. That needs
+`wal_level = logical` and a replication role, and it is not implemented yet.
+
+So this covers your application's writes completely, and it does not pretend to cover
+writes it cannot see. A write to a table that could not be mirrored lands in
+`nedb.unmirrored_tables` rather than vanishing.
 
 Three backends behind the same surface, selected by `backend="auto"`: **nedbd over HTTP** (`nedbd_url=`),
 **embedded v2/v3 DAG** (the Rust core, in-process, no server — `dag_path=` for a durable store,
 `dag_tmk=` for AES-256-GCM at rest), or the **v1 in-process AOF** engine as a universal fallback. On the
 DAG backend you also get `tip()`, `tip_collection()`, `since()` (changefeed) and `scan_status()`.
 
-### 🟢 MIT licensed since 3.0.0
+### Licensing — BUSL-1.1 as of 4.0.0
 
-No production restriction, no copyleft, no Change Date. Use it in production, embed it commercially,
-ship it closed-source, fork it, sell it. License review is a wall, not a speed bump — that wall is gone.
+| Your annual revenue | Production use |
+|---|---|
+| **under USD $1,000,000** | **free.** No permission, no royalty, no registration. Commercial, embedded and closed-source all included. |
+| **USD $1,000,000 or more** | needs an additional use grant — **licensing@interchained.org** |
+
+Measured on your whole organisation, not on revenue attributable to NEDB. Non-production use —
+development, testing, CI, evaluation, research, teaching — is unrestricted for **everyone**, at any
+revenue. Offering NEDB itself as a hosted database service needs a separate commercial license
+regardless of revenue.
+
+**Change Date 2030-09-11**: this version becomes **Apache 2.0** on that date, automatically. The
+grant is in the license text, not a promise — nobody has to be asked, and it cannot be withdrawn.
+The full Apache text ships as [`COPYING-APACHE-2.0.txt`](COPYING-APACHE-2.0.txt) so that is
+verifiable from the source tree alone.
+
+Every source file carries `SPDX-License-Identifier: BUSL-1.1`, so license scanners read the terms
+out of the code rather than guessing. Dependencies keep their own licenses — the Change License
+never relicenses them — and they are inventoried in [`THIRD_PARTY.md`](THIRD_PARTY.md). There is
+**no GPL, AGPL, SSPL or BUSL third-party dependency** in the tree; all 206 third-party crates are
+permissive, and the two Python runtime dependencies are BSD and Apache.
+
+**Versions 3.0.0 – 3.3.1 stay MIT, irrevocably.** If you already have NEDB at 3.3.1 or earlier, your
+rights in that copy are untouched. This applies to 4.0.0 and later only.
 
 ### Also in 3.2.0
 
@@ -270,6 +563,12 @@ db.put("users", "bob",   {"name": "Bob",   "age": 24, "status": "active", "bio":
 db.query('FROM users WHERE status = "active" ORDER BY age ASC')
 db.query('FROM users SEARCH "rust"')
 db.query('FROM users GROUP BY status COUNT')
+
+# Full boolean predicates — IN, BETWEEN, LIKE, IS NULL, OR, NOT, parentheses
+db.query('FROM users WHERE status IN ("active", "trialing")')
+db.query('FROM users WHERE age BETWEEN 25 AND 40')
+db.query('FROM users WHERE bio LIKE "%rust%" AND NOT (status = "retired")')
+db.query('FROM users WHERE (age < 25 OR age > 60) AND bio IS NOT NULL')
 
 # Time-travel — AS OF any past sequence
 snap = db.seq
@@ -495,13 +794,185 @@ redis-cli -p 6380 SELECT shop EVAL 'FROM beliefs TRACE caused_by' 0
 FROM <collection>
   [ AS OF <seq> ]                            transaction time (when was it written?)
   [ VALID AS OF "<date>" ]                   valid time (when was it true in the world?)
-  [ WHERE <field> <op> <value> (AND ...) ]   op: = != < <= > >=
+  [ WHERE <predicate> ]                      full boolean predicate, see below
   [ SEARCH "<text>" ]                        full-text search
-  [ ORDER BY <field> [ASC|DESC] ]
   [ TRAVERSE <relation> ]                    graph traversal
   [ TRACE caused_by [REVERSE] ]              causal provenance (why? / what did this cause?)
-  [ LIMIT <n> ]
   [ GROUP BY <field> [COUNT|SUM f|AVG f|MIN f|MAX f] ]
+  [ COUNT | SUM f | AVG f | MIN f | MAX f ]  whole-result aggregate, one row
+  [ HAVING <predicate> ]                     filters the AGGREGATED rows
+  [ ORDER BY <field> [ASC|DESC] (, ...) ]
+  [ LIMIT <n> ] [ OFFSET <n> ]
+```
+
+Clauses are evaluated in SQL's order, whatever order you write them in:
+
+```
+FROM → WHERE → GROUP BY → HAVING → ORDER BY → OFFSET → LIMIT
+```
+
+That matters, and before 3.3.0 it was wrong. `LIMIT` truncated the *input* to
+an aggregate rather than the result, so `LIMIT 5 GROUP BY status COUNT` over
+twelve rows reported counts summing to 5 — it said only five rows existed when
+twelve did. `ORDER BY` ran before grouping, so sorting on `count` or `sum_fee`
+silently did nothing. `VALID AS OF` was applied after `LIMIT` in the Python
+engine, so a limited bi-temporal query returned fewer valid rows than exist.
+
+### Predicates
+
+`WHERE` takes a full boolean expression. `AND` binds tighter than `OR`;
+parentheses override, and nest to any depth.
+
+```
+<predicate> := <or>
+<or>        := <and> [OR <and>]*
+<and>       := <not> [AND <not>]*
+<not>       := [NOT] <primary>
+<primary>   := "(" <predicate> ")" | <comparison>
+```
+
+| Comparison | Example |
+| --- | --- |
+| `= != < <= > >=` | `WHERE height > 600000` |
+| `IN (…)` / `NOT IN (…)` | `WHERE status IN ("open", "pending")` |
+| `BETWEEN a AND b` | `WHERE height BETWEEN 100 AND 200` — inclusive, as in SQL |
+| `NOT BETWEEN a AND b` | `WHERE fee NOT BETWEEN 10 AND 20` |
+| `LIKE` / `NOT LIKE` | `WHERE miner LIKE "Acme%"` — `%` any run, `_` any one char |
+| `ILIKE` | `WHERE miner ILIKE "acme%"` — case-insensitive |
+| `IS NULL` / `IS NOT NULL` | `WHERE miner IS NULL` — matches absent **and** explicitly-null |
+
+```python
+db.query('''FROM jobs
+            WHERE (status IN ("open", "pending") OR fee > 100)
+              AND miner IS NOT NULL
+              AND NOT (region LIKE "eu-%")
+            ORDER BY fee DESC LIMIT 20''')
+```
+
+Filterable metadata fields: `_id`, `_coll`, `_hash`, `_seq`.
+
+`_id = "x"` is an O(1) index lookup rather than a scan — but only when it is a
+genuine conjunct. Under an `OR` it cannot constrain the result set, so the
+planner correctly declines the fast path there.
+
+### Indexes
+
+`=`, `IN (...)`, `BETWEEN` and the one-sided inequalities are served from a
+sorted index when one covers the field, turning a full collection scan into a
+bounded range walk:
+
+```python
+db.create_index("blocks", "height", "sorted")
+db.query("FROM blocks WHERE height BETWEEN 600000 AND 600100")
+```
+
+Measured on 20,000 rows with `scripts/bench_index_range.py` — two identical
+databases, one indexed, one not:
+
+| Query | Scan | Indexed | Speedup |
+| --- | --- | --- | --- |
+| `WHERE fee = 10000` | 137 ms | 0.01 ms | 17,000× |
+| `WHERE fee IN (a, b, c)` | 185 ms | 0.02 ms | 9,700× |
+| `WHERE fee BETWEEN …` (1% of rows) | 186 ms | 1.1 ms | 170× |
+| `WHERE fee BETWEEN …` (10% of rows) | 188 ms | 13 ms | 14× |
+| unindexed field (control) | 188 ms | 187 ms | 1.0× |
+
+The planner asks the index how many rows each candidate range covers and takes
+the narrowest, so `WHERE region = "eu" AND height BETWEEN 600000 AND 600001`
+uses the height index rather than whichever field it saw first. Same-field
+bounds are merged, so `height > 100 AND height < 200` is one walk.
+
+An index is only ever used to NARROW candidates — the full predicate is
+re-evaluated on whatever comes back, so the answer never depends on whether an
+index exists. Three cases deliberately decline it:
+
+- **`IS NULL`.** A document whose field is absent is not in that field's
+  index, so an index scan would return the exact complement of the answer.
+- **Anything under `OR` or `NOT`.** A disjunct does not constrain the result
+  set; narrowing on one arm would silently drop the rows the other arm matched.
+- **`AS OF`.** The sorted index holds current versions only (a superseded hash
+  is dropped on overwrite), so it cannot answer a historical query.
+
+> **Predicates over NULL follow SQL's three-valued logic.** An ordering
+> comparison (`<` `<=` `>` `>=`, and therefore `BETWEEN`) against a missing or
+> null field is never true — `WHERE fee < 5` will not return a row that has no
+> `fee` at all. `LIKE` is false in *both* polarities, so a null row appears in
+> neither `LIKE` nor `NOT LIKE`. `=` and `!=` do operate on null, so
+> `WHERE fee = NULL` selects rows where the field is absent or null, and
+> `WHERE fee != 5` includes them. Use `IS NULL` / `IS NOT NULL` to test
+> presence explicitly.
+
+### Unknown clauses are errors
+
+A query containing a clause the engine does not implement is **rejected**, not
+silently reinterpreted. Before 3.3.0 the parser skipped tokens it did not
+recognise, so `FROM jobs OFFSET 2` returned un-offset rows with HTTP 200 and a
+misspelled `ORDRE BY fee` returned unsorted rows — the engine answered a
+*different query* than the one asked, and said nothing. Both now return
+HTTP 400 with the offending token.
+
+### Aggregates
+
+`SUM`/`AVG`/`MIN`/`MAX` take the field to aggregate; `COUNT` (the default when
+no aggregate is given) takes none.
+
+```python
+db.query('FROM items GROUP BY cat MAX price')
+# → [{"cat": "x", "count": 3, "max_price": 10.0, "value": 10.0}, …]
+```
+
+`count` is the group size. The aggregate only considers rows whose target field
+is numeric, so a group of 5 where 2 carry a numeric `price` reports `count: 5`
+and averages over 2. An aggregate with no numeric input is `null`, never `0`.
+The `value` key is a back-compatible alias for the aggregate result.
+
+Integer inputs give integer results — `SUM`/`MIN`/`MAX` stay in 64-bit
+integers rather than passing through a float, so a sum over satoshi amounts or
+block heights above 2^53 is exact. `AVG` is always fractional.
+
+Groups come back sorted by key unless you say otherwise, so results are stable
+run to run and identical across engines.
+
+Drop the `GROUP BY` for a whole-result aggregate, which returns exactly one row:
+
+```python
+db.query('FROM orders COUNT')                    # → [{"count": 1049, "value": 1049}]
+db.query('FROM orders WHERE status = "paid" COUNT')
+db.query('FROM orders SUM total')                # → [{"count": 1049, "sum_total": 88123, …}]
+```
+
+`COUNT` of an empty result is one row holding `0` — a caller asking "how many?"
+always gets a number. `SUM` of an empty result is `null`.
+
+### HAVING
+
+`WHERE` filters rows before they are grouped; `HAVING` filters the groups.
+
+```python
+db.query('FROM orders GROUP BY region SUM total HAVING sum_total > 10000')
+db.query('FROM orders GROUP BY region COUNT HAVING count BETWEEN 5 AND 50')
+```
+
+`HAVING` runs through the same evaluator as `WHERE`, so it gets the whole
+predicate surface — `IN`, `BETWEEN`, `LIKE`, `OR`, `NOT`, parentheses — rather
+than a poorer second copy.
+
+### Sorting and paging
+
+```python
+db.query('FROM orders ORDER BY region, total DESC')   # ties broken by the next key
+db.query('FROM orders ORDER BY total DESC LIMIT 20 OFFSET 40')
+```
+
+`OFFSET` skips rows of the result and pairs with `LIMIT` for pagination. An
+offset past the end is an empty page, not an error.
+
+A field whose name collides with a reserved word is still addressable — a
+document may legitimately have a `count`, `min`, `value` or `status` field, and
+`WHERE count > 3` reads that field rather than the aggregate:
+
+```python
+db.query('FROM metrics WHERE count > 3 ORDER BY count DESC')
 ```
 
 Combine both time axes:

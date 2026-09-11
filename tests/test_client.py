@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+# NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 """Official NedbClient — daemon-spawning proof suite.
 
 The client is an EXTRACTION of the two battle-tested hand-rolled clients
@@ -132,11 +136,27 @@ try:
     check("C4 bad NQL -> NedbBadRequest", False)
 except NedbBadRequest as e:
     check("C4 bad NQL -> NedbBadRequest", e.status == 400)
-try:
-    c.get_doc("users", 'u1" OR 1')
-    check("C4 quote-injection guarded", False)
-except NedbBadRequest:
-    check("C4 quote-injection guarded", True)
+# get_doc takes the id from the URL path (GET …/rows/<coll>/<id>), so nothing
+# is concatenated into a query and injection is impossible BY CONSTRUCTION.
+#
+# This used to assert that a quoted id RAISED, because get_doc interpolated the
+# id into `FROM coll WHERE _id = "..."` and refused anything unquotable. That
+# made legitimate ids unusable: put() accepts an id containing a quote, the
+# engine stores it, `FROM coll` returns it — and get_doc could not fetch it.
+# The stronger property is asserted instead: a crafted id can only ever name a
+# document, and a real one round-trips.
+check("C4 a crafted id cannot widen the result set",
+      c.get_doc("users", 'u1" OR 1') is None)
+c.put("users", 'quo"ted', {"v": "Q"})
+got_q = c.get_doc("users", 'quo"ted')
+check("C4 an id containing a quote round-trips",
+      got_q is not None and got_q.get("v") == "Q")
+c.put("users", "sl/ash", {"v": "S"})
+got_s = c.get_doc("users", "sl/ash")
+check("C4 an id containing a slash round-trips",
+      got_s is not None and got_s.get("v") == "S")
+check("C4 delete reaches a slashed id", c.delete("users", "sl/ash").get("ok") is True)
+check("C4 ...and it is gone", c.get_doc("users", "sl/ash") is None)
 
 # ── C5 tx / CAS ──────────────────────────────────────────────────────────────
 print("\n[C5] tx / CAS")

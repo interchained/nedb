@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+# NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 """
 Extract nedb/_native.* extension files from built wheels into native-ext/nedb/.
 Run from repo root.  Works on Linux, macOS, Windows (no unzip required).

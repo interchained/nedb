@@ -1,6 +1,6 @@
 {
   "name": "nedb-engine-client",
-  "version": "3.2.2",
+  "version": "4.0.0",
   "description": "TypeScript/JavaScript client for the nedbd HTTP API (nedb-engine)",
   "main": "dist/index.js",
   "module": "dist/index.esm.js",
@@ -20,7 +20,7 @@
   },
   "keywords": ["nedb", "nedb-engine", "client", "database", "dag", "bi-temporal", "causal", "nedbd"],
   "author": "Eth-Interchained",
-  "license": "MIT",
+  "license": "BUSL-1.1",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Eth-Interchained/nedb.git"

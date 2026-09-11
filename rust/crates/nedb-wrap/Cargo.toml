@@ -1,9 +1,9 @@
 [package]
 name        = "nedb-wrap"
-version     = "3.2.2"
+version     = "4.0.0"
 edition     = "2021"
 description = "NEDB wrap adapters — embed causal provenance into Redis/SQL/Mongo host connections (Rust). Surface trait over the nedb-engine DAG core."
-license     = "MIT"
+license     = "BUSL-1.1"
 repository  = "https://github.com/aiassistsecure/nedb"
 homepage    = "https://github.com/aiassistsecure/nedb"
 keywords    = ["database", "dag", "provenance", "wrapper", "adapter"]
@@ -11,7 +11,7 @@ categories  = ["database-implementations"]
 readme      = "README.md"
 
 [dependencies]
-nedb-engine = { path = "../../nedb-v2", version = "3.2.2" }
+nedb-engine = { path = "../../nedb-v2", version = "4.0.0" }
 serde_json = "1"
 anyhow = "1"
 # Optional host-protocol clients — each adapter ships behind a feature flag

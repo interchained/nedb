@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+// NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 //! napi-rs bindings: expose the v2 DAG Db to Node.js as the accelerated
 //! nedb-engine native addon. Built with @napi-rs/cli into prebuilt per-platform
 //! binaries and published to npm as `nedb-engine`.
@@ -5,7 +9,9 @@
 //! API surface mirrors the Python PyO3 binding (nedb-py) so the same engine
 //! contract holds across both runtimes.
 //!
-//! © INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)#![deny(clippy::all)]
+//! © INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)
+
+#![deny(clippy::all)]
 
 use std::sync::Arc;
 use napi::bindgen_prelude::*;

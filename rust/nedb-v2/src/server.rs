@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+// NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 //! nedbd v2 HTTP server — same /v1/databases/* API surface as v1.
 //! Drop-in replacement: Vision, itsl_mirror, all existing clients work unchanged.
 //!
@@ -622,6 +626,67 @@ async fn link_document(
     }
 }
 
+/// `GET /v1/databases/:name/rows/:coll/:id` — fetch one document by id.
+///
+/// This route existed only for DELETE, so a client could remove a row by id
+/// over HTTP but not READ one: it had to build `FROM coll WHERE _id = "..."`
+/// and interpolate the id into a NQL string. That made every id containing a
+/// double quote unreachable — `client.get()` returned None, meaning "no such
+/// document", for a document `put()` had stored and `FROM coll` returned — and
+/// an id ending in a backslash could not be escaped at all, because the lexer
+/// collapses `\"` and would swallow the closing quote.
+///
+/// Taking the id from the URL path removes the string-building entirely: the
+/// id arrives percent-decoded and byte-exact, with no quoting to get wrong and
+/// no injection surface.
+///
+/// Returns the same flat row shape a query returns (`nql::node_to_json`), so
+/// callers that previously used `rows[0]` from a query see no change.
+///
+/// `?as_of=N` resolves the version at or before sequence N, which is the
+/// single-document form of time travel and previously had no HTTP surface at
+/// all.
+///
+/// A missing row is `200 {"row": null}` rather than 404 — see the note in the
+/// body for why that ambiguity had to go.
+async fn get_document(
+    State(mgr): State<Manager>,
+    headers: HeaderMap,
+    AxPath((name, coll, id)): AxPath<(String, String, String)>,
+    AxQuery(q): AxQuery<GetRowQuery>,
+) -> Response {
+    if !mgr.check_auth(&headers) { return err(StatusCode::UNAUTHORIZED, "unauthorized"); }
+    let db = match mgr.get_db(&name).await {
+        None => return err(StatusCode::NOT_FOUND, &format!("database not found: {}", name)),
+        Some(db) => db,
+    };
+    let node = match q.as_of {
+        Some(seq) => db.get_as_of(&coll, &id, seq),
+        None      => db.get(&coll, &id),
+    };
+    // A MISSING ROW IS 200 WITH `row: null`, NOT 404.
+    //
+    // Deliberate, and it costs a little REST idiom to buy an unambiguous
+    // client. A client must work against two server implementations (this one
+    // and the Python AOF server) across several versions, and a server that
+    // does not have this route at all also answers 404 — so a 404 here would
+    // be indistinguishable from "route unavailable" and the client could not
+    // tell "the row is absent" from "fall back to the query path". With this
+    // shape: 200 means the route answered (row present or null), and any
+    // 404/405 means the route is not there.
+    let (seq, head) = db_seq_head(&db);
+    let row = match node {
+        None => Value::Null,
+        Some(n) => crate::nql::node_to_json(&n),
+    };
+    ok(json!({"row": row, "seq": seq, "head": head}))
+}
+
+#[derive(Deserialize, Default)]
+struct GetRowQuery {
+    as_of: Option<u64>,
+}
+
 async fn delete_document(
     State(mgr): State<Manager>,
     headers: HeaderMap,
@@ -1017,7 +1082,10 @@ pub fn router(mgr: Manager) -> Router {
         .route("/v1/databases/:name/cast",                       post(cast_prompt))
         .route("/v1/databases/:name/put",                        post(put_document))
         .route("/v1/databases/:name/link",                       post(link_document))
-        .route("/v1/databases/:name/rows/:coll/:id",             delete(delete_document))
+        // GET was missing here: a row could be DELETEd by id over HTTP but not
+        // READ by id, forcing clients to interpolate the id into a NQL string.
+        .route("/v1/databases/:name/rows/:coll/:id",
+               get(get_document).delete(delete_document))
         .route("/v1/databases/:name/batch",                      post(batch_operations))
         .route("/v1/databases/:name/index",                      post(create_index))
         .route("/v1/databases/:name/verify",                     get(verify_database))
@@ -1033,6 +1101,30 @@ pub fn router(mgr: Manager) -> Router {
 }
 
 /// Start the nedbd v2 server.
+/// Lets the Postgres read endpoint share this process's already-open databases
+/// instead of opening its own handles — which the exclusive data-dir LOCK would
+/// refuse anyway, and rightly so.
+impl crate::pgwire::DbResolver for Manager {
+    fn resolve(&self, name: &str) -> Option<Arc<Db>> {
+        // A blocking read on the manager map from the pgwire task. The lock is
+        // only held across a HashMap lookup, never across I/O.
+        let inner = self.inner.blocking_read();
+        // An empty database name means the client did not send one; serve the
+        // only database when that is unambiguous, which is the common case for
+        // `psql -h host` against a single-database store.
+        if name.is_empty() {
+            if inner.dbs.len() == 1 {
+                return inner.dbs.values().next().cloned();
+            }
+            return None;
+        }
+        inner.dbs.get(name).cloned()
+    }
+    fn token(&self) -> Option<String> {
+        self.token.clone()
+    }
+}
+
 pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, token: Option<String>, memory_mode: bool) -> anyhow::Result<()> {
     // `mut` is required by the cast block below, which assigns mgr.caster. With
     // the feature off nothing mutates it, so an unconditional `mut` warns on
@@ -1071,6 +1163,25 @@ pub async fn run(host: &str, port: u16, data_dir: &str, tmk: Option<[u8; 32]>, t
 
     let has_token = mgr.token.is_some();
     let mgr_for_shutdown = mgr.clone();
+    // ── Postgres read endpoint ────────────────────────────────────────────────
+    // Opt-in: nothing binds unless NEDBD_PG_PORT is set (or --pg-port passed).
+    // Default-off is deliberate — a second listener is a second attack surface,
+    // and it speaks cleartext, so the operator asks for it explicitly.
+    if let Ok(raw) = std::env::var("NEDBD_PG_PORT") {
+        match raw.trim().parse::<u16>() {
+            Ok(pg_port) if pg_port > 0 => {
+                let pg_host = host.to_string();
+                let resolver: Arc<dyn crate::pgwire::DbResolver> = Arc::new(mgr.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = crate::pgwire::run(&pg_host, pg_port, resolver).await {
+                        eprintln!("  [pgwire] listener stopped: {}", e);
+                    }
+                });
+            }
+            _ => eprintln!("  [pgwire] ignoring NEDBD_PG_PORT={:?} — not a valid port", raw),
+        }
+    }
+
     let app = router(mgr);
     let addr = format!("{}:{}", host, port).parse::<std::net::SocketAddr>()?;
     let banner = format!(r#"

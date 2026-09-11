@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+// NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 //! PyO3 bindings: expose the v2 DAG Db to Python as the accelerated `nedb._native`.
 //! Built into a wheel with maturin. The pure-Python package is the always-works fallback.
 //!

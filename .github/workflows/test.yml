@@ -15,7 +15,8 @@ name: test
 #   rust         cargo test on the engine + cargo check on both binding crates
 #   node         napi addon build, then smoke + durability + wrap family
 #   python-native  maturin wheel, then the suites that need `nedb._native`
-#   python-daemon  nedbd binary on PATH, then the suites that self-spawn it
+#   clients        the PUBLISHED PyPI + npm client packages, vs a live server
+#   python-daemon  nedbd binary on PATH + the Postgres read endpoint via libpq
 #
 # Deliberately NOT a release gate: this runs the same suites the release
 # workflow runs (and more), but on every push, so a red master is visible
@@ -62,16 +63,31 @@ jobs:
       - name: Install optional extras the suites exercise
         # pycryptodome: encryption-at-rest (test_crypto).
         # fakeredis: lets test_wrap_redis run for real instead of self-skipping.
-        run: pip install pycryptodome fakeredis
+        #
+        # pgserver + psycopg2: a REAL PostgreSQL server for the automatic
+        # shadowing suite. `wrap_postgresql` is an audit layer FOR Postgres —
+        # verifying it only against a mock is not verifying it. Without these
+        # the suite self-skips its Postgres half, and a self-skipping test is
+        # indistinguishable from a passing one, which is the whole failure
+        # mode that suite exists to catch.
+        run: pip install pycryptodome fakeredis pgserver psycopg2-binary
       - name: Run dependency-free suites
         env:
           PYTHONPATH: ${{ github.workspace }}/python
+          # test_wrap_autoshadow must FAIL rather than skip if the real
+          # PostgreSQL server is missing here — the extras above install it, so
+          # a skip means the install broke, and a silent skip would report
+          # green on an untested audit layer.
+          NEDB_REQUIRE_PG: "1"
         run: |
           set -uo pipefail
           fail=0
           for t in test_nedb test_bitemporal test_causal test_concurrent \
                    test_crypto test_deploy test_proof test_v050 \
-                   test_wrap_redis test_adapters test_wrap_sqlite_shadow; do
+                   test_wrap_redis test_adapters test_wrap_sqlite_shadow \
+                   test_wrap_autoshadow \
+                   test_nql_predicates test_nql_shaping \
+                   test_backcompat test_dag_preserved; do
             echo "::group::$t"
             if python3 "tests/$t.py"; then
               echo "PASS $t"
@@ -96,6 +112,25 @@ jobs:
       - name: cargo test — engine library
         working-directory: rust
         run: cargo test -p nedb-engine --lib
+      # The BINS were never compiled by any job. `cargo test --lib` builds the
+      # library, the release workflow builds only `--bin nedbd`, and the
+      # binding checks do not reach this crate's binaries — so `nedb-cli` sat
+      # broken (a `use std::env;` glued onto a doc-comment line) with nothing to
+      # notice. It also broke `cargo publish`, whose tarball verification
+      # builds every target, which is why crates.io stalled at 3.1.0 while the
+      # publish job reported success.
+      #
+      # --all-targets covers bins, examples, tests and benches in one pass.
+      - name: cargo check — every target (bins included)
+        working-directory: rust
+        run: cargo check -p nedb-engine --all-targets
+      # And RUN the integration tests, which were in the same blind spot: three
+      # test targets (nedb_cli, v3_integration, cast_endpoint — 13 tests) that
+      # nothing compiled, let alone executed. nedb_cli drives the compiled CLI
+      # as a subprocess, so it needs the bin built, which --tests does.
+      - name: cargo test — integration targets
+        working-directory: rust
+        run: cargo test -p nedb-engine --tests
       # The bindings are where drift hides: they are only ever compiled by the
       # release workflow, so a signature change in the core can sit broken on
       # master for days. `check` is cheap and catches exactly that.
@@ -178,16 +213,67 @@ jobs:
       # N)" where N was the caller's own pid. The ticker now holds a Weak<Db>
       # and exits when the upgrade fails, so close/reopen works and this suite
       # is a real gate again.
+      # test_nql_predicates appears in BOTH tiers on purpose. In the pure tier
+      # it exercises the Python reference alone; here, with the maturin wheel
+      # installed, it additionally runs every query through the Rust core and
+      # asserts the two engines return IDENTICAL answers. That cross-engine leg
+      # is the gate that was missing when the two NQL implementations drifted
+      # apart on GROUP BY (required-vs-optional aggregate keyword, aggregating
+      # the group field instead of the target field, and disagreeing output
+      # keys) with nothing to catch it.
+      #
+      # It must NOT be run with PYTHONPATH=python here: the source tree has no
+      # `_native` module, so putting it first pins __has_native__ to False and
+      # the parity leg self-skips into a false green.
       - name: Run native-backed suites
         run: |
           set -uo pipefail
           fail=0
-          for t in test_native test_celebration_v2 test_wrap_family; do
+          for t in test_native test_celebration_v2 test_wrap_family \
+                   test_nql_predicates test_nql_shaping \
+                   test_backcompat test_dag_preserved; do
             echo "::group::$t"
             if python3 "tests/$t.py"; then echo "PASS $t"; else echo "::error title=$t::suite failed"; fail=1; fi
             echo "::endgroup::"
           done
           exit $fail
+
+  # -------------------------------------------------------------- clients ---
+  # The PUBLISHED client packages (`nedb-engine-client` on PyPI and npm).
+  #
+  # These ship on every `v*` tag and their only verification was "it imports"
+  # (PyPI) and "it compiles" (npm). Not one request was ever made against a
+  # server before publish — the same gap this workflow closed for the engine,
+  # still open on the clients. Writing these suites found: `get()` could not
+  # fetch any id containing a double quote (returned None for a document that
+  # exists), `delete()` could not reach an id containing a slash, and the npm
+  # client abandoned response bodies on its early-return paths.
+  #
+  # Both run against the PYTHON AOF server, so this tier needs no Rust build
+  # and stays fast.
+  clients:
+    name: clients (published packages)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: pip install httpx
+      - name: PyPI client — nedb_client against a live nedbd
+        run: python3 tests/test_client_package.py
+      - name: npm client — build the artifact that actually ships
+        run: |
+          cd client/node
+          npm install
+          npx tsc
+      - name: npm client — dist/index.js against a live nedbd
+        # Imports dist/, not src/: the compiled output is what gets published,
+        # so testing the source would not prove the artifact works.
+        run: node client/node/test/client.test.mjs
 
   # --------------------------------------------------------- python-daemon ---
   # The suites that talk HTTP to nedbd. Each one auto-spawns the daemon when
@@ -245,6 +331,36 @@ jobs:
             [ "$i" -eq 20 ] && { echo "daemon never came up"; exit 1; }
           done
           pkill -x nedbd-v2 || true
+      # The Postgres read endpoint, driven by a REAL libpq client.
+      #
+      # Unit tests prove the SQL→NQL translation and the message framing, but
+      # only an actual PostgreSQL client proves the protocol: one wrong length
+      # prefix desynchronises the stream and the client HANGS, which no unit
+      # test would notice. psycopg2 is libpq, so if this passes then psql,
+      # DBeaver, Metabase and Grafana can read a NEDB store too.
+      - name: Postgres endpoint — simple protocol (psycopg2 / libpq)
+        run: |
+          pip install psycopg2-binary
+          python3 tests/test_pgwire.py
+
+      # The EXTENDED query protocol, driven by the drivers that only speak it.
+      #
+      # psycopg2 interpolates parameters client-side, so the suite above only
+      # ever exercises the simple protocol. psycopg3, asyncpg and JDBC send
+      # Parse/Bind/Describe/Execute for every parameterised statement — before
+      # that was implemented, none of them could run a single query. Both
+      # drivers are installed here rather than skipped, because "it would work
+      # if you had the driver" is not a test result.
+      #
+      # asyncpg is the strict one: it declares no parameter types, asks the
+      # server, and REFUSES the call client-side if the answer is wrong. So this
+      # tier also covers the schemaless type inference, which cannot be checked
+      # from a unit test.
+      - name: Postgres endpoint — extended protocol (psycopg3 + asyncpg)
+        run: |
+          pip install 'psycopg[binary]' asyncpg
+          python3 tests/test_pgwire_extended.py
+
       - name: Run daemon-backed suites
         env:
           PYTHONPATH: ${{ github.workspace }}/python

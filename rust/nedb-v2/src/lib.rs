@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+// NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 //! NEDB v2 — Content-addressed DAG storage engine.
 //!
 //! Architecture:
@@ -22,6 +26,7 @@ pub mod migrate;
 pub mod db;
 pub mod exit;
 pub mod nql;
+pub mod pgwire;
 #[cfg(feature = "cast")]
 pub mod cast;
 pub mod server;

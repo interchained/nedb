@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+// NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 /**
  * nedb-client — TypeScript/JavaScript client for the nedbd HTTP API.
  *
@@ -240,6 +244,7 @@ export class NedbClient {
 
     let resp = await this.fetch("POST", `/v1/databases/${this.db}/put`, payload, this.writeMs);
     if (resp.status === 404 && this.autoCreate) {
+      await NedbClient.drain(resp);
       await this.ensureDb();
       resp = await this.fetch("POST", `/v1/databases/${this.db}/put`, payload, this.writeMs);
     }
@@ -248,13 +253,100 @@ export class NedbClient {
   }
 
   /**
+   * Discard a response body we are not going to read.
+   *
+   * Node's `fetch` (undici) keeps the socket checked out until the body is
+   * consumed or cancelled. Every early return that skipped this leaked a
+   * connection: `queryFull()` returning `[]` for a missing database is a
+   * DOCUMENTED resilient path, so a long-running service leaked one socket per
+   * such call until the pool starved. It also kept the event loop alive, which
+   * is how this was found — the test suite passed every assertion and then
+   * hung forever instead of exiting.
+   */
+  private static async drain(resp: Response): Promise<void> {
+    try {
+      if (resp.body && !resp.bodyUsed) await resp.body.cancel();
+    } catch {
+      /* best effort — the socket is being discarded either way */
+    }
+  }
+
+  /**
+   * Percent-encode one URL path segment.
+   *
+   * `delete("t", "a/slash")` used to interpolate the id straight into the
+   * path, so the `/` split it and the route matched a different id — the call
+   * returned false ("no such document") for a document that existed.
+   * `encodeURIComponent` encodes `/`, which is exactly what is needed here.
+   */
+  private static seg(value: string): string {
+    return encodeURIComponent(String(value));
+  }
+
+  /**
+   * Escape a value for use inside a double-quoted NQL string literal.
+   *
+   * The engine's lexer collapses `\"` to a literal quote and leaves every
+   * OTHER backslash alone, so only the quote needs escaping. One case is
+   * genuinely unrepresentable: a value ENDING in a backslash produces `...\"`,
+   * which the lexer reads as an escaped quote, and the string never
+   * terminates. That is why {@link get} prefers the `rows/:coll/:id` route,
+   * which takes the id from the URL path and has no quoting to get wrong.
+   */
+  private static nqlStr(value: string): string {
+    return String(value).replace(/"/g, '\\"');
+  }
+
+  /**
    * Fetch the current version of a document. Returns null if not found.
+   *
+   * With `asOf`, returns the version at or before that sequence number — the
+   * single-document form of time travel.
+   *
+   * Uses `GET /v1/databases/<db>/rows/<coll>/<id>`, which takes the id from
+   * the URL path. This used to build `FROM coll WHERE _id = "..."` and
+   * interpolate the id into it, which made every id containing a double quote
+   * unreachable: the call returned null — meaning "no such document" — for a
+   * document `put()` had stored and `FROM coll` returned. An id ending in a
+   * backslash could not be escaped at all.
+   *
+   * A missing document is `200 {"row": null}` on this route, not 404 —
+   * deliberately, so that a 404/405 unambiguously means "the server does not
+   * have this route" and the client can fall back to the query path.
+   * Requires nedb-engine >= 3.3.0; older servers take the fallback.
    */
   async get(
     coll: string,
     id: string,
+    asOf?: number,
   ): Promise<Record<string, unknown> | null> {
-    const rows = await this.query(`FROM ${coll} WHERE _id = "${id}" LIMIT 1`);
+    const qs = asOf !== undefined ? `?as_of=${encodeURIComponent(String(asOf))}` : "";
+    const path =
+      `/v1/databases/${this.db}/rows/${NedbClient.seg(coll)}/${NedbClient.seg(id)}${qs}`;
+    const resp = await this.fetch("GET", path);
+
+    // The route answers 200 with `row: null` for a missing document,
+    // precisely so this cannot be confused with "no such route". A 404/405
+    // therefore means the server predates the route.
+    if (resp.status === 404 || resp.status === 405) {
+      await NedbClient.drain(resp);
+      return this.getViaQuery(coll, id, asOf);
+    }
+    if (!resp.ok) await this.raise(resp);
+    const body = await resp.json() as { row?: Record<string, unknown> | null };
+    return body.row ?? null;
+  }
+
+  /** Pre-3.3.0 fallback for {@link get} — a point lookup built as NQL. */
+  private async getViaQuery(
+    coll: string,
+    id: string,
+    asOf?: number,
+  ): Promise<Record<string, unknown> | null> {
+    const asOfClause = asOf !== undefined ? ` AS OF ${Math.trunc(asOf)}` : "";
+    const rows = await this.query(
+      `FROM ${coll}${asOfClause} WHERE _id = "${NedbClient.nqlStr(id)}" LIMIT 1`,
+    );
     return rows[0] ?? null;
   }
 
@@ -265,11 +357,14 @@ export class NedbClient {
   async delete(coll: string, id: string): Promise<boolean> {
     const resp = await this.fetch(
       "DELETE",
-      `/v1/databases/${this.db}/rows/${coll}/${id}`,
+      `/v1/databases/${this.db}/rows/${NedbClient.seg(coll)}/${NedbClient.seg(id)}`,
       undefined,
       this.writeMs,
     );
-    if (resp.status === 404) return false;
+    if (resp.status === 404) {
+      await NedbClient.drain(resp);
+      return false;
+    }
     if (!resp.ok) await this.raise(resp);
     const body = await resp.json() as { ok: boolean };
     return body.ok;
@@ -282,13 +377,42 @@ export class NedbClient {
    * NQL: FROM <coll>
    *        [AS OF <seq>]
    *        [VALID AS OF "<date>"]
-   *        [WHERE field = value [AND ...]]
-   *        [ORDER BY field [DESC]]
-   *        [LIMIT n]
-   *        [GROUP BY field COUNT|SUM|AVG|MIN|MAX]
-   *        [TRACE caused_by [REVERSE]]
+   *        [WHERE <predicate>]
    *        [SEARCH "text"]
+   *        [TRAVERSE <relation>]
+   *        [TRACE caused_by [REVERSE]]
+   *        [GROUP BY field [COUNT|SUM f|AVG f|MIN f|MAX f]]
+   *        [COUNT | SUM f | AVG f | MIN f | MAX f]
+   *        [HAVING <predicate>]
+   *        [ORDER BY field [ASC|DESC] (, field [ASC|DESC])*]
+   *        [LIMIT n] [OFFSET n]
    * ```
+   *
+   * Clauses are evaluated in SQL's order regardless of how they are written:
+   * FROM -> WHERE -> GROUP BY -> HAVING -> ORDER BY -> OFFSET -> LIMIT.
+   *
+   * `<predicate>` is a full boolean expression (AND binds tighter than OR;
+   * parentheses nest to any depth):
+   *
+   * ```
+   * field = != < <= > >= value
+   * field [NOT] IN (v1, v2, ...)
+   * field [NOT] BETWEEN low AND high     // inclusive, as in SQL
+   * field [NOT] LIKE|ILIKE "pat"         // % any run, _ any one char
+   * field IS [NOT] NULL                  // absent OR explicitly null
+   * NOT (...) / (... OR ...) / ...
+   * ```
+   *
+   * An ordering comparison against a missing or null field is never true, so
+   * `WHERE fee < 5` will not return a row that has no `fee`. Use `IS NULL` to
+   * select those rows.
+   *
+   * A clause the server does not implement is REJECTED rather than silently
+   * ignored, so a typo throws instead of quietly answering a different
+   * question.
+   *
+   * Requires nedb-engine >= 3.3.0 for IN / BETWEEN / LIKE / IS NULL / OR /
+   * NOT / OFFSET / HAVING / multi-key ORDER BY and bare aggregates.
    */
   async query(nql: string): Promise<Record<string, unknown>[]> {
     const result = await this.queryFull(nql);
@@ -301,6 +425,7 @@ export class NedbClient {
   async queryFull(nql: string): Promise<QueryResult> {
     const resp = await this.fetch("POST", `/v1/databases/${this.db}/query`, { nql });
     if (resp.status === 400 || resp.status === 404) {
+      await NedbClient.drain(resp);
       return { rows: [], count: 0, seq: 0, head: "" };
     }
     if (!resp.ok) await this.raise(resp);
@@ -383,6 +508,7 @@ export class NedbClient {
       this.writeMs,
     );
     if (resp.status === 404 && this.autoCreate) {
+      await NedbClient.drain(resp);
       await this.ensureDb();
       resp = await this.fetch(
         "POST",

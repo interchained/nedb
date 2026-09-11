@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+# NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 """
 nedb.crypto — AES-256-GCM encryption at rest with a double-envelope key structure.
 

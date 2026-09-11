@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+# NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 """
 NEDB — a versioned, self-compressing, time-traveling embedded database.
 
@@ -102,4 +106,4 @@ __all__ = [
     "verify_proof", "fold_head",
     "_native", "__has_native__",
 ]
-__version__ = "3.2.2"
+__version__ = "4.0.0"

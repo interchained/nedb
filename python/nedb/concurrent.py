@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+# NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 """
 nedb.concurrent — make a NEDB database safe AND fast under many concurrent clients,
 without a global lock.

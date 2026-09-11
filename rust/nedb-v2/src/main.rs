@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+// NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 //! nedbd v2 — NEDB DAG storage daemon.
 //!
 //! Usage:
@@ -11,6 +15,8 @@
 //! Environment (still honored as defaults):
 //!   NEDBD_HOST=127.0.0.1    Bind address (default 127.0.0.1 — loopback only)
 //!   NEDBD_PORT=7070         HTTP port (default 7070)
+//!   NEDBD_PG_PORT=5433      Also serve a Postgres wire-protocol READ endpoint
+//!                           (SELECT only). Unset = off.
 //!   NEDBD_TOKEN=<token>     Bearer token for auth (optional)
 //!   NEDBD_MEMORY=1          Pure in-memory mode — no disk I/O, data lost on exit
 //!   NEDB_DAG_V3=1           Use the v3 segment/pack object store (see --dag-v3)
@@ -34,6 +40,10 @@ OPTIONS:
                           Alias: --dag-fast-sync
     -H, --host <ADDR>     Bind address (default: 127.0.0.1 — loopback only)
     -p, --port <PORT>     HTTP port (default: 7070)
+        --pg-port <PORT>  ALSO serve a PostgreSQL wire-protocol READ endpoint on
+                          this port (psql / DBeaver / psycopg; SELECT only).
+                          Off unless set. Cleartext — keep it on loopback or
+                          behind a tunnel. Sets NEDBD_PG_PORT.
         --token <TOKEN>   Bearer token required on every request
     -m, --memory          Pure in-memory mode (no disk I/O; data lost on exit)
     -h, --help            Print this help and exit
@@ -41,12 +51,14 @@ OPTIONS:
 
 ENVIRONMENT (flags take precedence when both are set):
     NEDBD_HOST  NEDBD_PORT  NEDBD_TOKEN  NEDBD_MEMORY  NEDB_DAG_V3  NEDB_FAST_FSYNC
+    NEDBD_PG_PORT   Postgres read endpoint port (see --pg-port); unset = off
     NEDB_TMK    32-byte hex master key for AES-256-GCM (env-only — never a flag)
 
 EXAMPLES:
     nedbd-v2 ./data                  # v2 DAG (loose objects) at ./data
     nedbd-v2 --dag-v3 ./data         # v3 segment store at ./data
     nedbd-v2 --dag-v3 --data ./data --port 7171
+    nedbd-v2 ./data --pg-port 5433    # then: psql -h 127.0.0.1 -p 5433 -d mydb
     NEDB_DAG_V3=1 nedbd-v2 ./data    # env form (equivalent to --dag-v3)
 ";
 
@@ -131,6 +143,20 @@ async fn main() -> anyhow::Result<()> {
                 port = v
                     .parse()
                     .unwrap_or_else(|_| die(format!("invalid --port '{}': expected 0-65535", v)));
+            }
+            // Set the env var rather than threading another parameter through
+            // server::run — the engine already reads its optional surfaces from
+            // the environment, and this keeps the flag and the env form exactly
+            // equivalent instead of nearly equivalent.
+            "--pg-port" => {
+                let v = need_val(&args, &mut i, inline.as_deref(), "--pg-port");
+                let p: u16 = v.parse().unwrap_or_else(|_| {
+                    die(format!("invalid --pg-port '{}': expected 1-65535", v))
+                });
+                if p == 0 {
+                    die("invalid --pg-port '0': expected 1-65535".to_string());
+                }
+                std::env::set_var("NEDBD_PG_PORT", p.to_string());
             }
             "--token" => {
                 token = Some(need_val(&args, &mut i, inline.as_deref(), "--token"))

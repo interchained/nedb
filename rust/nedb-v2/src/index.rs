@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+// NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 //! Index store for NEDB v2.
 //!
 //! Two index types:
@@ -542,6 +546,90 @@ impl SortedIndexes {
         self.inner.get(&key).map(|idx| {
             idx.values().rev().flat_map(|v| v.iter().cloned()).take(k).collect()
         }).unwrap_or_default()
+    }
+
+    /// Hashes whose indexed value falls within the given bounds.
+    ///
+    /// The BTreeMap already orders by value, so a bounded predicate is a
+    /// range walk rather than a full collection scan. `None` for either bound
+    /// means unbounded on that side, which serves a one-sided inequality
+    /// (`fee > 10`) as well as a two-sided `BETWEEN`.
+    ///
+    /// Documents where the field is ABSENT are not in this index at all, and
+    /// are therefore not returned. That is correct for every predicate this
+    /// serves: a missing field compares as null, which satisfies no ordering
+    /// comparison.
+    pub fn range(
+        &self,
+        coll: &str,
+        field: &str,
+        low: Option<&Value>,
+        high: Option<&Value>,
+        low_incl: bool,
+        high_incl: bool,
+    ) -> Vec<String> {
+        use std::ops::Bound;
+        let key = (coll.to_string(), field.to_string());
+        self.inner.get(&key).map(|idx| {
+            let lo = match low {
+                None => Bound::Unbounded,
+                Some(v) => {
+                    let ov = OrderedValue::from(v);
+                    if low_incl { Bound::Included(ov) } else { Bound::Excluded(ov) }
+                }
+            };
+            let hi = match high {
+                None => Bound::Unbounded,
+                Some(v) => {
+                    let ov = OrderedValue::from(v);
+                    if high_incl { Bound::Included(ov) } else { Bound::Excluded(ov) }
+                }
+            };
+            idx.range((lo, hi)).flat_map(|(_, v)| v.iter().cloned()).collect()
+        }).unwrap_or_default()
+    }
+
+    /// Hashes whose indexed value equals `value` — an O(log n) point lookup,
+    /// used for `=` and for each arm of an `IN (...)` list.
+    pub fn exact(&self, coll: &str, field: &str, value: &Value) -> Vec<String> {
+        let key = (coll.to_string(), field.to_string());
+        self.inner.get(&key).map(|idx| {
+            idx.get(&OrderedValue::from(value)).cloned().unwrap_or_default()
+        }).unwrap_or_default()
+    }
+
+    /// How many hashes a range covers, without materialising them.
+    ///
+    /// Lets the planner compare two candidate indexes and pick the more
+    /// selective one, rather than committing to whichever field it saw first.
+    pub fn range_len(
+        &self,
+        coll: &str,
+        field: &str,
+        low: Option<&Value>,
+        high: Option<&Value>,
+        low_incl: bool,
+        high_incl: bool,
+    ) -> usize {
+        use std::ops::Bound;
+        let key = (coll.to_string(), field.to_string());
+        self.inner.get(&key).map(|idx| {
+            let lo = match low {
+                None => Bound::Unbounded,
+                Some(v) => {
+                    let ov = OrderedValue::from(v);
+                    if low_incl { Bound::Included(ov) } else { Bound::Excluded(ov) }
+                }
+            };
+            let hi = match high {
+                None => Bound::Unbounded,
+                Some(v) => {
+                    let ov = OrderedValue::from(v);
+                    if high_incl { Bound::Included(ov) } else { Bound::Excluded(ov) }
+                }
+            };
+            idx.range((lo, hi)).map(|(_, v)| v.len()).sum()
+        }).unwrap_or(0)
     }
 
     /// Check if a sorted index exists for a (coll, field) pair.

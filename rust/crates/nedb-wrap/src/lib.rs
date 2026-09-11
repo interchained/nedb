@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+// NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 //! nedb-wrap — embed NEDB causal provenance into the databases you already run (Rust).
 //!
 //! The Rust leg of the wrap adapter family. Where the Python and JS wrappers

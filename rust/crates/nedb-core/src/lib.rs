@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+// NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 //! nedb-core — the production speed core for NEDB.
 //!
 //! The OpLog is the single source of truth. Every mutation appends an Op; `apply`

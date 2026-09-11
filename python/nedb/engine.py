@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+# NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 """
 nedb.engine — the NEDB database: log + MVCC store + relations + indexes + Cascade.
 
@@ -19,7 +23,7 @@ from .index import Indexes, tokenize
 from .log import Op, OpLog, ReplayError, GENESIS, blake, canon  # noqa: F401  (re-exported)
 from typing import List as _List
 from .merkle import merkle_proof, merkle_verify
-from .query import Query, cmp, parse_nql
+from .query import Query, cmp, eval_predicate, parse_nql
 from .relations import Relations
 from .store import MVCCStore
 
@@ -49,6 +53,18 @@ def apply_op(store: MVCCStore, relations: Relations, indexes: Indexes, op: Op,
         key, coll = p["key"], p["coll"]
         doc = dict(p["doc"])          # copy so we don't mutate the op payload
         doc["_seq"] = op.seq          # inject sequence number into every stored doc
+        # `_hash` and `_coll` mirror what the Rust engine's node_to_json emits,
+        # so the documented metadata fields (_id, _coll, _hash, _seq) resolve in
+        # a predicate on BOTH engines. Without them `WHERE _coll = "jobs"` and
+        # `WHERE _hash = "..."` compared against a missing field and silently
+        # returned an empty set here while working in Rust.
+        #
+        # `_hash` is the hash of the op that wrote this version — the
+        # anchorable identity of this exact record. Injected into the COPY, so
+        # the hashed op payload and therefore the chain are untouched; verify()
+        # recomputes from op payloads, not from materialized docs.
+        doc["_hash"] = op.hash
+        doc["_coll"] = coll
         old = store.get(key)
         if old is not None:
             indexes.remove(coll, key, old)
@@ -655,6 +671,7 @@ class NEDB:
         as_of = plan.get("as_of")
         prefix = coll + ":"
         where = plan.get("where", [])
+        predicate = plan.get("predicate")
         search = plan.get("search")
 
         candidates: Optional[set] = None
@@ -688,22 +705,19 @@ class NEDB:
             doc = self.store.get(key, as_of)
             if doc is None:
                 continue
-            if all(cmp(doc.get(f), op, v) for (f, op, v) in where):
+            # The predicate tree is authoritative when the plan carries one.
+            # `where` remains the fallback for plans built directly by callers
+            # (mongo.py) and by the fluent Query builder, which both emit the
+            # flat conjunct list rather than a tree.
+            if (eval_predicate(doc, predicate) if predicate is not None
+                    else all(cmp(doc.get(f), op, v) for (f, op, v) in where)):
                 if search and not self.indexes.search_fields(coll):
                     blob = " ".join(str(x) for x in doc.values()).lower()
                     if not all(t in blob for t in tokenize(search)):
                         continue
                 rows.append((key, doc))
 
-        # order
-        ob = plan.get("order_by")
-        if ob:
-            field, direction = ob
-            try:
-                rows.sort(key=lambda kv: (kv[1].get(field) is None, kv[1].get(field)),
-                          reverse=(direction == "DESC"))
-            except TypeError:
-                rows.sort(key=lambda kv: str(kv[1].get(field)), reverse=(direction == "DESC"))
+        # ORDER BY moved DOWN the pipeline — see the ordering note below.
 
         # traverse relations
         if plan.get("traverse"):
@@ -782,12 +796,33 @@ class NEDB:
                                     queue.append(dep_seq)  # continue BFS
                 rows = out_fwd
 
-        if plan.get("limit") is not None:
-            rows = rows[: plan["limit"]]
+        # ── VALID AS OF → aggregate → HAVING → ORDER BY → OFFSET → LIMIT ──
+        #
+        # This is the SQL pipeline order. The previous order was
+        # ORDER BY → LIMIT → VALID AS OF → GROUP BY, which produced three
+        # separate classes of silently-wrong answer:
+        #
+        #   LIMIT before GROUP BY truncated the INPUT, so the aggregate was
+        #   computed over a fraction of the rows. With twelve rows across
+        #   three statuses, `LIMIT 5 GROUP BY status COUNT` returned counts
+        #   summing to 5 instead of 12 — a confident wrong number.
+        #
+        #   LIMIT before VALID AS OF meant `VALID AS OF "<date>" LIMIT 3`
+        #   truncated to three RAW rows and only then dropped the ones not
+        #   valid at that date, returning fewer rows than exist. Same defect
+        #   class the Rust engine already guards against for WHERE (see
+        #   where_order_limit_does_not_truncate_before_filter) — and the Rust
+        #   engine filters valid-time BEFORE limiting, so this was also a
+        #   live divergence between the two engines.
+        #
+        #   ORDER BY before GROUP BY sorted the raw documents on a field that
+        #   only exists AFTER grouping (`count`, `sum_fee`), so the grouped
+        #   output came back unordered and the clause was silently inert.
+        #
+        # In SQL, ORDER BY / OFFSET / LIMIT apply to the RESULT. They now do.
 
-        # VALID AS OF <date> — bi-temporal valid-time filter.
-        # Applied after all other filters so WHERE/ORDER BY/LIMIT can still
-        # reference _valid_from/_valid_to as regular queryable fields.
+        # VALID AS OF <date> — bi-temporal valid-time filter. A row filter, so
+        # it belongs with WHERE, before anything that shapes the result.
         # Docs without _valid_from/_valid_to always pass (backward compat).
         valid_date = plan.get("valid_as_of")
         if valid_date:
@@ -795,33 +830,118 @@ class NEDB:
 
         result = [d for _, d in rows]
 
-        # GROUP BY [COUNT | SUM f | AVG f | MIN f | MAX f]
-        if plan.get("group_by"):
-            gb_field = plan["group_by"]
-            agg      = plan.get("aggregate")
+        order_keys = plan.get("order_keys")
+        if not order_keys and plan.get("order_by"):
+            # A plan built by the fluent builder or by a direct caller carries
+            # only the single-key form.
+            order_keys = [plan["order_by"]]
+
+        def _sorted(items, keys, get):
+            """Sort by keys right-to-left, so the leftmost key dominates.
+
+            Python's sort is stable, so applying the least-significant key
+            first and the most-significant last yields the same ordering as a
+            single comparison over the whole key tuple — without needing the
+            values to be mutually comparable across keys.
+            """
+            out = list(items)
+            for field, direction in reversed(keys):
+                try:
+                    out.sort(key=lambda d: (get(d, field) is None, get(d, field)),
+                             reverse=(direction == "DESC"))
+                except TypeError:
+                    # Mixed types in one column — fall back to string order so
+                    # the query answers instead of raising.
+                    out.sort(key=lambda d: str(get(d, field)),
+                             reverse=(direction == "DESC"))
+            return out
+
+        def _page(items):
+            off = plan.get("offset")
+            if off:
+                items = items[off:]
+            lim = plan.get("limit")
+            if lim is not None:
+                items = items[:lim]
+            return items
+
+        # GROUP BY [COUNT | SUM f | AVG f | MIN f | MAX f], or a bare aggregate
+        # with no GROUP BY (one row over the whole result).
+        gb_field = plan.get("group_by")
+        agg = plan.get("aggregate")
+
+        if gb_field or agg:
             groups: dict = {}
+            order: list = []
+            WHOLE = object()
             for d in result:
-                gkey = d.get(gb_field)
-                groups.setdefault(gkey, []).append(d)
+                gkey = d.get(gb_field) if gb_field else WHOLE
+                if gkey not in groups:
+                    groups[gkey] = []
+                    order.append(gkey)
+                groups[gkey].append(d)
+
+            # An ungrouped aggregate over ZERO rows still returns one row:
+            # COUNT of an empty set is 0, not "no answer". A GROUPED aggregate
+            # over zero rows correctly returns no groups.
+            if not gb_field and not order:
+                order.append(WHOLE)
+                groups[WHOLE] = []
+
             grouped = []
-            for gval, gdocs in groups.items():
-                entry: dict = {gb_field: gval, "count": len(gdocs)}
+            for gval in order:
+                gdocs = groups[gval]
+                entry: dict = {}
+                if gb_field:
+                    entry[gb_field] = gval
+                entry["count"] = len(gdocs)
                 if agg:
                     fn, af = agg
-                    if fn == "count":
-                        pass  # already in entry["count"]
-                    else:
-                        nums = [d[af] for d in gdocs if af in d and isinstance(d[af], (int, float))]
+                    if fn != "count":
+                        # count is the group size; the aggregate considers only
+                        # rows whose target field is numeric.
+                        nums = [d[af] for d in gdocs
+                                if af in d and isinstance(d[af], (int, float))
+                                and not isinstance(d[af], bool)]
                         if fn == "sum":
-                            entry[f"sum_{af}"] = sum(nums)
+                            entry[f"sum_{af}"] = sum(nums) if nums else None
                         elif fn == "avg":
                             entry[f"avg_{af}"] = sum(nums) / len(nums) if nums else None
                         elif fn == "min":
                             entry[f"min_{af}"] = min(nums) if nums else None
                         elif fn == "max":
                             entry[f"max_{af}"] = max(nums) if nums else None
+                        # `value` alias, matching the Rust engine's output.
+                        entry["value"] = entry[f"{fn}_{af}"]
+                    else:
+                        entry["value"] = len(gdocs)
+                else:
+                    entry["value"] = len(gdocs)
                 grouped.append(entry)
-            return grouped
+
+            having = plan.get("having")
+            if having is not None:
+                grouped = [g for g in grouped if eval_predicate(g, having)]
+
+            if order_keys:
+                grouped = _sorted(grouped, order_keys, lambda d, f: d.get(f))
+            elif gb_field:
+                # Deterministic default: groups sorted by key.
+                #
+                # NOT first-seen order. This engine draws candidates from a
+                # `set`, so input row order is arbitrary and a first-seen
+                # ordering would differ run to run AND differ from the Rust
+                # engine, which scans in a defined order. Sorting by the key
+                # gives one answer both engines can agree on. Stringified so a
+                # column holding mixed types still orders instead of raising.
+                grouped.sort(key=lambda d: str(d.get(gb_field)))
+
+            return _page(grouped)
+
+        if order_keys:
+            result = _sorted(result, order_keys, lambda d, f: d.get(f))
+
+        result = _page(result)
 
         return result
 

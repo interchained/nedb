@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+# NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 """
 NedbClient — async HTTP client for the nedbd server.
 
@@ -14,6 +18,7 @@ All /v1/databases/* routes are covered. The client handles:
 from __future__ import annotations
 
 import asyncio
+import urllib.parse
 from typing import Any, Dict, List, Optional, Union
 
 try:
@@ -120,6 +125,33 @@ class NedbClient:
             raise RuntimeError("NedbClient not open — use 'async with NedbClient(...) as c'")
         return self._write_client
 
+    # ── Id handling ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _seg(value: str) -> str:
+        """Percent-encode one URL path segment.
+
+        `delete("t", "a/slash")` used to interpolate the id straight into the
+        path, so the `/` split it and the route matched a different id — the
+        call returned False ("no such document") for a document that existed.
+        `safe=""` is deliberate: `/` must be encoded, not passed through.
+        """
+        return urllib.parse.quote(str(value), safe="")
+
+    @staticmethod
+    def _nql_str(value: str) -> str:
+        """Escape a value for use inside a double-quoted NQL string literal.
+
+        The engine's lexer collapses `\\"` to a literal quote and leaves every
+        OTHER backslash alone, so only the quote needs escaping. One case is
+        genuinely unrepresentable: a value ENDING in a backslash would produce
+        `...\\"`, which the lexer reads as an escaped quote and the string
+        never terminates. Callers that might see such an id should use the
+        `rows/:coll/:id` route, which takes the id from the URL path and has no
+        quoting to get wrong.
+        """
+        return str(value).replace('"', '\\"')
+
     # ── Internal HTTP helpers ─────────────────────────────────────────────────
 
     async def _raise(self, resp: httpx.Response) -> None:
@@ -196,11 +228,45 @@ class NedbClient:
         if client_id  is not None: payload["client"]     = client_id
         return await self._put_raw(payload)
 
-    async def get(self, coll: str, id: str) -> Optional[Dict[str, Any]]:
+    async def get(self, coll: str, id: str,
+                  as_of: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """
         Fetch the current version of a document. Returns the doc dict or None.
+
+        With ``as_of``, returns the version at or before that sequence number —
+        the single-document form of time travel.
+
+        Uses ``GET /v1/databases/<db>/rows/<coll>/<id>``, which takes the id
+        from the URL path. This used to build ``FROM coll WHERE _id = "..."``
+        and interpolate the id into it, which made every id containing a double
+        quote unreachable: the call returned None — meaning "no such document"
+        — for a document ``put()`` had stored and ``FROM coll`` returned. An id
+        ending in a backslash could not be escaped at all.
+
+        A missing document is ``200 {"row": null}`` on this route, not 404 —
+        deliberately, so that a 404/405 unambiguously means "the server does
+        not have this route" and the client can fall back to the query path.
+        Requires nedb-engine >= 3.3.0; older servers take the fallback.
         """
-        result = await self._query_raw(f'FROM {coll} WHERE _id = "{id}" LIMIT 1')
+        path = f"/v1/databases/{self._db}/rows/{self._seg(coll)}/{self._seg(id)}"
+        params = {"as_of": as_of} if as_of is not None else None
+        resp = await self._rc().get(path, params=params)
+
+        # The route answers 200 with `row: null` for a missing document,
+        # precisely so this cannot be confused with "no such route". A
+        # 404/405 therefore means the server predates the route.
+        if resp.status_code in (404, 405):
+            return await self._get_via_query(coll, id, as_of)
+        if not resp.is_success:
+            await self._raise(resp)
+        return resp.json().get("row")
+
+    async def _get_via_query(self, coll: str, id: str,
+                             as_of: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """Pre-3.3.0 fallback for :meth:`get` — a point lookup built as NQL."""
+        as_of_clause = f" AS OF {int(as_of)}" if as_of is not None else ""
+        nql = f'FROM {coll}{as_of_clause} WHERE _id = "{self._nql_str(id)}" LIMIT 1'
+        result = await self._query_raw(nql)
         rows = result.get("rows", [])
         return rows[0] if rows else None
 
@@ -210,7 +276,8 @@ class NedbClient:
         The object history is preserved in the DAG; the live id pointer is removed.
         Returns True if the document existed.
         """
-        resp = await self._wc().delete(f"/v1/databases/{self._db}/rows/{coll}/{id}")
+        resp = await self._wc().delete(
+            f"/v1/databases/{self._db}/rows/{self._seg(coll)}/{self._seg(id)}")
         if resp.status_code == 404:
             return False
         if not resp.is_success:
@@ -226,12 +293,40 @@ class NedbClient:
             FROM <coll>
               [AS OF <seq>]
               [VALID AS OF "<date>"]
-              [WHERE field = value [AND ...]]
-              [ORDER BY field [DESC]]
-              [LIMIT n]
-              [GROUP BY field COUNT|SUM|AVG|MIN|MAX]
-              [TRACE caused_by [REVERSE]]
+              [WHERE <predicate>]
               [SEARCH "text"]
+              [TRAVERSE <relation>]
+              [TRACE caused_by [REVERSE]]
+              [GROUP BY field [COUNT|SUM f|AVG f|MIN f|MAX f]]
+              [COUNT | SUM f | AVG f | MIN f | MAX f]
+              [HAVING <predicate>]
+              [ORDER BY field [ASC|DESC] (, field [ASC|DESC])*]
+              [LIMIT n] [OFFSET n]
+
+        Clauses are evaluated in SQL's order regardless of how they are
+        written: FROM -> WHERE -> GROUP BY -> HAVING -> ORDER BY -> OFFSET ->
+        LIMIT.
+
+        ``<predicate>`` is a full boolean expression (AND binds tighter than
+        OR; parentheses nest to any depth)::
+
+            field = != < <= > >= value
+            field [NOT] IN (v1, v2, ...)
+            field [NOT] BETWEEN low AND high     -- inclusive, as in SQL
+            field [NOT] LIKE|ILIKE "pat"         -- % any run, _ any one char
+            field IS [NOT] NULL                  -- absent OR explicitly null
+            NOT (...) / (... OR ...) / ...
+
+        An ordering comparison against a missing or null field is never true,
+        so ``WHERE fee < 5`` will not return a row that has no ``fee``. Use
+        ``IS NULL`` to select those rows.
+
+        A clause the server does not implement is REJECTED rather than
+        silently ignored, so a typo raises instead of quietly answering a
+        different question.
+
+        Requires nedb-engine >= 3.3.0 for IN / BETWEEN / LIKE / IS NULL / OR /
+        NOT / OFFSET / HAVING / multi-key ORDER BY and bare aggregates.
         """
         result = await self._query_raw(nql)
         return result.get("rows", [])

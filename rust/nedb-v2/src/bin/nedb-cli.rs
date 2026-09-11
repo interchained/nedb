@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+// NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 //! `nedb-cli` — the engine's companion CLI/sidecar for a NEDB v2 store on disk.
 //!
 //! `nedbd` *serves* a store over HTTP; `nedb-cli` operates on a store directory
@@ -20,7 +24,9 @@
 //!
 //! Exit code: 0 ok · 1 error/tamper/not-found · 2 usage.
 //!
-//! © INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)use std::env;
+//! © INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)
+
+use std::env;
 use std::path::Path;
 use std::process::exit;
 use std::sync::atomic::Ordering;

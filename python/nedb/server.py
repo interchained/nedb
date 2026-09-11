@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+# NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 """
 nedbd — the NEDB server daemon.
 
@@ -28,6 +32,7 @@ HTTP API (all JSON):
   POST   /v1/databases/<name>/put              {coll, id, doc, client?, nonce?, idem?, ttl_s?}
   POST   /v1/databases/<name>/index            {coll, field, kind}
   POST   /v1/databases/<name>/link             {frm, rel, to}
+  GET    /v1/databases/<name>/rows/<coll>/<id>[?as_of=N]
   DELETE /v1/databases/<name>/rows/<coll>/<id>
   GET    /v1/databases/<name>/verify
   GET    /v1/databases/<name>/log?limit=N
@@ -53,7 +58,7 @@ import shutil
 import traceback as _tb
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 from . import __version__
 from .engine import NEDB
@@ -253,8 +258,20 @@ def make_handler(manager: Manager, token: Optional[str]):
 
         # ── dispatch ─────────────────────────────────────────────────────────
         def _parts(self):
+            """Split the path into PERCENT-DECODED segments, plus the query.
+
+            Decoding happens AFTER the split, which is the only correct order:
+            a `%2F` inside a segment becomes a literal `/` that belongs to that
+            segment rather than splitting it. Without this, every route taking
+            an id from the path looked up the still-encoded text — so
+            `DELETE .../rows/t/a%2Fslash` reported "did not exist" for a
+            document that did, and no id containing a slash, space or percent
+            was reachable by path at all. The Rust daemon's router has always
+            decoded; this brings the Python server into line.
+            """
             u = urlparse(self.path)
-            return [p for p in u.path.split("/") if p], parse_qs(u.query)
+            return ([unquote(p) for p in u.path.split("/") if p],
+                    parse_qs(u.query))
 
         def do_OPTIONS(self) -> None:
             self.send_response(204)
@@ -511,11 +528,36 @@ def make_handler(manager: Manager, token: Optional[str]):
                                          "size": len(data), "tier": tier})
                         return
 
+                # GET /v1/databases/<name>/rows/<coll>/<id>[?as_of=N]
+                #
+                # Parity with the Rust daemon, which grew this route in 3.3.0.
+                # Without it a client had to build `FROM coll WHERE _id = "..."`
+                # and interpolate the id, which made every id containing a
+                # double quote unreachable and every id containing a slash
+                # unreachable through the path form.
+                #
+                # A missing row is 200 with `row: null`, NOT 404 — a 404 would
+                # be indistinguishable from "this server has no such route",
+                # which is exactly the discrimination the client needs.
+                if method == "GET" and len(parts) == 6 and parts[:2] == ["v1", "databases"] and parts[3] == "rows":
+                    db = manager.require(parts[2])
+                    as_of_raw = query.get("as_of", [None])[0]
+                    as_of = int(as_of_raw) if as_of_raw is not None else None
+                    doc = db.get(parts[4], parts[5], as_of=as_of)
+                    self._send(200, {"row": doc, "seq": db.seq, "head": db.head})
+                    return
+
                 # DELETE /v1/databases/<name>/rows/<coll>/<id>
                 if method == "DELETE" and len(parts) == 6 and parts[:2] == ["v1", "databases"] and parts[3] == "rows":
                     db = manager.require(parts[2])
+                    # `ok` reports whether the document EXISTED, matching the
+                    # Rust daemon's `{"ok": existed}`. This was hardcoded True,
+                    # so a client could not tell a real delete from a no-op —
+                    # `client.delete()` answered True for an id that was never
+                    # there. engine.delete() returns None, hence the probe.
+                    existed = db.get(parts[4], parts[5]) is not None
                     db.delete(parts[4], parts[5])
-                    self._send(200, {"ok": True, "seq": db.seq, "head": db.head})
+                    self._send(200, {"ok": existed, "seq": db.seq, "head": db.head})
                     return
 
                 # GET  /v1/databases/<name>/files/<filename>          → file bytes as base64

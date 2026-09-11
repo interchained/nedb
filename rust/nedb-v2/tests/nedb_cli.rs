@@ -1,7 +1,13 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+// NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 //! Integration tests for the `nedb-cli` binary. Builds a real store via the lib,
 //! then drives the compiled CLI as a subprocess and checks its behavior.
 //!
-//! © INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)use std::process::{Command, Output};
+//! © INTERCHAINED LLC × Vex (Interchained AI fleet: GLM · Claude · Opus · Fable · GPT-6)
+
+use std::process::{Command, Output};
 
 use nedb_engine::Db;
 

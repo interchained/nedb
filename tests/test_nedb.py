@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+# SPDX-License-Identifier: BUSL-1.1
+# NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 """NEDB invariant tests. Run: python3 -m pytest -q   (or python3 tests/test_nedb.py)"""
 from __future__ import annotations
 

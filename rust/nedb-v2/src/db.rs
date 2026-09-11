@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+// NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 //! Main DAG database — coordinates ObjectStore, IdIndex, SortedIndexes, GraphStore.
 
 use std::fs;
@@ -89,6 +93,25 @@ pub struct ScanStatus {
 pub struct Db {
     pub objects:        ObjectStore,
     pub id_index:       IdIndex,
+    /// Deleted id → its tombstone hash. The GRAVEYARD.
+    ///
+    /// `id_index` answers "what is the current version of this key?", so a
+    /// delete has to remove the entry from it or the row would stay visible.
+    /// But that made a deleted document's whole HISTORY unreachable: `AS OF`
+    /// enumerates ids from `id_index`, so the id was never considered at any
+    /// sequence — even one long before the delete. Nothing was lost on disk
+    /// (the tombstone node keeps a `prev` link to the full version chain); it
+    /// was simply unreferenced.
+    ///
+    /// That contradicted the central promise: a `DELETE` is a tombstone, not
+    /// an erasure. So the pointer is not dropped, it is MOVED here — the id
+    /// leaves the land of the living and stays addressable in history.
+    ///
+    /// It is a second `IdIndex` rather than a new namespace inside the first
+    /// because every operation needed — set, get, list, remove, WAL buffering,
+    /// sharded on-disk layout — already exists and is already tested. A
+    /// deliberately boring choice.
+    pub del_index:      IdIndex,
     pub sorted_indexes: SortedIndexes,
     pub graph:          GraphStore,
     pub root:           PathBuf,
@@ -141,6 +164,7 @@ impl Db {
         Self {
             objects:        ObjectStore::in_memory(),
             id_index:       IdIndex::in_memory(),
+            del_index:      IdIndex::in_memory(),
             sorted_indexes: SortedIndexes::new(),
             graph:          GraphStore::in_memory(),
             root:           std::path::PathBuf::from(":memory:"),
@@ -196,12 +220,16 @@ impl Db {
 
         let objects        = ObjectStore::new(db_root, dek.clone())?;
         let id_index       = IdIndex::new(db_root)?;
+        // The graveyard lives under its own root so it shares no path with the
+        // live index and cannot be confused with it by any existing reader.
+        let del_index      = IdIndex::new(&db_root.join("graveyard"))?;
         let sorted_indexes = SortedIndexes::new();
         let graph          = GraphStore::new(db_root)?;
 
         let mut db = Self {
             objects,
             id_index,
+            del_index,
             sorted_indexes,
             graph,
             root: db_root.to_path_buf(),
@@ -599,7 +627,11 @@ impl Db {
     /// is still worth doing when one index leaf failed), and the first error is
     /// returned. Failed id-index entries stay in the WAL for retry.
     pub fn try_flush_all(&self) -> Result<()> {
-        let index_result = self.id_index.try_flush_write_buf();
+        let index_result = self.id_index.try_flush_write_buf()
+            // The graveyard is as durable as the live index: a tombstone
+            // pointer lost to a crash would take a document's history back out
+            // of reach, which is the bug this index exists to prevent.
+            .and(self.del_index.try_flush_write_buf());
         // v3: fsync the active segment (no-op for loose/in-memory stores).
         // One durability point per batch instead of one fsync per object.
         let sync_result = self.objects.sync();
@@ -630,6 +662,28 @@ impl Db {
     /// dropped, so AS OF / TRACE over pruned versions is discarded — that is
     /// what reclaims the space. Flushes first so all data is durable on disk
     /// before the old segments are deleted.
+    /// Reclaim space by rewriting the segments with only CURRENT versions.
+    ///
+    /// # This discards history. On purpose.
+    ///
+    /// The live set is each document's current-version hash and nothing else,
+    /// so compaction drops every superseded version and every tombstone. After
+    /// it runs, `AS OF` can no longer reach a prior value and `TRACE` can no
+    /// longer walk to a pruned ancestor — the rows simply become unavailable
+    /// rather than wrong, and `verify()` stays clean because what remains is
+    /// still internally consistent.
+    ///
+    /// That is worth stating loudly, because NEDB's headline property is that
+    /// history is permanent and never garbage-collected — and it is, right up
+    /// until an operator calls THIS. Nothing calls it automatically: it is not
+    /// on the HTTP surface, not in the CLI, and not on any timer. It exists for
+    /// the operator who has decided, explicitly, to trade the audit trail for
+    /// disk space.
+    ///
+    /// A graveyard entry whose tombstone was pruned is left pointing at an
+    /// object that no longer exists. `get_as_of` degrades to `None` there
+    /// rather than failing, so a compacted store answers "not available at that
+    /// sequence" instead of erroring or inventing a value.
     pub fn compact(&self) -> Result<crate::segment::CompactStats> {
         self.flush_all();
         let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -781,6 +835,7 @@ impl Db {
                 };
                 // Flush id-index WAL to disk (parallel Rayon writes)
                 db.id_index.flush_write_buf();
+                db.del_index.flush_write_buf();
                 // Segment bytes must be durable BEFORE a MANIFEST that
                 // references them: otherwise power loss can leave MANIFEST
                 // pointing at a tip whose object bytes were still in the page
@@ -829,6 +884,18 @@ impl Db {
         self.update_head(coll, seq, &hash);
         // Remove the live id pointer — doc is now invisible to queries and list()
         self.id_index.remove(coll, id)?;
+        // …and MOVE it to the graveyard, so history stays reachable.
+        //
+        // Removing the live pointer without this made the document's whole
+        // version chain unaddressable: `AS OF` walks ids from `id_index`, so a
+        // deleted id was skipped at every sequence — including sequences long
+        // before the delete, where the row demonstrably existed. Nothing was
+        // lost on disk, only unreferenced, which is the worst kind of data
+        // loss because `verify()` still counts every object as healthy.
+        //
+        // The tombstone hash is the entry point: its `prev` links to the last
+        // live version, and that chain back to the first write.
+        self.del_index.set(coll, id, &hash)?;
         Ok(true)
     }
 
@@ -845,9 +912,40 @@ impl Db {
 
     /// Get a document AS OF a specific sequence number.
     /// Walks the version chain (prev links) backward until seq <= target.
+    ///
+    /// Reaches DELETED documents too. A delete moves the id's pointer into the
+    /// graveyard rather than dropping it, so the version chain stays walkable
+    /// and a row is still readable at a sequence before it was deleted — which
+    /// is what "a DELETE is a tombstone, not an erasure" has to mean in
+    /// practice. At or after the tombstone's own sequence the document is
+    /// correctly absent.
     pub fn get_as_of(&self, coll: &str, id: &str, target_seq: u64) -> Option<Node> {
-        let hash = self.id_index.get(coll, id)?;
-        let mut current = self.objects.read(&hash).ok()?;
+        // The live chain first: the common case, and the only one for an id
+        // that was never deleted.
+        if let Some(hash) = self.id_index.get(coll, id) {
+            if let Some(node) = self.walk_back_to(&hash, target_seq) {
+                return Some(node);
+            }
+            // Falling through matters for a RE-CREATED id. A `put` after a
+            // delete starts a fresh chain with no `prev`, so the live chain
+            // cannot reach a sequence from before the delete — but the
+            // graveyard still can.
+        }
+        let tomb_hash = self.del_index.get(coll, id)?;
+        let tomb = self.objects.read(&tomb_hash).ok()?;
+        // As of the tombstone's own sequence the document is deleted. Returning
+        // the tombstone node itself would surface `{_deleted, _prev}` as if it
+        // were the document.
+        if tomb.seq <= target_seq {
+            return None;
+        }
+        self.walk_back_to(tomb.prev.as_deref()?, target_seq)
+    }
+
+    /// Walk `prev` links back from `hash` to the newest version at or before
+    /// `target_seq`. `None` when the chain starts after it.
+    fn walk_back_to(&self, hash: &str, target_seq: u64) -> Option<Node> {
+        let mut current = self.objects.read(hash).ok()?;
         loop {
             if current.seq <= target_seq {
                 return Some(current);
@@ -857,6 +955,19 @@ impl Db {
         }
     }
 
+    /// Every id in a collection that AS OF must consider: the live ones, plus
+    /// the deleted ones whose history is still addressable.
+    ///
+    /// Order is stable (sorted, deduplicated) so a historical query answers the
+    /// same way run to run.
+    pub fn list_ids_including_deleted(&self, coll: &str) -> Vec<String> {
+        let mut ids = self.id_index.list_ids(coll);
+        ids.extend(self.del_index.list_ids(coll));
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     /// List all documents in a collection, returning current versions.
     pub fn list(&self, coll: &str) -> Vec<Node> {
         self.id_index
@@ -864,6 +975,77 @@ impl Db {
             .into_iter()
             .filter_map(|id| self.get(coll, &id))
             .collect()
+    }
+
+    /// Candidate nodes whose `field` falls in the given range, via the sorted
+    /// index. `None` when no index covers (coll, field) — the caller must then
+    /// fall back to a scan.
+    ///
+    /// Returns CURRENT versions only (the index drops a superseded hash on
+    /// overwrite), so this must not be used to serve an `AS OF` query.
+    pub fn range_scan(
+        &self,
+        coll: &str,
+        field: &str,
+        low: Option<&Value>,
+        high: Option<&Value>,
+        low_incl: bool,
+        high_incl: bool,
+    ) -> Option<Vec<Node>> {
+        if !self.sorted_indexes.has(coll, field) {
+            return None;
+        }
+        Some(
+            self.sorted_indexes
+                .range(coll, field, low, high, low_incl, high_incl)
+                .into_iter()
+                .filter_map(|h| self.objects.read(&h).ok())
+                .collect(),
+        )
+    }
+
+    /// Candidate nodes whose `field` equals any of `values` — the indexed path
+    /// for `=` and for `IN (...)`. `None` when no index covers the field.
+    pub fn index_lookup(&self, coll: &str, field: &str, values: &[Value]) -> Option<Vec<Node>> {
+        if !self.sorted_indexes.has(coll, field) {
+            return None;
+        }
+        // A value may legitimately appear in several arms of an IN list, and a
+        // hash must not be returned twice.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out = vec![];
+        for v in values {
+            for h in self.sorted_indexes.exact(coll, field, v) {
+                if seen.insert(h.clone()) {
+                    if let Ok(node) = self.objects.read(&h) {
+                        out.push(node);
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// How many rows an indexed range covers, without reading any of them.
+    /// `None` when no index covers the field.
+    pub fn range_cardinality(
+        &self,
+        coll: &str,
+        field: &str,
+        low: Option<&Value>,
+        high: Option<&Value>,
+        low_incl: bool,
+        high_incl: bool,
+    ) -> Option<usize> {
+        if !self.sorted_indexes.has(coll, field) {
+            return None;
+        }
+        Some(self.sorted_indexes.range_len(coll, field, low, high, low_incl, high_incl))
+    }
+
+    /// True when a sorted index covers (coll, field).
+    pub fn has_sorted_index(&self, coll: &str, field: &str) -> bool {
+        self.sorted_indexes.has(coll, field)
     }
 
     /// ORDER BY field ASC LIMIT n — uses sorted index if available, else falls back to full scan.
@@ -1363,6 +1545,167 @@ mod tests {
 mod tests_v2 {
     use super::*;
     use tempfile::tempdir;
+
+    // ── a DELETE is a tombstone, not an erasure ─────────────────────────────
+    //
+    // `delete()` used to just remove the live id pointer, which made the
+    // document's whole history unreachable: `AS OF` enumerates ids from
+    // `id_index`, so a deleted id was skipped at EVERY sequence — including
+    // sequences long before the delete, where the row demonstrably existed.
+    //
+    // Nothing was lost on disk. The tombstone node keeps a `prev` link to the
+    // full version chain and `verify()` counted every object as healthy — which
+    // makes it the worst kind of data loss, the kind that passes its own audit.
+    // The pointer is now MOVED to the graveyard instead of dropped.
+
+    #[test]
+    fn a_deleted_documents_history_is_still_readable_before_the_delete() {
+        let db = Db::in_memory();
+        let v1 = db.put("o", "a", serde_json::json!({"t": 55}), vec![], None, None).unwrap();
+        let v2 = db.put("o", "a", serde_json::json!({"t": 66}), vec![], None, None).unwrap();
+        assert!(db.delete("o", "a").unwrap());
+
+        // Gone from the present — a delete must still delete.
+        assert!(db.get("o", "a").is_none(), "a deleted doc must not be visible now");
+
+        // …and readable at each sequence it existed at.
+        let at_v1 = db.get_as_of("o", "a", v1.seq).expect("the ORIGINAL value survives");
+        assert_eq!(at_v1.data["t"], serde_json::json!(55));
+        let at_v2 = db.get_as_of("o", "a", v2.seq).expect("the UPDATED value survives");
+        assert_eq!(at_v2.data["t"], serde_json::json!(66));
+    }
+
+    #[test]
+    fn as_of_the_tombstone_or_later_reports_the_document_absent() {
+        let db = Db::in_memory();
+        db.put("o", "a", serde_json::json!({"t": 55}), vec![], None, None).unwrap();
+        db.delete("o", "a").unwrap();
+        let tomb_seq = db.tip().expect("the tombstone is the tip").seq;
+
+        assert!(db.get_as_of("o", "a", tomb_seq).is_none(),
+                "at the delete's own sequence the document is gone");
+        assert!(db.get_as_of("o", "a", tomb_seq + 10).is_none(), "and after it");
+        // Never the tombstone node itself: `{_deleted, _prev}` is bookkeeping,
+        // and surfacing it would look like a document with strange fields.
+        for s in 0..=tomb_seq + 1 {
+            if let Some(n) = db.get_as_of("o", "a", s) {
+                assert!(n.data.get("_deleted").is_none(),
+                        "seq {} surfaced the tombstone as a document: {:?}", s, n.data);
+            }
+        }
+    }
+
+    #[test]
+    fn an_as_of_query_lists_deleted_ids_alongside_live_ones() {
+        let db = Db::in_memory();
+        db.put("o", "keep", serde_json::json!({"n": 1}), vec![], None, None).unwrap();
+        let gone = db.put("o", "gone", serde_json::json!({"n": 2}), vec![], None, None).unwrap();
+        db.delete("o", "gone").unwrap();
+
+        assert_eq!(db.id_index.list_ids("o"), vec!["keep".to_string()],
+                   "the live index holds only the living");
+        assert_eq!(db.list_ids_including_deleted("o"),
+                   vec!["gone".to_string(), "keep".to_string()],
+                   "AS OF must consider both, in a stable order");
+
+        // The query path, end to end — this is what actually regressed.
+        let (rows, _) = crate::nql::query(&db, &format!("FROM o AS OF {}", gone.seq)).unwrap();
+        let ids: Vec<&str> = rows.iter().filter_map(|r| r["_id"].as_str()).collect();
+        assert!(ids.contains(&"gone"), "AS OF must see the deleted row: {:?}", ids);
+        assert!(ids.contains(&"keep"), "{:?}", ids);
+
+        // And the present must not.
+        let (now, _) = crate::nql::query(&db, "FROM o").unwrap();
+        let ids: Vec<&str> = now.iter().filter_map(|r| r["_id"].as_str()).collect();
+        assert_eq!(ids, vec!["keep"], "a delete still deletes");
+    }
+
+    #[test]
+    fn a_recreated_id_keeps_the_history_from_before_its_delete() {
+        // The edge case the graveyard fallback exists for: a `put` after a
+        // delete starts a FRESH chain with no `prev`, so the live chain cannot
+        // reach a sequence from before the delete. Only the graveyard can.
+        let db = Db::in_memory();
+        let old = db.put("o", "a", serde_json::json!({"era": "first"}), vec![], None, None).unwrap();
+        db.delete("o", "a").unwrap();
+        let new = db.put("o", "a", serde_json::json!({"era": "second"}), vec![], None, None).unwrap();
+
+        assert_eq!(db.get("o", "a").unwrap().data["era"], serde_json::json!("second"));
+        assert_eq!(db.get_as_of("o", "a", new.seq).unwrap().data["era"],
+                   serde_json::json!("second"));
+        assert_eq!(db.get_as_of("o", "a", old.seq).expect("the FIRST era survives").data["era"],
+                   serde_json::json!("first"),
+                   "re-creating an id must not orphan what came before it");
+    }
+
+    #[test]
+    fn the_graveyard_survives_a_reopen() {
+        // A tombstone pointer lost to a restart would put the history back out
+        // of reach — the exact bug, just deferred. So it is flushed with the
+        // live index and read back from disk.
+        let dir = tempdir().unwrap();
+        let seq = {
+            let db = Db::open(dir.path(), None).unwrap();
+            let v1 = db.put("o", "a", serde_json::json!({"t": 7}), vec![], None, None).unwrap();
+            db.delete("o", "a").unwrap();
+            db.try_flush_all().expect("flush must succeed");
+            v1.seq
+        };
+        let db = Db::open(dir.path(), None).unwrap();
+        assert!(db.get("o", "a").is_none(), "still deleted after a reopen");
+        assert_eq!(db.get_as_of("o", "a", seq).expect("history survives a reopen").data["t"],
+                   serde_json::json!(7));
+        assert_eq!(db.list_ids_including_deleted("o"), vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn the_graveyard_is_invisible_to_everything_that_enumerates_the_store() {
+        // It adds a directory to the data dir, so the risk is that it shows up
+        // as a phantom COLLECTION or a phantom OBJECT. Both enumerations are
+        // rooted at their own subdirectory rather than at the data dir, which
+        // is why it cannot — but that is exactly the kind of reasoning worth
+        // pinning, because a stray "graveyard" collection would be nasty and
+        // would only surface in someone's UI.
+        let dir = tempdir().unwrap();
+        let db = Db::open(dir.path(), None).unwrap();
+        db.put("orders", "a", serde_json::json!({"t": 1}), vec![], None, None).unwrap();
+        // A surviving sibling, so the collection is still live after the
+        // delete. (With `a` alone, `orders` would have no index entries left
+        // and so no directory to enumerate — existing behaviour, unrelated to
+        // the graveyard, but it would make this test assert the wrong thing.)
+        db.put("orders", "b", serde_json::json!({"t": 2}), vec![], None, None).unwrap();
+        db.delete("orders", "a").unwrap();
+        db.try_flush_all().unwrap();
+
+        let colls = db.id_index.collections();
+        assert!(!colls.iter().any(|c| c == "graveyard"),
+                "the graveyard must not look like a collection: {:?}", colls);
+        assert_eq!(colls, vec!["orders".to_string()]);
+
+        let (_checked, tampered) = db.verify();
+        assert!(tampered.is_empty(), "{:?}", tampered);
+    }
+
+    #[test]
+    fn a_delete_leaves_the_hash_chain_verifiable() {
+        // The graveyard is an index, not a second source of truth: it must not
+        // be able to make `verify()` disagree with the objects on disk.
+        let db = Db::in_memory();
+        db.put("o", "a", serde_json::json!({"t": 1}), vec![], None, None).unwrap();
+        db.put("o", "b", serde_json::json!({"t": 2}), vec![], None, None).unwrap();
+        db.delete("o", "a").unwrap();
+        let (checked, tampered) = db.verify();
+        assert!(tampered.is_empty(), "a delete must not break verify(): {:?}", tampered);
+        assert!(checked >= 3, "the tombstone is an object too, got {}", checked);
+    }
+
+    #[test]
+    fn deleting_a_missing_id_stays_a_no_op() {
+        let db = Db::in_memory();
+        assert!(!db.delete("o", "nope").unwrap(), "nothing to delete");
+        assert!(db.list_ids_including_deleted("o").is_empty(),
+                "a failed delete must not put anything in the graveyard");
+    }
 
     #[test]
     fn seq_index_populated_on_put() {

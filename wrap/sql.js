@@ -1,3 +1,7 @@
+// SPDX-FileCopyrightText: 2026 INTERCHAINED LLC
+// SPDX-License-Identifier: BUSL-1.1
+// NEDB · © 2026 INTERCHAINED LLC × Eth-Interchained × Vex (Claude Opus 5)
+
 'use strict';
 // nedb/wrap/sql.js — wrapSqlite / wrapMysql / wrapPg: causal provenance for
 // SQL databases (JS).
