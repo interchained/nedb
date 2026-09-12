@@ -134,17 +134,25 @@ impl<'a> Lexer<'a> {
             return Tok::Str(s);
         }
 
+        // Three-char operators: the case-insensitive regex negation `!~*`.
+        // Longest match FIRST — checked before `!~` and before `!=`, or `!~*`
+        // would tokenise as `!~` followed by a stray `*`.
+        if self.pos + 2 < self.src.len() && &self.src[self.pos..self.pos + 3] == "!~*" {
+            self.pos += 3;
+            return Tok::Op("!~*".to_string());
+        }
+
         // Two-char operators
         if self.pos + 1 < self.src.len() {
             let two = &self.src[self.pos..self.pos+2];
-            if matches!(two, "!=" | ">=" | "<=") {
+            if matches!(two, "!=" | ">=" | "<=" | "!~" | "~*") {
                 self.pos += 2;
                 return Tok::Op(two.to_string());
             }
         }
 
         // One-char operators
-        if matches!(c, '=' | '>' | '<') {
+        if matches!(c, '=' | '>' | '<' | '~') {
             self.pos += 1;
             return Tok::Op(c.to_string());
         }
@@ -225,6 +233,25 @@ pub enum Pred {
     /// field [NOT] LIKE "pat" — SQL wildcards: % = any run, _ = any one char.
     /// `ci` is set by ILIKE (case-insensitive).
     Like { field: String, pattern: String, negated: bool, ci: bool },
+    /// `field ~ "pat"` / `field !~ "pat"` — POSIX regex match, over a
+    /// DOCUMENTED SUBSET. `ci` is set by `~*` / `!~*`.
+    ///
+    /// Exists because Postgres catalogue introspection needs it: `psql`'s
+    /// `\dn` filters with `nspname !~ '^pg_'`, and `\dt` with
+    /// `nspname !~ '^pg_toast'`. Without the operator those queries cannot
+    /// run at all.
+    ///
+    /// The subset is `^`, `$`, `.`, and literal text — which is everything
+    /// those queries actually use. A pattern containing any other
+    /// metacharacter is REFUSED with an error naming it, rather than matched
+    /// approximately. Approximate regex matching on a catalogue filter would
+    /// silently include or exclude schemas, and a wrong schema list looks
+    /// exactly like a correct one.
+    ///
+    /// Deliberately no `regex` crate: it would add a dependency tree to an
+    /// engine whose small footprint is a selling point, to serve two anchored
+    /// prefix patterns.
+    Regex { field: String, pattern: String, negated: bool, ci: bool },
     /// field IS [NOT] NULL — true when the field is JSON null OR absent.
     IsNull { field: String, negated: bool },
     And(Vec<Pred>),
@@ -456,6 +483,35 @@ impl Parser {
             Tok::Op(s) => s,
             other => bail!("WHERE: expected operator, got {:?}", other),
         };
+
+        // `~` / `~*` / `!~` / `!~*` — POSIX regex match. Its argument is a
+        // PATTERN, not a value, so it is taken as text and validated here
+        // rather than passed through `parse_value` (which would happily
+        // interpret `^1` as something numeric).
+        if matches!(op.as_str(), "~" | "~*" | "!~" | "!~*") {
+            let pattern = match self.advance() {
+                Tok::Str(s) => s,
+                Tok::Ident(s) => s,
+                other => bail!("WHERE: {} expects a pattern string, got {:?}", op, other),
+            };
+            // Refuse an unsupported metacharacter HERE, at parse time, so the
+            // caller learns at the point of the mistake instead of receiving a
+            // confidently wrong row set.
+            if let Some(bad) = unsupported_regex_char(&pattern) {
+                bail!("WHERE: regex {:?} uses {:?}, which this engine does not \
+                       implement. The supported subset is ^ $ . and literal text \
+                       — enough for catalogue filters like '^pg_'. Matching the \
+                       rest approximately would silently include or exclude rows, \
+                       so it is refused instead", pattern, bad);
+            }
+            return Ok(Pred::Regex {
+                field,
+                pattern,
+                negated: op.starts_with('!'),
+                ci: op.ends_with('*'),
+            });
+        }
+
         let value = self.parse_value()?;
         Ok(Pred::Cmp { field, op, value })
     }
@@ -751,6 +807,81 @@ fn like_match(value: &str, pattern: &str, ci: bool) -> bool {
     pi == p.len()
 }
 
+/// The first regex metacharacter in `pattern` that this engine does not
+/// implement, or `None` when the whole pattern is inside the supported subset.
+///
+/// Supported: `^` `$` `.` and literal text. Everything else is refused rather
+/// than approximated — see `Pred::Regex`.
+fn unsupported_regex_char(pattern: &str) -> Option<char> {
+    // `\` is listed because an escape changes the meaning of the NEXT
+    // character, so honouring `^` and `.` while ignoring escapes would make
+    // `\.` match any character instead of a literal dot.
+    const UNSUPPORTED: &[char] =
+        &['*', '+', '?', '[', ']', '(', ')', '{', '}', '|', '\\'];
+    pattern.chars().find(|c| UNSUPPORTED.contains(c))
+}
+
+/// POSIX regex matching over the documented subset: `^`, `$`, `.`, literals.
+///
+/// `^` anchors at the start and `$` at the end; ANYWHERE else they are literal
+/// characters, which is what POSIX says. An unanchored pattern is a substring
+/// search, which is the behaviour psql's catalogue filters rely on.
+fn regex_match(value: &str, pattern: &str, ci: bool) -> bool {
+    let (v, p): (Vec<char>, Vec<char>) = if ci {
+        (value.to_lowercase().chars().collect(), pattern.to_lowercase().chars().collect())
+    } else {
+        (value.chars().collect(), pattern.chars().collect())
+    };
+
+    let anchored_start = p.first() == Some(&'^');
+    // No length guard here: a pattern of exactly `$` IS an end anchor in
+    // POSIX and matches every string. Guarding on `len > 1` made that lone
+    // `$` a literal dollar sign, so `x ~ '$'` answered false where Postgres
+    // answers true. The slice below cannot underflow — a single character
+    // cannot be both `^` and `$`, so the two anchors never consume more than
+    // the pattern holds.
+    let anchored_end = p.last() == Some(&'$');
+    let body = &p[usize::from(anchored_start)..p.len() - usize::from(anchored_end)];
+
+    // `.` matches exactly one character, so a fixed-length comparison.
+    let matches_at = |start: usize| -> bool {
+        if start + body.len() > v.len() {
+            return false;
+        }
+        body.iter().enumerate().all(|(i, pc)| *pc == '.' || *pc == v[start + i])
+    };
+
+    match (anchored_start, anchored_end) {
+        (true, true) => v.len() == body.len() && matches_at(0),
+        (true, false) => matches_at(0),
+        (false, true) => v.len() >= body.len() && matches_at(v.len() - body.len()),
+        // Unanchored: a substring search. An empty pattern matches anything,
+        // exactly as POSIX says.
+        (false, false) => (0..=v.len().saturating_sub(body.len())).any(matches_at),
+    }
+}
+
+/// Public aliases so the SQL `SELECT` engine matches patterns with EXACTLY
+/// the same code NQL does.
+///
+/// Two implementations of `LIKE` or of the regex subset would be two chances
+/// for the SQL surface and the NQL surface to disagree about the same
+/// operator on the same data — and a filter that disagrees with itself is the
+/// silent-wrong-row class this engine keeps having to remove.
+pub fn regex_match_pub(value: &str, pattern: &str, ci: bool) -> bool {
+    regex_match(value, pattern, ci)
+}
+
+/// The first unsupported regex metacharacter, or `None`. See `Pred::Regex`.
+pub fn unsupported_regex_char_pub(pattern: &str) -> Option<char> {
+    unsupported_regex_char(pattern)
+}
+
+/// SQL `LIKE` matching — `%` any run, `_` exactly one char.
+pub fn like_match_pub(value: &str, pattern: &str, ci: bool) -> bool {
+    like_match(value, pattern, ci)
+}
+
 /// Evaluate a predicate against anything that can resolve a field name.
 ///
 /// Generic over the row source so ONE implementation serves both `WHERE`
@@ -781,6 +912,17 @@ fn eval_pred_with(get: &dyn Fn(&str) -> Value, pred: &Pred) -> bool {
             // predicate over NULL is never true in either polarity.
             if fv.is_null() { return false; }
             let hit = like_match(&as_text(&fv), pattern, *ci);
+            hit != *negated
+        }
+
+        Pred::Regex { field, pattern, negated, ci } => {
+            let fv = get(field);
+            // Same three-valued logic as LIKE: a predicate over NULL is never
+            // true in EITHER polarity, so `x !~ 'p'` does not match a row
+            // where x is absent. Postgres agrees, and psql's catalogue filters
+            // depend on it.
+            if fv.is_null() { return false; }
+            let hit = regex_match(&as_text(&fv), pattern, *ci);
             hit != *negated
         }
 
@@ -1449,6 +1591,64 @@ pub fn query(db: &Db, nql: &str) -> Result<(Vec<Value>, usize)> {
     Ok((rows, count))
 }
 
+/// Run a query's WHERE / ORDER BY / OFFSET / LIMIT against rows ALREADY IN
+/// HAND, rather than against stored documents.
+///
+/// This is what makes `pg_catalog` and `information_schema` real queryable
+/// tables instead of pattern-matched query strings. A catalogue row is
+/// synthesised from the live database, never stored — but `psql` filters and
+/// orders it with ordinary SQL, so it needs the ordinary predicate surface.
+///
+/// The alternative was to recognise psql's exact query text and answer it from
+/// a fixed table. That breaks SILENTLY the moment psql changes its query, and
+/// an empty table list is indistinguishable from "this database has no
+/// tables" — the same class of confidently-wrong answer as everything else
+/// this engine has had to fix. So the predicate engine is REUSED here rather
+/// than a second, poorer copy being written: one `eval_pred_with`, one
+/// `sort_by_keys`, one `paginate`, already tested.
+///
+/// Clauses that only mean something against the log — `AS OF`, `VALID AS OF`,
+/// `TRACE`, `TRAVERSE`, `SEARCH`, and aggregates — are REFUSED by name. A
+/// catalogue has no history and no causal edges; silently ignoring the clause
+/// would answer a time-travel question with present-day rows.
+pub fn query_rows(rows: Vec<Value>, nql: &str) -> Result<Vec<Value>> {
+    let q = parse(nql)?;
+
+    for (unsupported, clause) in [
+        (q.as_of.is_some(), "AS OF"),
+        (q.valid_as_of.is_some(), "VALID AS OF"),
+        (q.trace.is_some(), "TRACE"),
+        (q.traverse.is_some(), "TRAVERSE"),
+        (q.search.is_some(), "SEARCH"),
+        (q.aggregate.is_some(), "an aggregate"),
+        (q.having.is_some(), "HAVING"),
+    ] {
+        if unsupported {
+            bail!("{} is not supported on the catalogue table {:?} — a catalogue \
+                   is synthesised from the current database, so it has no history, \
+                   no causal edges and nothing to aggregate. Query the collection \
+                   itself for those", clause, q.coll);
+        }
+    }
+
+    let get = |row: &Value, field: &str| -> Value {
+        row.get(field).cloned().unwrap_or(Value::Null)
+    };
+
+    let mut kept: Vec<Value> = match &q.where_ {
+        None => rows,
+        Some(pred) => rows
+            .into_iter()
+            .filter(|r| eval_pred_with(&|f| get(r, f), pred))
+            .collect(),
+    };
+
+    if !q.order_by.is_empty() {
+        sort_by_keys(&mut kept, &q.order_by, get);
+    }
+    Ok(paginate(kept, q.offset, q.limit))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1660,6 +1860,123 @@ mod tests {
         assert!(!like_match("abc", "%abd", false));
         assert!(!like_match("ab", "ab_", false));
         assert!(like_match("héllo wörld", "h_llo w%d", false));
+    }
+
+    // ── `~` / `!~` — the operator psql's catalogue filters need ─────────────
+
+    #[test]
+    fn regex_anchors_behave_as_posix_says() {
+        // THE case this exists for: psql's \dn sends `nspname !~ '^pg_'`.
+        assert!(regex_match("pg_catalog", "^pg_", false));
+        assert!(regex_match("pg_toast_1", "^pg_toast", false));
+        assert!(!regex_match("public", "^pg_", false));
+        // `^` only anchors at position 0 — a schema merely CONTAINING pg_ is
+        // not a system schema, and treating it as one would hide a user's data.
+        assert!(!regex_match("my_pg_stuff", "^pg_", false));
+
+        assert!(regex_match("report.sql", "sql$", false));
+        assert!(!regex_match("sql_report", "sql$", false));
+        // Anchored at both ends is an exact match.
+        assert!(regex_match("public", "^public$", false));
+        assert!(!regex_match("public2", "^public$", false));
+        // Unanchored is a substring search.
+        assert!(regex_match("xxpg_yy", "pg_", false));
+        assert!(!regex_match("xxqg_yy", "pg_", false));
+    }
+
+    #[test]
+    fn regex_dot_matches_exactly_one_character() {
+        assert!(regex_match("abc", "a.c", false));
+        assert!(!regex_match("ac", "a.c", false), "`.` is one char, not zero");
+        assert!(!regex_match("abbc", "a.c", false), "`.` is one char, not many");
+        // Operates on chars, so a multi-byte value matches correctly.
+        assert!(regex_match("héllo", "h.llo", false));
+    }
+
+    #[test]
+    fn regex_case_insensitivity_is_opt_in() {
+        assert!(regex_match("PG_CATALOG", "^pg_", true));
+        assert!(!regex_match("PG_CATALOG", "^pg_", false),
+                "`~` is case SENSITIVE; only `~*` folds case");
+    }
+
+    #[test]
+    fn an_empty_regex_matches_anything() {
+        // POSIX says so, and `$` alone is an empty anchored pattern.
+        assert!(regex_match("anything", "", false));
+        assert!(regex_match("", "", false));
+        assert!(regex_match("x", "$", false));
+    }
+
+    #[test]
+    fn an_unsupported_regex_metacharacter_is_REFUSED_not_approximated() {
+        // The whole point. Matching `a+b` approximately would silently include
+        // or exclude rows, and a wrong catalogue listing looks exactly like a
+        // correct one. So the parser refuses and names the character.
+        for pat in ["a+b", "a*b", "a?b", "[ab]", "(a|b)", "a{2}", "a\\.b"] {
+            assert!(unsupported_regex_char(pat).is_some(),
+                    "{:?} must be refused, not matched approximately", pat);
+        }
+        for pat in ["^pg_", "sql$", "^public$", "a.c", "plain", ""] {
+            assert_eq!(unsupported_regex_char(pat), None, "{:?} is in the subset", pat);
+        }
+        // `\` is refused because an escape changes the NEXT character's
+        // meaning: honouring `.` while ignoring `\` would make `\.` match any
+        // character instead of a literal dot.
+        assert_eq!(unsupported_regex_char("a\\.b"), Some('\\'));
+    }
+
+    #[test]
+    fn the_regex_operators_parse_in_all_four_spellings() {
+        for (nql, negated, ci) in [
+            (r#"FROM t WHERE nspname ~ "^pg_""#,   false, false),
+            (r#"FROM t WHERE nspname ~* "^pg_""#,  false, true),
+            (r#"FROM t WHERE nspname !~ "^pg_""#,  true,  false),
+            (r#"FROM t WHERE nspname !~* "^pg_""#, true,  true),
+        ] {
+            let q = parse(nql).unwrap_or_else(|e| panic!("{}: {}", nql, e));
+            match q.where_.expect("a predicate") {
+                Pred::Regex { field, pattern, negated: n, ci: c } => {
+                    assert_eq!(field, "nspname");
+                    assert_eq!(pattern, "^pg_");
+                    assert_eq!((n, c), (negated, ci), "{}", nql);
+                }
+                other => panic!("{} parsed as {:?}", nql, other),
+            }
+        }
+    }
+
+    #[test]
+    fn a_bad_regex_is_rejected_at_parse_time_with_the_offending_char() {
+        let e = parse(r#"FROM t WHERE x ~ "a+b""#).unwrap_err().to_string();
+        assert!(e.contains('+'), "the error must name the character: {}", e);
+        assert!(e.contains("refused"), "{}", e);
+    }
+
+    #[test]
+    fn a_regex_over_a_missing_field_is_false_in_both_polarities() {
+        // SQL three-valued logic, matching LIKE and matching Postgres. psql's
+        // catalogue filters depend on `!~` NOT resurrecting absent rows.
+        let (_tmp, db) = setup_items();
+        let (m, _) = query(&db, r#"FROM items WHERE nosuchfield ~ "x""#).unwrap();
+        assert!(m.is_empty());
+        let (n, _) = query(&db, r#"FROM items WHERE nosuchfield !~ "x""#).unwrap();
+        assert!(n.is_empty(), "NOT over NULL must not match either");
+    }
+
+    #[test]
+    fn the_regex_operator_works_end_to_end_over_stored_documents() {
+        let (_tmp, db) = setup_items();
+        let (all, _) = query(&db, "FROM items").unwrap();
+        let want: Vec<String> = all.iter()
+            .filter_map(|r| r["_id"].as_str().map(str::to_string)).collect();
+        // `_id` on every seeded item is non-empty, so an empty pattern matches
+        // all of them — a control proving the operator reaches the executor.
+        let (got, _) = query(&db, r#"FROM items WHERE _id ~ """#).unwrap();
+        assert_eq!(got.len(), want.len());
+        // And `!~` over the same pattern matches none.
+        let (none, _) = query(&db, r#"FROM items WHERE _id !~ """#).unwrap();
+        assert!(none.is_empty());
     }
 
     #[test]

@@ -10,7 +10,7 @@ One Rust core → ships to **PyPI** and **npm** from a single source.
 [![PyPI](https://img.shields.io/pypi/v/nedb-engine?label=PyPI&color=6366f1)](https://pypi.org/project/nedb-engine/)
 [![crates.io](https://img.shields.io/crates/v/nedb-engine?label=crates.io&color=f97316)](https://crates.io/crates/nedb-engine)
 [![npm](https://img.shields.io/npm/v/nedb-engine?label=npm&color=00d4ff)](https://www.npmjs.com/package/nedb-engine)
-[![CI](https://img.shields.io/github/actions/workflow/status/Eth-Interchained/nedb/release.yml?label=CI&color=34d399)](https://github.com/Eth-Interchained/nedb/actions)
+[![CI](https://img.shields.io/github/actions/workflow/status/Eth-Interchained/nedb/test.yml?branch=master&label=CI&color=34d399)](https://github.com/Eth-Interchained/nedb/actions)
 [![nedb-engine-client PyPI](https://img.shields.io/pypi/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://pypi.org/project/nedb-engine-client/)
 [![nedb-engine-client npm](https://img.shields.io/npm/v/nedb-engine-client?label=nedb-engine-client&color=34d399)](https://www.npmjs.com/package/nedb-engine-client)
 [![License: BUSL-1.1](https://img.shields.io/badge/license-BUSL--1.1-f59e0b)](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE) [![Free under $1M revenue](https://img.shields.io/badge/free%20under%20%241M%20revenue-22c55e)](https://github.com/Eth-Interchained/nedb/blob/master/LICENSE)

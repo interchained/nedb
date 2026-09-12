@@ -49,7 +49,7 @@ _TOKEN_RE = re.compile(
       | "(?P<dq>[^"]*)"
       | '(?P<sq>[^']*)'
       | (?P<num>-?\d+(?:\.\d+)?)
-      | (?P<op><=|>=|!=|=|<|>)
+      | (?P<op>!~\*|!~|~\*|<=|>=|!=|=|<|>|~)
       | (?P<punct>[(),])
       | (?P<word>[A-Za-z_][A-Za-z0-9_]*)
     """,
@@ -128,6 +128,57 @@ def like_to_regex(pattern: str, ci: bool = False) -> "re.Pattern":
             out.append(re.escape(ch))
     flags = re.DOTALL | (re.IGNORECASE if ci else 0)
     return re.compile("^" + "".join(out) + "$", flags)
+
+
+# ── `~` / `!~` — POSIX regex over a DOCUMENTED SUBSET ────────────────────────
+
+# Supported: ^ $ . and literal text. Everything else is REFUSED.
+#
+# This exists because Postgres catalogue introspection needs it: psql's `\dn`
+# filters with `nspname !~ '^pg_'`. Without the operator those queries cannot
+# run at all.
+#
+# Python has `re` and could match the full language — but the RUST engine
+# cannot without taking a regex dependency it should not take for two anchored
+# prefix patterns. Two engines that accept different regex languages is a
+# divergence, and a divergence in a FILTER silently includes or excludes rows.
+# So Python deliberately implements the same subset and refuses the same
+# patterns, rather than being quietly more capable.
+_REGEX_UNSUPPORTED = set("*+?[](){}|\\")
+
+
+def unsupported_regex_char(pattern: str):
+    """The first metacharacter outside the supported subset, or None."""
+    for ch in pattern:
+        if ch in _REGEX_UNSUPPORTED:
+            return ch
+    return None
+
+
+def regex_match(value: str, pattern: str, ci: bool = False) -> bool:
+    """Match the supported subset. `^`/`$` anchor; `.` is exactly one char.
+
+    A lone `$` is an END ANCHOR and matches every string — POSIX says so, and
+    treating it as a literal dollar sign was a real bug caught by test.
+    """
+    if ci:
+        value, pattern = value.lower(), pattern.lower()
+    start = pattern.startswith("^")
+    end = pattern.endswith("$")
+    body = pattern[1 if start else 0: len(pattern) - (1 if end else 0)]
+
+    def at(i: int) -> bool:
+        if i + len(body) > len(value):
+            return False
+        return all(pc == "." or pc == value[i + j] for j, pc in enumerate(body))
+
+    if start and end:
+        return len(value) == len(body) and at(0)
+    if start:
+        return at(0)
+    if end:
+        return len(value) >= len(body) and at(len(value) - len(body))
+    return any(at(i) for i in range(len(value) - len(body) + 1))
 
 
 def parse_nql(text: str) -> dict:
@@ -315,6 +366,30 @@ def parse_nql(text: str) -> dict:
         if t != "op":
             raise SyntaxError("NQL: expected operator in WHERE")
         i += 1
+
+        # `~` / `~*` / `!~` / `!~*` — POSIX regex over the supported subset.
+        # Its argument is a PATTERN, not a value, so it is taken as text and
+        # validated here rather than through value(), which would read `^1` as
+        # something numeric.
+        if op in ("~", "~*", "!~", "!~*"):
+            t2, pat = peek()
+            if t2 not in ("str", "word"):
+                raise SyntaxError(f"NQL: {op} expects a pattern string, got {pat!r}")
+            i += 1
+            bad = unsupported_regex_char(pat)
+            if bad is not None:
+                # Refused at PARSE time so the caller learns at the point of
+                # the mistake, and refused identically in both engines so the
+                # two cannot accept different regex languages.
+                raise SyntaxError(
+                    f"NQL: regex {pat!r} uses {bad!r}, which this engine does not "
+                    f"implement. The supported subset is ^ $ . and literal text — "
+                    f"enough for catalogue filters like '^pg_'. Matching the rest "
+                    f"approximately would silently include or exclude rows, so it "
+                    f"is refused instead")
+            return {"op": "regex", "field": field, "pattern": pat,
+                    "negated": op.startswith("!"), "ci": op.endswith("*")}
+
         return {"op": "cmp", "field": field, "cmp": op, "value": value()}
 
     def flatten_conjuncts(pred):
@@ -574,6 +649,16 @@ def eval_predicate(doc: dict, pred: Optional[dict]) -> bool:
         if val is None:
             return False
         hit = bool(like_to_regex(pred["pattern"], pred["ci"]).match(str(val)))
+        return hit != pred["negated"]
+
+    if op == "regex":
+        # Same three-valued logic as LIKE, and the same in the Rust engine: a
+        # predicate over a missing/null field is false in BOTH polarities, so
+        # `x !~ 'p'` does not resurrect an absent row. psql's catalogue
+        # filters depend on that.
+        if val is None:
+            return False
+        hit = regex_match(str(val), pred["pattern"], pred["ci"])
         return hit != pred["negated"]
 
     if op == "isnull":

@@ -30,6 +30,14 @@ past**, and that the proof of that is cryptographic and locally verifiable.
 | #107 | **Extended query protocol** | psycopg3, asyncpg and JDBC could not run a *single* query before this |
 | #108 | **A DELETE is a tombstone, not an erasure** | `AS OF` returned nothing for a deleted id, at *every* sequence |
 | #109 | **`shadow_writes = True` is the whole setup** | it used to be a silent no-op |
+| #110–#114 | BUSL relicense, fork relicense, SPDX headers, `~` regex, `pg_catalog` as real tables | the licence actually holds; `\dn` became reachable |
+| #115 | **a real SQL evaluator** (`sqlselect.rs`) | `psql \dt` works — 11/14 backslash commands |
+| #116 | **hash join + the frozen semantic corpus** | the evaluator became a subsystem with a contract |
+| #117 | **execution plan + `EXPLAIN` + the row budget** | the engine can say why it ran a query that way; `LIMIT` stopped materialising whole joins |
+| #118 | **ambiguous bindings refused; duplicate output names fixed** | two wrong-answer surfaces closed before any further optimiser work |
+| #119 | **conservative predicate pushdown, with recorded refusals** | a selective filter no longer waits for the whole join |
+| #120 | **physical `Filter`-in-`Join`** | `WHERE ... LIMIT n` stops early; `ON` and `WHERE` stay logically distinct |
+| #121 | **streaming `Resolver`** | `LIMIT 20` pulls exactly 20 source rows, not 8000 |
 
 ### The two engines, and which one to trust
 
@@ -85,12 +93,38 @@ Corollary: **a self-skipping test is indistinguishable from a passing one.**
 `NEDB_REQUIRE_PG=1`. Do the same for any suite whose dependency might silently
 go missing in CI.
 
+### The two failure modes that keep recurring
+
+Both were caught again this session, and both are cheap to check for:
+
+1. **A test that cannot fail.** `duplicate_output_names_are_not_silently_renamed`
+   asserted the column NAMES and never the VALUES, so it passed while
+   `SELECT e.name, e2.name` returned one value twice. The multi-join budget
+   guard passed under the mutation that removed the guard. **Mutate the
+   implementation and confirm the suite screams** — if it does not, the test is
+   decorative.
+2. **Asserting content instead of structure.** No test caught the `EXPLAIN`
+   tree printing a join's two scans at different depths, because every
+   assertion checked which relation and how many rows — and those were right.
+   `Plan::tree()` now exists so tests assert TOPOLOGY (`children().len() == 2`,
+   `depth()`), and five of them fail if the shape regresses.
+
 ### Test surface (all green at v4.0.0)
 
 | Tier | Count | Notes |
 |---|---|---|
-| `cargo test --lib` | 234 | the Rust core |
+| `cargo test --lib` | 355 | the Rust core |
 | `cargo test --tests` | 15 | integration, incl. v3 segments + compaction |
+| **semantic corpus** | 44 | frozen SQL meaning, run under **every** join strategy |
+| **join differential** | 11 | hash vs nested loop, incl. 640 generated cases |
+| `EXPLAIN` over libpq | 15 | inside the `pg_catalog` suite, real psycopg2 |
+| bindings + duplicate names | 6 | same suite; duplicate names verified positionally |
+| plan topology | 6 | structural, not rendered text |
+| **pushdown differential** | 6 | on vs off, x both join strategies |
+| **fusion differential** | 9 | fused vs unfused, x both join strategies |
+| **streaming** | 12 | counts rows PULLED, with exact assertions |
+| psql introspection | 44 | drives the **real `psql` binary** |
+| `pg_catalog` | 35 | catalogue as queryable tables |
 | Python suites | 20 files | dependency-free tier |
 | cross-engine parity | 157 + 182 | Python **and** Rust, same corpus |
 | backwards compatibility | 109 | frozen v3.2.2 answers, 0 regressions |
@@ -154,35 +188,204 @@ Lead with it.
 Work top-down. Each item says *why* so you can re-order with judgement rather
 than just obeying a list.
 
-### 3.1 `pg_catalog` + `information_schema` — **next**
+### 3.1 `pg_catalog` + `information_schema` — **DONE** (#114, #115)
 
-`\dt` and DBeaver's schema browser come back **empty**. That is an evaluator's
-first ten minutes and it currently looks broken.
+Implemented as **real queryable virtual tables** (`pgcatalog.rs`), not as
+pattern matches against known query strings — pattern matching breaks silently
+when psql changes its query, and a silently empty table list looks exactly
+like "you have no tables".
 
-I captured the real queries with `psql -E` against a real server — do not guess
-them, capture them again if the version moves:
+`psql` now runs **11 of 14** backslash commands: `\dn \dt \dv \di \dm \dS
+\l \du \dg \df \dx`. The three that do not are refused **by name**:
+`\dp` needs an ARRAY constructor, `\dT` a subquery, `\d <table>` regex
+capture groups.
 
-* `\dn` needs only `pg_namespace` + `pg_get_userbyid()` + the `!~` operator +
-  `ORDER BY 1`. **No JOIN.** This is the first milestone and it proves the
-  approach.
-* `\dt` additionally needs `LEFT JOIN`, a `CASE` expression, and
-  `pg_table_is_visible()`.
-* `\d <table>` sends **nine** queries across fifteen catalog relations with
-  correlated subqueries, `::` casts and `generate_series`. **Chasing full `\d`
-  fidelity is a trap — do not.**
+Do **not** chase 14/14 for its own sake. If a remaining command needs
+disproportionate catalogue emulation with no benefit to ordinary SQL users,
+leave it explicit and move on. Subqueries are worth building; a
+PostgreSQL-specific catalogue curiosity is not.
 
-Implement the catalog as **real queryable virtual tables**, not as pattern
-matches against known query strings. Pattern matching breaks silently when psql
-changes its query, and a silently empty table list looks exactly like "you have
-no tables" — the same disease as everything in §1.
+### 3.2 JOIN — **DONE** (#115 nested loop, #116 hash)
 
-### 3.2 JOIN (nested loop first)
+Both strategies are permanent and their roles are distinct:
 
-Needed by `\dt`, by every BI tool, and it is the biggest remaining SQL gap. A
-nested-loop join over materialised rows is honest for small results and unlocks
-real tooling; `O(n*m)` is acceptable as a v1 **if documented**. The pieces
-already exist: `eval_pred_with` is generic over a field resolver, and
-`columns_for`/`sort_by_keys`/`paginate` already operate on JSON rows.
+* **nested loop** — the semantic reference, the implementation for
+  non-equality predicates, and the oracle the differential suite compares
+  against. Never delete it.
+* **hash join** — chosen when the planner can *prove* an equality key. The
+  hash table only NARROWS candidates; every surviving pair is re-checked
+  against the complete, unmodified `ON` expression. See `sqljoin.rs`.
+
+The reason that split exists is worth internalising: **equality in this engine
+is not transitive.** `1 = '1'` and `1 = '1.0'` are both TRUE while
+`'1' = '1.0'` is FALSE, because numbers and numeric strings compare
+numerically but two strings compare exactly. Bucketing assumes an equivalence
+relation, so bucketing alone cannot be correct here. `hkey()` needs exactly one
+property — *if `a = b` is TRUE then `hkey(a) == hkey(b)`* — and everything else
+is performance.
+
+**Done in #117:**
+
+* **An execution plan** (`src/sqlplan.rs`) and `EXPLAIN` / `EXPLAIN ANALYZE`
+  over the wire. The plan is **emitted by the executor** as it works, never
+  assembled alongside it — a plan built independently can drift, and an
+  `EXPLAIN` that confidently describes a pipeline the engine did not run is
+  worse than none, because it sends the reader to optimise a shape that never
+  existed. For the same reason `EXPLAIN` of a statement the **NQL path** runs
+  says so plainly instead of inventing a plan for it.
+* `EXPLAIN` always reports **actual** rows. There are no statistics to estimate
+  from, and a guess printed as a number is worse than the truth. The output
+  says so, so nobody mistakes it for PostgreSQL's estimate.
+* **The row budget** — when the final answer is a prefix of a join's output,
+  the join stops once it has enough rows. Every disqualifying condition is
+  load-bearing and independently proven by mutation: `ORDER BY`, `DISTINCT`, a
+  `WHERE` clause, or more than one join. `OFFSET` is *added* to the budget
+  rather than disqualifying it.
+
+**Done in #118** — wrong-answer surfaces, closed before continuing:
+
+* Ambiguous relation bindings refused by name (see §4).
+* **Duplicate output names carried the same value.** PostgreSQL permits
+  `SELECT e.name, e2.name`, and generated SQL relies on it — but rows here are
+  JSON objects, so two columns sharing a name shared a KEY and the second write
+  silently overwrote the first. Output columns are now `OutCol { key, name }`:
+  the key is disambiguated, the display name is untouched. Renaming the column
+  instead would be worse, because generated SQL asks for the name it wrote.
+* A latent index drift in projection: a single counter walked both the
+  name-building and projection stages, and a `*` that skipped an already-named
+  column left it pointing at the wrong name. Each select item now owns an
+  explicit span of output columns.
+
+**Done in #119** — conservative predicate pushdown.
+
+A `WHERE` conjunct reading exactly ONE relation is COPIED to pre-filter that
+relation before the join. The `WHERE` is retained and still runs afterwards.
+
+**Retention alone is not sufficient, and believing it was cost a wrong
+answer.** The first version argued a copy-not-move was safe for every join
+type, because newly-unmatched rows get NULL-extended and the retained filter
+then drops them. But a predicate can be SATISFIED by a synthesised NULL:
+
+```sql
+SELECT e.name FROM emp e LEFT JOIN dept d ON e.dept_id = d.id
+ WHERE d.dname IS NULL          -- 1 row, and it became 5
+```
+
+No `dept` row has a NULL `dname`, so pre-filtering empties `dept`, every `emp`
+row becomes unmatched, and `IS NULL` is TRUE for all of them. **The semantic
+corpus caught it on the first run.** That is the corpus doing precisely the job
+it was built for.
+
+So the real rule is about NULL SYNTHESIS:
+
+> A predicate may be pre-applied to relation `R` only if `R` is never
+> NULL-synthesised in this query.
+
+`sqlpush::nullable_bindings` computes that set: a join's right binding is
+nullable under `LEFT`/`FULL`, and a LATER `RIGHT`/`FULL` join retroactively
+makes every binding accumulated before it nullable — the `FROM` relation
+included. An all-inner query can push everything, which is the common case.
+
+Refusals are **recorded on the plan**, not silent, and visible in `EXPLAIN`:
+`Filter retained above join: predicate references nullable side of an outer
+join (n)`. An optimiser that silently declines cannot be audited — you cannot
+tell "correctly refused" from "forgot to look".
+
+Measured: `join + selective pred` at 8000x1500 went 8774 -> 118ms on the
+nested loop and 27.1 -> 8.0ms on the hash join. `join + broad pred` barely
+moved, which is correct — it keeps 85% of the rows.
+
+**Done in #120** — physical `Filter`-in-`Join`.
+
+The `WHERE` clause is evaluated inside the final join's loop rather than as a
+separate pass. It is a PHYSICAL change only, and one rule keeps it that way:
+
+> Whether a row counts as MATCHED is decided by `ON` alone.
+
+That is semantic law, not a preference. An `ON` predicate and a post-join
+`WHERE` predicate mean different things:
+
+```sql
+LEFT JOIN ... ON a.k = b.k AND b.tag = 'q'     -- keeps every left row
+LEFT JOIN ... ON a.k = b.k WHERE b.tag = 'q'   -- discards the outer rows
+```
+
+If the filter were allowed to influence `matched`, a left row whose only
+partner fails the filter would be NULL-extended — and `WHERE b.tag IS NULL`
+would then ACCEPT that synthesised row, inventing output the unfused pipeline
+never produces. Same trap as the pushdown mistake, in a different place.
+Evaluation order is fixed: candidate pair -> `ON` -> NULL synthesis if the
+outer join requires it -> post-join filter -> count toward the row budget.
+
+The plan reports the fused filter as its own number
+(`post-join filter removed N`) rather than folding it into the join's row
+count, so the two remain distinguishable in `EXPLAIN`.
+
+The payoff: a `WHERE` no longer disqualifies the row budget. Measured by
+`examples/fusebench` at 8000x1500 returning 20 rows — nested 4657 -> 34.2ms
+(136x), hash 19.9 -> 11.2ms (1.8x).
+
+**Read that hash number as a signal, not a disappointment.** The hash gain
+SHRINKS with size (2.7x -> 3.2x -> 1.8x) because at that shape the hash path
+is dominated by materialising relations, not probing them. Stopping the probe
+early cannot recover time already spent cloning 9500 rows.
+
+**Done in #121** — the streaming `Resolver`.
+
+`Resolver` now returns `Box<dyn Relation>`, a two-method trait: `next_row` and
+an optional `size_hint`. Not an async stream, not a borrowing iterator with a
+lifetime threaded through the evaluator — the smallest thing that permits
+*pull a row* and *stop*.
+
+The DRIVING relation is streamed and pre-filtered inline; the INNER side of
+every join is still materialised, on purpose, because a hash join must build
+its table before probing and a nested loop re-scans the inner side per left
+row. That limit is pinned by a test so it is recorded rather than rediscovered
+and mistaken for a bug.
+
+**Verified by counting, not by timing.** A fast run proves nothing about how
+many rows were requested. The test source counts every row it hands out:
+
+| query | left rows pulled (of 8000) |
+|---|---|
+| `... JOIN ... LIMIT 20` | **20** |
+| `... JOIN ... WHERE amount > 500 LIMIT 20` | **92** |
+| `... JOIN ... LIMIT 5 OFFSET 40` | **45** |
+| `... JOIN ...` (no limit) | 8000 |
+| `... ORDER BY ... LIMIT 20` | 8000 (correctly refused) |
+
+Those are EXACT assertions, and that matters. The first version asserted
+`left < 100` — which would have passed at 99 and hidden a real inefficiency.
+Mark asked "why doesn't it pull 20?", and the honest answer was that it does;
+the test simply was not saying so. Moving the budget check to the bottom of
+the loop makes it pull 21, and the exact assertion catches that where the
+loose bound did not.
+
+The 92 is worth keeping written down because it looks arbitrary and is not:
+`amount` is `(7 * i) % 1000`, so rows 0..=71 all fail `> 500` (7 * 71 = 497)
+and rows 72..=91 supply the twenty survivors. 72 rejected + 20 kept, minimal
+for that data.
+
+**Storage is still eager.** `nql::query` materialises a whole collection, so
+the daemon's own resolver hands back a `from_vec`. The EVALUATOR no longer
+requires that, which is the half of the work that had to come first — but
+nobody should read the streaming interface as a claim that the storage scan is
+lazy. Making `nql::query` yield rows is the next step and is noted in
+`pgwire.rs` where the eager call lives.
+
+**The next item.**
+
+* **A lazy storage scan**, so the `LIMIT 20` result above holds end to end
+  rather than only above the storage boundary.
+* **Skew benchmark, then derive the hash crossover from it.**
+  `AUTO_HASH_MIN_PAIRS = 64` is a guess. Measure uniform-unique, moderate
+  duplicates, a single hot key, all-same-key, and coercion-heavy
+  numeric/string keys — the threshold must come from the ugly shapes.
+
+Then **subqueries**, one semantic class at a time, each with its own
+regression corpus: scalar uncorrelated, `IN (SELECT ...)`, `EXISTS`,
+correlated, derived tables. Prioritise by the captured `psql` queries, not by
+abstract SQL completeness.
 
 ### 3.3 `DECLARE` / `FETCH` cursors
 
@@ -227,6 +430,28 @@ same `ShadowCursor` treatment (its cursor path is identical). Mongo needs
 ## 4. Sharp edges — state these, never hide them
 
 An evaluator who finds an unstated limitation stops trusting everything else.
+
+* **`SELECT *` column order.** Now the document's own order, because
+  `serde_json`'s `preserve_order` feature is enabled. That feature is
+  **workspace-wide** (Cargo unifies features), so the napi and pyo3 bindings
+  get it too. It is safe for the content-addressed store because a node's hash
+  is taken over the **bytes as written** and verification re-hashes those same
+  bytes — `decode()` never re-serialises a parsed node, so key order cannot
+  invalidate an existing hash. Verified, not assumed: backcompat 109/109 and
+  DAG-preservation 62/62 green with it on, including the case that asserts
+  `verify()` still FAILS when it should.
+* **`1` and `1.0` are the same value.** PostgreSQL distinguishes integer from
+  numeric-with-scale; JSON has no numeric-with-scale type, so it cannot be
+  represented. Integral values render as integers (`SELECT 1` → `1`, fixed in
+  #116 — it used to answer `1.0`, which clients read as the text "1.0").
+  `SELECT 1.0` therefore also renders as `1`. Unrepresentable either way;
+  stated rather than hidden.
+* **A relation used twice without aliases is now REFUSED** (#118), with
+  `ambiguous relation binding: "a" appears more than once; use aliases`. It
+  used to return silently NOTHING, because a qualified reference takes the
+  first matching binding and so `emp.mgr = emp.id` compared every row to
+  itself. The check is case-insensitive, because binding resolution is.
+  `FROM a JOIN a AS a2` is the supported spelling.
 
 * **`Db::compact()` discards history.** It rewrites the object segments keeping
   only each document's *current* version, so it prunes superseded versions and
@@ -292,6 +517,33 @@ Learned the hard way. Breaking these has cost real time.
 * Build the release binary before running suites that prefer
   `target/release/` — the tests pick that up over `debug/` and will happily
   test yesterday's code.
+* **A masked failure is indistinguishable from a pass.** `cargo check … | grep`
+  printed nothing and looked clean when the truth was `cargo: command not
+  found` (it lives in `~/.cargo/bin`, not on the default PATH here). Check exit
+  codes, not just filtered output. Same disease as `| tail`.
+* **Prove the test can fail.** A differential suite that passes on broken code
+  is worthless. Mutate the implementation deliberately and confirm the suite
+  screams: bucketing numeric strings as text (losing `1 = '1'`) must fail ~7
+  tests; skipping the confirm step must fail loudly. Two of four mutations I
+  tried were *duds* that changed no answer — without running them I would have
+  credited the suite with catching things it never could.
+* **`npm run build` for the node addon, never bare `napi build`.** The package
+  script passes `--js native.js --dts native.d.ts`; without those flags napi
+  OVERWRITES the hand-written `index.js` durable-mode wrapper with a generated
+  loader, and `durability.test.mjs` then fails in a way that looks like a
+  durability regression. It is not. `git checkout -- index.js index.d.ts`.
+* A `git checkout -- a b c` with one **untracked** path in the list fails
+  wholesale and restores *nothing*, silently. Restore tracked paths only.
+* **Never patch Rust string literals from inside a Python heredoc.** A trailing
+  `\` inside a Python triple-quoted string is a PYTHON line continuation, so
+  Rust's own `\`-newline continuations get flattened *with their source
+  indentation baked in* — three user-visible strings shipped reading
+  "executed by                      the storage engine". Use the editor for
+  string literals, or grep for runs of 6+ spaces inside quotes afterwards.
+* **A join has two inputs, so a plan renderer is not a list.** The first
+  `EXPLAIN` indented a join's two scans differently, which reads as "the left
+  relation was scanned inside the scan of the right one" — a false claim about
+  execution, caught only by looking at real `psql` output.
 
 **Tooling in this repo**
 

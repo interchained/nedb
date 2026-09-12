@@ -137,6 +137,36 @@ CASES = [
      'FROM jobs WHERE miner > "A"', ["1", "2", "3"]),
     ("ordering on a sparse string column, other direction",
      'FROM jobs WHERE miner < "zzz"', ["1", "2", "3"]),
+
+    # ── `~` / `!~` — POSIX regex over a documented subset ────────────────
+    #
+    # Added for Postgres catalogue introspection: psql's `\dn` filters with
+    # `nspname !~ '^pg_'`, so without the operator that query cannot run.
+    #
+    # Pinned CROSS-ENGINE on purpose. Python has `re` and could have matched
+    # the full regex language, while the Rust engine cannot without taking a
+    # dependency it should not take for two anchored prefix patterns. Two
+    # engines accepting different regex languages is exactly the divergence
+    # class that produced this codebase's worst bugs — and a divergence in a
+    # FILTER silently includes or excludes rows.
+    ("~ anchored at the start",      'FROM jobs WHERE miner ~ "^Acme"',   ["1"]),
+    ("~ anchored at the end",        'FROM jobs WHERE miner ~ "solo$"',   ["2"]),
+    ("~ anchored at both ends",      'FROM jobs WHERE miner ~ "^Zenith$"', ["3"]),
+    ("~ unanchored is a substring",  'FROM jobs WHERE miner ~ "cme"',     ["1", "2"]),
+    ("~ dot is exactly one char",    'FROM jobs WHERE miner ~ "^Ac.e"',   ["1"]),
+    ("~* folds case",                'FROM jobs WHERE miner ~* "^acme"',  ["1", "2"]),
+    ("~ is case SENSITIVE",          'FROM jobs WHERE miner ~ "^acme"',   ["2"]),
+    # `!~` must NOT resurrect the rows whose field is absent (4) or explicitly
+    # null (5) — three-valued logic, same as LIKE, same as Postgres.
+    ("!~ excludes null and missing", 'FROM jobs WHERE miner !~ "^Acme"',  ["2", "3"]),
+    ("~ over a missing field matches nothing",
+                                     'FROM jobs WHERE nosuch ~ "x"',      []),
+    ("!~ over a missing field matches nothing too",
+                                     'FROM jobs WHERE nosuch !~ "x"',     []),
+    ("a lone $ is an END ANCHOR, matching every non-null value",
+                                     'FROM jobs WHERE miner ~ "$"',       ["1", "2", "3"]),
+    ("~ composes with AND",
+     'FROM jobs WHERE miner ~ "^Acme" AND fee > 5',                       ["1"]),
 ]
 
 # Queries that MUST be rejected. Each one previously either parsed into a
@@ -158,6 +188,15 @@ REJECT = [
     "FROM jobs WHERE fee NOT = 1",           # infix NOT before a comparison op
     "FROM jobs WHERE fee LIKE",              # missing pattern
     "FROM jobs GROUP BY status SUM",         # aggregate without a target field
+    # An unsupported regex metacharacter must be REFUSED, not approximated —
+    # in BOTH engines. Matching `a+b` loosely would silently include or
+    # exclude rows, and a wrong filter result looks exactly like a right one.
+    'FROM jobs WHERE miner ~ "a+b"',         # + not implemented
+    'FROM jobs WHERE miner ~ "a*b"',         # * not implemented
+    'FROM jobs WHERE miner ~ "[ab]"',        # character class not implemented
+    'FROM jobs WHERE miner ~ "(a|b)"',       # alternation not implemented
+    r'FROM jobs WHERE miner ~ "a\\.b"',        # escape not implemented
+    "FROM jobs WHERE miner ~",               # missing pattern
 ]
 
 # GROUP BY: (NQL, group key field, {group value: {expected key: expected number}})

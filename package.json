@@ -1,6 +1,6 @@
 {
   "name": "nedb-engine",
-  "version": "4.0.0",
+  "version": "4.1.1",
   "description": "NEDB \u2014 hash-chained, time-traveling, bi-temporal embedded database with Rust native core. SQL, Redis, MongoDB adapters. Causal Write Provenance. RESP2 wire protocol.",
   "main": "index.js",
   "exports": {
@@ -33,6 +33,9 @@
   ],
   "license": "BUSL-1.1",
   "homepage": "https://github.com/aiassistsecure/nedb#readme",
+  "bugs": {
+    "url": "https://github.com/aiassistsecure/nedb/issues"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/aiassistsecure/nedb.git"

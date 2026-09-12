@@ -193,11 +193,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
-      - name: Stage Python source into the maturin layout
-        run: |
-          rm -rf rust/crates/nedb-py/python
-          mkdir -p rust/crates/nedb-py/python
-          cp -r python/nedb rust/crates/nedb-py/python/nedb
+      - name: Stage Python source + README into the maturin layout
+        run: bash scripts/stage_maturin.sh
       - name: Build + install the native wheel
         run: |
           pip install --upgrade maturin
@@ -342,6 +339,32 @@ jobs:
         run: |
           pip install psycopg2-binary
           python3 tests/test_pgwire.py
+
+      # pg_catalog / information_schema as REAL queryable tables. Driven over
+      # the wire, because unit tests prove the rows exist and only a real
+      # client proves they are reachable — and because the alternative
+      # implementation (pattern-matching psql's query text) fails by returning
+      # an EMPTY table list, which is indistinguishable from a database that
+      # genuinely has no tables.
+      - name: Postgres endpoint — pg_catalog / information_schema
+        run: python3 tests/test_pgcatalog.py
+
+      # psql's backslash commands, driven by the REAL psql binary.
+      #
+      # An assertion written against a query I typed proves only that I can
+      # type the query I implemented. psql's actual SQL is the specification —
+      # it changes between versions and is full of constructs nobody writes by
+      # hand (OPERATOR(pg_catalog.~), COLLATE pg_catalog."C", E'\n'). So the
+      # binary runs and its exit status is the verdict.
+      #
+      # NEDB_REQUIRE_PSQL=1: a missing psql FAILS here rather than skipping,
+      # because a self-skipping test is indistinguishable from a passing one.
+      - name: Postgres endpoint — psql \dn and \dt (real psql binary)
+        env:
+          NEDB_REQUIRE_PSQL: "1"
+        run: |
+          pip install pgserver
+          python3 tests/test_psql_introspection.py
 
       # The EXTENDED query protocol, driven by the drivers that only speak it.
       #

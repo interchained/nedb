@@ -9,8 +9,17 @@ build-backend = "maturin"
 
 [project]
 name = "nedb-engine"
-version = "4.0.0"
+version = "4.1.1"
 description = "NEDB — versioned, self-compressing, time-traveling embedded database with Rust native core"
+# The NATIVE wheels are uploaded BEFORE the universal wheel, and PyPI takes a
+# release's description from the FIRST file uploaded. Without this the project
+# page read "The author of this package has not provided a project description"
+# even though the root pyproject.toml had a readme all along.
+#
+# README.md is staged into this directory by CI (see release.yml, the same step
+# that stages python/nedb/) because maturin will not read a path outside the
+# project root.
+readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "BUSL-1.1" }
 authors = [{ name = "Eth-Interchained" }]

@@ -724,8 +724,23 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
     if coll.contains(',') {
         return Err("selecting from more than one collection is not supported (no JOIN)".into());
     }
-    // Postgres clients often qualify as schema.table; NEDB has one namespace.
-    let coll = coll.rsplit('.').next().unwrap_or(coll).trim_matches('"');
+    // Postgres clients often qualify as schema.table; NEDB has one namespace,
+    // so the schema is dropped — EXCEPT for `information_schema`, whose table
+    // names (`tables`, `columns`) are words a user could plausibly name a
+    // collection. Keeping the qualifier there is what stops
+    // `SELECT * FROM information_schema.tables` and a real collection called
+    // `tables` from resolving to the same thing.
+    let bare = coll.rsplit('.').next().unwrap_or(coll).trim_matches('"');
+    let qualified = coll
+        .split('.')
+        .map(|p| p.trim_matches('"'))
+        .collect::<Vec<_>>()
+        .join(".");
+    let coll = if qualified.starts_with("information_schema.") {
+        qualified.as_str()
+    } else {
+        bare
+    };
     let tail = rest[coll_end..].trim();
 
     // ── the select list ──────────────────────────────────────────────────────
@@ -838,6 +853,11 @@ pub fn translate(sql_raw: &str) -> Result<Stmt, String> {
 
 const SERVER_VERSION: &str = "15.0";
 
+/// The `version()` string, for the SQL engine's `version()` function.
+pub fn version_string() -> String {
+    full_version_string()
+}
+
 fn full_version_string() -> String {
     format!(
         "PostgreSQL {} (NEDB {}) — tamper-evident, append-only, permanent \
@@ -911,6 +931,15 @@ fn unify_oid(a: i32, b: i32) -> i32 {
 /// holding `3` in row one and `"n/a"` in row two was advertised as `int8`, and
 /// a client that believes the description then fails parsing `"n/a"` as an
 /// integer — or, on the binary path, cannot be sent the value at all.
+/// Public alias so `pgcatalog` types a column EXACTLY as the wire does.
+///
+/// The catalogue reporting `bigint` for a column the protocol then sends as
+/// text would be a self-contradiction a client is entitled to trust, so both
+/// go through this one function rather than two that agree today.
+pub fn oid_for_column(rows: &[Value], col: &str) -> i32 {
+    oid_for(rows, col)
+}
+
 fn oid_for(rows: &[Value], col: &str) -> i32 {
     let mut acc: Option<i32> = None;
     for r in rows {
@@ -2365,6 +2394,223 @@ fn no_db(db_name: &str) -> Vec<u8> {
          (POST /v1/databases), or connect with -d <name>", db_name))
 }
 
+/// Run a `SELECT` through the full SQL engine when it touches the catalogue.
+///
+/// The gate is deliberately narrow: a statement goes to `sqlselect` only when
+/// one of its tables is a catalogue relation. Everything else keeps the
+/// SQL→NQL path, which has the index pushdown, `AS OF`, `TRACE` and the
+/// bounded scans — and whose join story is a real planning question rather
+/// than a nested loop. Routing a large collection through a nested-loop join
+/// would be a promise this engine cannot keep.
+///
+/// `None` means "not mine": the caller falls through to the ordinary path, so
+/// the error the client sees is the ordinary path's error rather than a
+/// confusing one from a parser that was never meant to handle the statement.
+fn try_catalog_select(
+    sql: &str,
+    db: Option<&Arc<Db>>,
+) -> Result<Option<(Executed, crate::sqlplan::Plan)>, Vec<u8>> {
+    let sel = match crate::sqlselect::parse(sql) {
+        Ok(sel) => sel,
+        Err(why) => {
+            // A statement that plainly reads the catalogue but that this
+            // engine cannot parse gets the PARSE error, not the NQL path's.
+            //
+            // Falling through unconditionally produced an actively false
+            // message: `\d` and `\dp` were told "JOIN is not supported",
+            // which stopped being true the moment joins started working — and
+            // a wrong explanation is worse than a blunt one, because it sends
+            // the reader to fix the wrong thing.
+            if mentions_catalog(sql) {
+                return Err(err_msg("0A000", &format!(
+                    "this catalogue query uses SQL this endpoint does not \
+                     implement: {}", why)));
+            }
+            return Ok(None);
+        }
+    };
+
+    // Which relations does it read?
+    let mut touched: Vec<String> = vec![];
+    if let Some(f) = &sel.from {
+        touched.push(f.name.clone());
+    }
+    for j in &sel.joins {
+        touched.push(j.table.name.clone());
+    }
+    let catalog_name = |n: &str| -> String {
+        // `pg_catalog.pg_class` → `pg_class`, but `information_schema.tables`
+        // keeps its qualifier, because `tables` is a plausible collection
+        // name and the catalogue must never shadow a user's own data.
+        let joined: Vec<&str> = n.split('.').collect();
+        if joined.len() >= 2 && joined[joined.len() - 2] == "information_schema" {
+            format!("information_schema.{}", joined[joined.len() - 1])
+        } else {
+            joined[joined.len() - 1].to_string()
+        }
+    };
+    if !touched.iter().any(|t| crate::pgcatalog::is_catalog(&catalog_name(t))) {
+        return Ok(None);
+    }
+
+    // An aggregate over the catalogue falls through on purpose, so the caller
+    // produces the one clear "a catalogue has nothing to aggregate" message
+    // rather than a generic "unknown function" from this engine.
+    if select_has_aggregate(&sel) {
+        return Ok(None);
+    }
+
+    let resolve = |name: &str| -> anyhow::Result<Option<Box<dyn crate::sqlselect::Relation>>> {
+        let cname = catalog_name(name);
+        if let Some(rows) = crate::pgcatalog::rows(&cname, db) {
+            // A synthesised catalogue relation is small and built eagerly;
+            // wrapping it satisfies the streaming contract without pretending
+            // it is lazy.
+            return Ok(Some(crate::sqlselect::from_vec(rows)));
+        }
+        // A join between a catalogue relation and a real collection is
+        // legitimate, so a user table still resolves.
+        //
+        // NOTE: `nql::query` materialises the whole collection, so this side
+        // is eager even though the evaluator no longer requires it to be.
+        // Making the storage scan itself lazy is the other half of the work
+        // and is tracked in HANDOFF — stated here so nobody reads the
+        // streaming interface as a claim that storage is already streaming.
+        match db {
+            Some(db) => match crate::nql::query(db, &format!("FROM {}", cname)) {
+                Ok((rows, _)) => Ok(Some(crate::sqlselect::from_vec(rows))),
+                Err(_) => Ok(None),
+            },
+            None => Ok(None),
+        }
+    };
+
+    let (cols, rows, plan) = crate::sqlselect::execute_explain(
+        &sel,
+        &resolve,
+        crate::sqljoin::JoinExec::Auto,
+    )
+    .map_err(|e| err_msg("42601", &e.to_string()))?;
+
+    Ok(Some((
+        Executed {
+            rows,
+            // The KEY is what the row is stored under; the NAME is what the
+            // client sees. They differ when a select list has duplicate output
+            // names, which PostgreSQL permits and generated SQL relies on.
+            project: cols
+                .iter()
+                .map(|c| Col::renamed(&c.key, &c.name))
+                .collect(),
+            has_rows: true,
+            tag: "SELECT".into(),
+            tag_counts_rows: true,
+        },
+        plan,
+    )))
+}
+
+/// Strip a leading `EXPLAIN`, returning the statement it wraps.
+///
+/// `ANALYZE` and `VERBOSE` are accepted and ignored: this endpoint always
+/// executes and always reports actual rows, so `EXPLAIN` and
+/// `EXPLAIN ANALYZE` genuinely do the same thing here. Accepting the keyword
+/// and silently doing the honest thing beats refusing a client's spelling.
+fn strip_explain(sql: &str) -> Option<&str> {
+    let t = sql.trim().trim_end_matches(';').trim();
+    let mut rest = t.strip_prefix("EXPLAIN").or_else(|| t.strip_prefix("explain"))?;
+    // Require a word boundary so `EXPLAINED` is not mistaken for a keyword.
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    rest = rest.trim_start();
+    loop {
+        let low = rest.to_lowercase();
+        if let Some(r) = low.strip_prefix("analyze").or_else(|| low.strip_prefix("analyse")) {
+            if r.starts_with(char::is_whitespace) || r.is_empty() {
+                rest = rest[rest.len() - r.len()..].trim_start();
+                continue;
+            }
+        }
+        if let Some(r) = low.strip_prefix("verbose") {
+            if r.starts_with(char::is_whitespace) || r.is_empty() {
+                rest = rest[rest.len() - r.len()..].trim_start();
+                continue;
+            }
+        }
+        break;
+    }
+    Some(rest)
+}
+
+/// One text column named `QUERY PLAN`, which is exactly the shape PostgreSQL
+/// returns — so `psql` prints it without special handling.
+fn plan_result(lines: Vec<String>) -> Executed {
+    Executed {
+        rows: lines
+            .into_iter()
+            .map(|l| serde_json::json!({ "QUERY PLAN": l }))
+            .collect(),
+        project: vec![Col::same("QUERY PLAN")],
+        has_rows: true,
+        tag: "EXPLAIN".into(),
+        tag_counts_rows: false,
+    }
+}
+
+/// Does the raw SQL plainly read a catalogue relation?
+///
+/// A cheap text check, used only to decide WHICH error to report when the
+/// statement cannot be parsed — never to decide what a parsable statement
+/// means. `pg_` is the giveaway: every catalogue relation is prefixed, and so
+/// is the `pg_catalog` schema qualifier.
+fn mentions_catalog(sql: &str) -> bool {
+    let low = sql.to_lowercase();
+    low.contains("pg_catalog.")
+        || low.contains("information_schema.")
+        || low.contains("from pg_")
+        || low.contains("join pg_")
+}
+
+/// Does any select item call an aggregate?
+fn select_has_aggregate(sel: &crate::sqlselect::Select) -> bool {
+    fn walk(e: &crate::sqlselect::Expr) -> bool {
+        use crate::sqlselect::Expr as E;
+        match e {
+            E::Func { name, args } => {
+                matches!(name.as_str(),
+                         "count" | "sum" | "avg" | "min" | "max" | "array_agg"
+                         | "string_agg" | "bool_and" | "bool_or")
+                    || args.iter().any(walk)
+            }
+            E::Binary { left, right, .. } => walk(left) || walk(right),
+            E::Unary { expr, .. } | E::Cast { expr, .. } => walk(expr),
+            E::IsNull { expr, .. } => walk(expr),
+            E::InList { expr, list, .. } => walk(expr) || list.iter().any(walk),
+            E::Case { operand, whens, else_ } => {
+                operand.as_deref().map(walk).unwrap_or(false)
+                    || whens.iter().any(|(c, t)| walk(c) || walk(t))
+                    || else_.as_deref().map(walk).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+    sel.items.iter().any(|i| walk(&i.expr))
+}
+
+/// The catalogue relation a translated query reads from, if any.
+///
+/// Reads the collection straight off the parsed NQL rather than re-parsing the
+/// SQL, so it cannot disagree with what the executor is about to run.
+fn catalog_target(nql: &str) -> Option<String> {
+    let coll = crate::nql::parse(nql).ok()?.coll;
+    if crate::pgcatalog::is_catalog(&coll) {
+        Some(coll)
+    } else {
+        None
+    }
+}
+
 /// True when the statement carried a RETURNING clause. Checked against the raw
 /// SQL because `RETURNING *` yields an EMPTY projection, which is otherwise
 /// indistinguishable from "no RETURNING at all".
@@ -2428,6 +2674,47 @@ fn execute_stmt(
     db: Option<&Arc<Db>>,
     read_only: bool,
 ) -> Result<Executed, Vec<u8>> {
+    // The full SQL engine gets first refusal, but ONLY for statements that
+    // touch the catalogue — see `try_catalog_select`. It has to run before
+    // `translate`, because `translate` targets NQL and NQL cannot express a
+    // join, a CASE or a scalar function at all.
+    // EXPLAIN reports which engine would run the statement, and a plan only
+    // when the SQL evaluator is the engine that actually runs it. Describing a
+    // pipeline the statement would not take is the one thing an EXPLAIN must
+    // never do.
+    if let Some(inner) = strip_explain(stmt_sql) {
+        if let Some((_, plan)) = try_catalog_select(inner, db)? {
+            return Ok(plan_result(plan.render()));
+        }
+        let mut lines = vec![];
+        match translate(inner) {
+            Ok(_) => {
+                lines.push(
+                    "NQL path — this statement is translated to NQL and \
+                     executed by the storage engine, not by the SQL evaluator."
+                        .to_string(),
+                );
+                lines.push(
+                    "No plan is reported, because the SQL evaluator is not \
+                     what runs it. Reporting one would describe a pipeline \
+                     that never executed."
+                        .to_string(),
+                );
+                lines.push(
+                    "The SQL evaluator (joins, CASE, scalar functions, a \
+                     hash-join planner) currently serves catalogue queries."
+                        .to_string(),
+                );
+            }
+            Err(why) => lines.push(format!("cannot be executed: {why}")),
+        }
+        return Ok(plan_result(lines));
+    }
+
+    if let Some((done, _plan)) = try_catalog_select(stmt_sql, db)? {
+        return Ok(done);
+    }
+
     let stmt = translate(stmt_sql).map_err(|why| err_msg("0A000", &why))?;
 
     // Every arm below that touches storage needs a database; resolve the
@@ -2468,6 +2755,25 @@ fn execute_stmt(
         }
 
         Stmt::Query { nql, project } => {
+            // A catalogue relation is synthesised from the live database
+            // rather than read from it — but it is still queried with the
+            // ORDINARY predicate path, so WHERE / ORDER BY / LIMIT and the
+            // `~` operators work on it because they are the same operators.
+            //
+            // Checked BEFORE `need_db!()`: `SELECT * FROM pg_namespace` has to
+            // answer even when the client connected without naming a database,
+            // which is exactly what psql does on startup. Refusing there is
+            // how "psql cannot connect" starts.
+            if let Some(coll) = catalog_target(&nql) {
+                let rows = crate::pgcatalog::rows(&coll, db)
+                    .expect("catalog_target only returns names pgcatalog serves");
+                let rows = crate::nql::query_rows(rows, &nql)
+                    .map_err(|e| err_msg("42601", &e.to_string()))?;
+                return Ok(Executed {
+                    rows, project, has_rows: true,
+                    tag: "SELECT".into(), tag_counts_rows: true,
+                });
+            }
             let db = need_db!();
             let (rows, _) = crate::nql::query(db, &nql).map_err(|e| {
                 err_msg("42601", &format!("{} (translated to NQL: {})", e, nql))
@@ -2664,6 +2970,56 @@ pub async fn run(host: &str, port: u16, resolver: Arc<dyn DbResolver>) -> anyhow
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod explain_tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_explain_is_stripped() {
+        assert_eq!(strip_explain("EXPLAIN SELECT 1"), Some("SELECT 1"));
+        assert_eq!(strip_explain("explain select 1"), Some("select 1"));
+        assert_eq!(strip_explain("  EXPLAIN   SELECT 1 ;  "), Some("SELECT 1"));
+    }
+
+    #[test]
+    fn analyze_and_verbose_are_accepted_and_ignored() {
+        // This endpoint always executes and always reports actual rows, so
+        // EXPLAIN and EXPLAIN ANALYZE genuinely do the same thing. Accepting
+        // the client's spelling beats refusing it.
+        assert_eq!(strip_explain("EXPLAIN ANALYZE SELECT 1"), Some("SELECT 1"));
+        assert_eq!(strip_explain("EXPLAIN ANALYSE SELECT 1"), Some("SELECT 1"));
+        assert_eq!(strip_explain("EXPLAIN VERBOSE SELECT 1"), Some("SELECT 1"));
+        assert_eq!(strip_explain("EXPLAIN ANALYZE VERBOSE SELECT 1"), Some("SELECT 1"));
+        assert_eq!(strip_explain("explain analyze verbose select 1"), Some("select 1"));
+    }
+
+    #[test]
+    fn a_word_merely_starting_with_explain_is_not_a_keyword() {
+        assert_eq!(strip_explain("EXPLAINED SELECT 1"), None);
+        assert_eq!(strip_explain("SELECT 1"), None);
+        assert_eq!(strip_explain("SELECT explain FROM t"), None);
+    }
+
+    #[test]
+    fn a_column_named_analyze_is_not_eaten() {
+        // `analyzed` merely starts with the keyword; the word boundary check
+        // is what stops it being consumed as an option.
+        assert_eq!(strip_explain("EXPLAIN analyzed_view"), Some("analyzed_view"));
+    }
+
+    #[test]
+    fn the_plan_result_has_postgres_shape() {
+        let e = plan_result(vec!["Seq Scan on t".into(), "note".into()]);
+        assert_eq!(e.project.len(), 1);
+        assert_eq!(e.project[0].out, "QUERY PLAN");
+        assert_eq!(e.rows.len(), 2);
+        assert_eq!(e.rows[0]["QUERY PLAN"], "Seq Scan on t");
+        assert_eq!(e.tag, "EXPLAIN");
+        // EXPLAIN's tag carries no row count in PostgreSQL.
+        assert!(!e.tag_counts_rows);
+    }
+}
 
 #[cfg(test)]
 mod tests {
